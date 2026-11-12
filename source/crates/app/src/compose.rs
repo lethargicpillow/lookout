@@ -1024,6 +1024,10 @@ struct AutosaveCtx {
     /// the composer opened with (see `capture_baseline`). A tick whose fields
     /// still match it does nothing.
     last_saved: Rc<RefCell<Option<DraftSnapshot>>>,
+    // Only one unacknowledged save at a time. A failed save must retry
+    // even when the current snapshot equals the last queued one.
+    pending: Rc<Cell<bool>>,
+    retry_required: Rc<Cell<bool>>,
     /// Set the moment a `SaveDraft` is queued for this session - gates the
     /// `replace` flag and the delete-before-send, so it's deliberately
     /// optimistic (a queued-but-failed save still means "ask the server to
@@ -1113,26 +1117,39 @@ impl AutosaveCtx {
     /// without queueing anything.
     async fn attempt(&self, force: bool) {
         let Some(_saving) = self.save_lock.try_lock() else { return };
-        self.save_if_changed(force).await;
+        let _ = self.save_if_changed(force).await;
     }
 
     /// Like `attempt`, but waits out a save already in flight first, so the
     /// final content is always queued - schedule send (item 1.14) relies on
     /// the Drafts copy being current, and on `draft_queued` being set,
     /// before it queues the message.
-    async fn flush(&self, force: bool) {
+    async fn flush(&self, force: bool) -> bool {
         let _saving = self.save_lock.lock().await;
-        self.save_if_changed(force).await;
+        self.save_if_changed(force).await
     }
 
-    async fn save_if_changed(&self, force: bool) {
-        let Some(snap) = self.snapshot().await else { return };
+    /// Wait for the account event, not merely for the command to enter its
+    /// queue. A timeout keeps the editor alive; it is not proof of failure
+    /// or permission to submit a second overlapping APPEND.
+    async fn wait_for_save(&self) -> bool {
+        for _ in 0..150 {
+            if !self.pending.get() { return !self.retry_required.get(); }
+            glib::timeout_future(std::time::Duration::from_millis(100)).await;
+        }
+        false
+    }
+
+    async fn save_if_changed(&self, force: bool) -> bool {
+        if self.pending.get() { return false; }
+        let Some(snap) = self.snapshot().await else { return false };
         // Scoped so no borrow is held across the sends below - and, more to
         // the point, never across the `.await` above, which yields to the
         // main loop and lets other handlers run.
-        let save = should_save(&snap, self.last_saved.borrow().as_ref(), self.draft_queued.get(), force);
+        let save = should_save(&snap, self.last_saved.borrow().as_ref(), self.draft_queued.get(), force)
+            || (self.retry_required.get() && !draft_is_trivial(&snap));
         if !save {
-            return;
+            return !self.retry_required.get();
         }
         // First save of a reopened draft takes its exact source UID (then
         // clears it); every other replace works by Message-ID, which by now
@@ -1140,13 +1157,11 @@ impl AutosaveCtx {
         // own id.
         let replace = if !self.draft_queued.get() {
             DraftReplace::None
-        } else if let Some((mailbox, uid)) = self.replace_uid.borrow_mut().take() {
+        } else if let Some((mailbox, uid)) = self.replace_uid.borrow().clone() {
             DraftReplace::ByUid { mailbox, uid }
         } else {
             DraftReplace::ByMessageId
         };
-        *self.last_saved.borrow_mut() = Some(snap.clone());
-        self.draft_queued.set(true);
         let identity = selected_identity(&self.identities, &self.from_dropdown);
         let bcc = with_identity_bcc(parse_recipients(&snap.bcc), &identity);
         let msg = ComposedMessage {
@@ -1171,8 +1186,21 @@ impl AutosaveCtx {
             references: self.references.clone(),
             message_id: Some((*self.draft_message_id).clone()),
         };
-        let _ = self.cmd_tx.send_blocking(AccountCommand::SaveDraft { msg: Box::new(msg), replace });
-        self.status_label.set_label("Saving draft…");
+        match self.cmd_tx.try_send(AccountCommand::SaveDraft { msg: Box::new(msg), replace }) {
+            Ok(()) => {
+                *self.last_saved.borrow_mut() = Some(snap);
+                self.draft_queued.set(true);
+                self.pending.set(true);
+                self.retry_required.set(false);
+                self.status_label.set_label("Saving draft…");
+                true
+            }
+            Err(_) => {
+                self.retry_required.set(true);
+                self.status_label.set_label("Draft not saved — will retry");
+                false
+            }
+        }
     }
 }
 
@@ -2591,6 +2619,8 @@ pub fn build_compose_view(
         rich_web_view: rich_web_view.clone(),
         attachments: attachments.clone(),
         last_saved: Rc::new(RefCell::new(None)),
+        pending: Rc::new(Cell::new(false)),
+        retry_required: Rc::new(Cell::new(false)),
         // A reopened draft is already stored: its first save must replace,
         // not append (and its Send must delete the stored copy).
         draft_queued: Rc::new(Cell::new(prefill.draft_source.is_some() || prefill.draft_saved)),
@@ -2654,11 +2684,14 @@ pub fn build_compose_view(
     let (draft_saved_tx, draft_saved_rx) = async_channel::bounded(8);
     {
         let draft_message_id = draft_message_id.clone();
-        let status_label = status_label.clone();
+        let autosave = autosave.clone();
         glib::spawn_future_local(async move {
             while let Ok(message_id) = draft_saved_rx.recv().await {
                 if message_id == *draft_message_id {
-                    status_label.set_label("Draft saved");
+                    autosave.pending.set(false);
+                    autosave.retry_required.set(false);
+                    autosave.replace_uid.borrow_mut().take();
+                    autosave.status_label.set_label("Draft saved");
                 }
             }
         });
@@ -2669,11 +2702,13 @@ pub fn build_compose_view(
     let (draft_save_failed_tx, draft_save_failed_rx) = async_channel::bounded(8);
     {
         let draft_message_id = draft_message_id.clone();
-        let status_label = status_label.clone();
+        let autosave = autosave.clone();
         glib::spawn_future_local(async move {
             while let Ok((message_id, _detail)) = draft_save_failed_rx.recv().await {
                 if message_id == *draft_message_id {
-                    status_label.set_label("Not saved — working offline");
+                    autosave.pending.set(false);
+                    autosave.retry_required.set(true);
+                    autosave.status_label.set_label("Draft not saved — will retry");
                 }
             }
         });
@@ -2814,7 +2849,10 @@ pub fn build_compose_view(
         // nothing, and stores even an untouched reply or forward.
         save_draft_button.connect_clicked(move |_| {
             let autosave = autosave.clone();
-            glib::spawn_future_local(async move { autosave.flush(true).await });
+            glib::spawn_future_local(async move {
+                if autosave.pending.get() { let _ = autosave.wait_for_save().await; }
+                let _ = autosave.flush(true).await;
+            });
         });
     }
     {
@@ -2827,6 +2865,7 @@ pub fn build_compose_view(
         let on_done = on_done.clone();
         let autosave = autosave.clone();
         let closed = closed.clone();
+        let content = content.clone();
         close_button.connect_clicked(move |_| {
             // `closed` only stops the autosave tick here; teardown happens in
             // `on_done` after the flush. Setting it first also makes a second
@@ -2836,9 +2875,19 @@ pub fn build_compose_view(
             }
             let autosave = autosave.clone();
             let on_done = on_done.clone();
+            let closed = closed.clone();
+            let content = content.clone();
+            content.set_sensitive(false);
             glib::spawn_future_local(async move {
-                autosave.flush(false).await;
-                on_done();
+                if autosave.pending.get() { let _ = autosave.wait_for_save().await; }
+                let queued = !autosave.pending.get() && autosave.flush(false).await;
+                if queued && autosave.wait_for_save().await {
+                    on_done();
+                } else {
+                    closed.set(false);
+                    content.set_sensitive(true);
+                    autosave.status_label.set_label("Draft not confirmed — keep this window open");
+                }
             });
         });
     }
@@ -2923,7 +2972,8 @@ pub fn build_compose_view(
                 // delete once sent. Commands reach the session in order, so
                 // the save lands before the outbox row is queued.
                 if schedule.is_some() {
-                    autosave.flush(true).await;
+                    if autosave.pending.get() { let _ = autosave.wait_for_save().await; }
+                    let _ = autosave.flush(true).await;
                 }
                 let (text_body, html_body, inline_images) = if rich {
                     // Reading the editor's live HTML back out is a round trip

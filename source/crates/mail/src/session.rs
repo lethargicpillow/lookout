@@ -3175,12 +3175,17 @@ async fn connect_and_run(
                 }
                 AccountCommand::SaveDraft { msg, replace } => {
                     let had_drafts_folder = drafts_path(&folders, &account_id).is_some();
+                    let draft_id = msg.message_id.clone().unwrap_or_default();
                     match save_draft(&mut session, &folders, &account_id, *msg, replace, has_uidplus).await {
                         Ok(message_id) => {
                             let _ = events.send(AccountEvent::DraftSaved { message_id }).await;
                         }
                         Err(e) => {
                             tracing::warn!("draft save failed: {e}");
+                            let _ = events.send(AccountEvent::DraftSaveFailed {
+                                message_id: draft_id,
+                                message: "The draft could not be saved to the server.".into(),
+                            }).await;
                         }
                     }
                     // The draft path SELECTs the Drafts mailbox; bring the
@@ -6414,8 +6419,9 @@ async fn purge_uids(session: &mut Session<SessionStream>, uids: &[Uid], has_uidp
 
 /// Saves `msg` as a draft: `APPEND`s the raw message to the account's
 /// Drafts mailbox with `\Draft \Seen` flags (drafts must not show as
-/// unread). `replace` names the previous copy to purge first so autosaves
-/// update in place instead of accumulating - by `Message-ID` for a resave,
+/// unread). `replace` names the previous copy to purge only after the new
+/// APPEND succeeds, so a failed save cannot remove the previous draft.
+/// Autosaves update in place instead of accumulating - by `Message-ID` for a resave,
 /// or by exact `(mailbox, uid)` for the first save of a reopened draft.
 /// The saved raw message includes a `Bcc` header (see
 /// `build_draft_raw_message`) so reopening the draft can restore its
@@ -6445,20 +6451,35 @@ async fn save_draft(
             "Drafts".to_string()
         }
     };
-    // ByUid purges the source copy in its own mailbox before the append
-    // below; the mailbox id carries the account prefix, which the wire path
-    // doesn't take.
-    if let DraftReplace::ByUid { mailbox, uid } = &replace {
-        let source_path = mailbox.0.split_once(':').map(|(_, p)| p).unwrap_or(mailbox.0.as_str());
-        session.select(source_path).await?;
-        purge_uid(session, *uid, has_uidplus).await?;
-    }
     let (raw, message_id, _) = build_draft_raw_message(&msg);
     session.select(&path).await?;
-    if matches!(replace, DraftReplace::ByMessageId) {
-        purge_by_message_id(session, &message_id, has_uidplus).await?;
-    }
+    // Capture the old UIDs before APPEND, including a copy that may have
+    // landed during a previous ambiguous connection failure. Never search
+    // by Message-ID and purge after APPEND: that would delete the new copy.
+    let mut previous: Vec<Uid> = if matches!(&replace, DraftReplace::None) {
+        Vec::new()
+    } else {
+        session.uid_search(format!("HEADER Message-Id <{message_id}>")).await?.into_iter().map(Uid).collect()
+    };
+    let source = match &replace {
+        DraftReplace::ByUid { mailbox, uid } => {
+            let source_path = mailbox.0.split_once(':').map(|(_, p)| p).unwrap_or(mailbox.0.as_str());
+            if source_path == path {
+                if !previous.contains(uid) { previous.push(*uid); }
+                None
+            } else {
+                Some((source_path.to_string(), *uid))
+            }
+        }
+        _ => None,
+    };
     session.append(&path, Some("(\\Draft \\Seen)"), None, raw.as_slice()).await?;
+    purge_uids(session, &previous, has_uidplus).await?;
+    if let Some((source_path, uid)) = source {
+        session.select(&source_path).await?;
+        purge_uid(session, uid, has_uidplus).await?;
+        session.select(&path).await?;
+    }
     Ok(message_id)
 }
 
