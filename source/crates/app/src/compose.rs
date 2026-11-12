@@ -1858,6 +1858,7 @@ pub fn build_compose_view(
 
     // All address fields remain visible. Each field has its own address
     // book button, so GAL results can be added to To, Cc or Bcc directly.
+    let address_labels = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
     for (row, label) in [(&to_row, "To"), (&cc_row, "Cc"), (&bcc_row, "Bcc")] {
         row.widget().add_css_class("compose-recipient");
         let button = gtk::Button::builder()
@@ -1866,6 +1867,7 @@ pub fn build_compose_view(
             .tooltip_text(format!("Select {label} recipients from address book"))
             .css_classes(["compose-picker-button"])
             .build();
+        address_labels.add_widget(&button);
         row.add_header_prefix(&button);
         let row = row.clone();
         let open = open_contact_picker.clone();
@@ -1947,6 +1949,7 @@ pub fn build_compose_view(
     fields_group.append(bcc_row.widget());
     let subject_line = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["compose-subject-line"]).build();
     let subject_label = gtk::Label::builder().label("Subject").xalign(0.0).width_request(72).build();
+    address_labels.add_widget(&subject_label);
     subject_line.append(&subject_label);
     subject_line.append(&subject_row);
     fields_group.append(&subject_line);
@@ -2483,6 +2486,8 @@ pub fn build_compose_view(
     let close_button = gtk::Button::from_icon_name("window-close-symbolic");
     close_button.set_tooltip_text(Some("Close (the draft is kept)"));
     let editor_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
+    let insert_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
+    let options_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
     let format = &format_controls;
     editor_band.group("Font", |group| {
         group.plain();
@@ -2508,6 +2513,8 @@ pub fn build_compose_view(
     editor_band.group("Include", |group| {
         group.button(&attach_button, "mail-attachment-symbolic", "Attach Files");
         group.menu(&signature_button, "signature-1", "Signature");
+    });
+    insert_band.group("Insert", |group| {
         group.menu(&templates_button, "edit-copy-symbolic", "Templates");
         group.small_button(&format.link, "insert-link-symbolic", "Link");
         group.small_button(&format.table, "view-grid-symbolic", "Table");
@@ -2515,16 +2522,16 @@ pub fn build_compose_view(
         group.small_menu(&format.emoji, "face-smile-symbolic", "Emoji");
         group.small_button(&format.horizontal_rule, "insert-hr-symbolic", "Horizontal Line");
     });
-    editor_band.group("Tracking", |group| {
+    options_band.group("Tracking", |group| {
         group.small_toggle(&read_receipt_toggle, "mark-location-symbolic", "Read Receipt");
         group.small_toggle(&delivery_receipt_toggle, "document-send-symbolic", "Delivery Receipt");
     });
-    editor_band.group("Tags", |group| {
+    options_band.group("Tags", |group| {
         group.small_toggle(&high_importance_toggle, "emblem-important-symbolic", "High Importance");
         group.small_toggle(&low_importance_toggle, "go-down-symbolic", "Low Importance");
         group.widget(&sensitivity_dropdown);
     });
-    editor_band.group("Format", |group| {
+    options_band.group("Format", |group| {
         group.small_toggle(
             &rich_toggle,
             crate::window::themed_icon_name(&["document-edit-symbolic", "accessories-text-editor-symbolic"]),
@@ -2536,20 +2543,29 @@ pub fn build_compose_view(
         group.button(&close_button, "window-close-symbolic", "Close");
     });
     // The composer owns its overflow controller, including when popped out.
-    let editor_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(4).hexpand(true).build();
+    let editor_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).hexpand(true).build();
     let editor_stack = gtk::Stack::new();
-    editor_stack.add_named(editor_band.root(), Some("editor"));
+    editor_stack.set_hhomogeneous(false);
+    editor_stack.set_vhomogeneous(false);
+    editor_stack.add_titled(editor_band.root(), Some("message"), "Message");
+    editor_stack.add_titled(insert_band.root(), Some("insert"), "Insert");
+    editor_stack.add_titled(options_band.root(), Some("options"), "Options");
+    let tabs = gtk::StackSwitcher::builder().stack(&editor_stack).halign(gtk::Align::Start).build();
+    tabs.add_css_class("compose-ribbon-tabs");
+    editor_toolbar.append(&tabs);
+    let ribbon_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(4).hexpand(true).build();
+    editor_toolbar.append(&ribbon_row);
     let editor_scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::External)
         .vscrollbar_policy(gtk::PolicyType::Never)
         .hexpand(true)
         .child(&editor_stack)
         .build();
-    editor_toolbar.append(&editor_scroller);
+    ribbon_row.append(&editor_scroller);
     let more = gtk::MenuButton::builder().icon_name("view-more-symbolic").tooltip_text("More commands").build();
     let more_band = crate::ribbon::RibbonBand::new(&ribbon_style, &[]);
     more_band.standalone().menu(&more, "view-more-symbolic", "More");
-    editor_toolbar.append(more_band.root());
+    ribbon_row.append(more_band.root());
     let overflow_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).margin_top(6).margin_bottom(6).margin_start(6).margin_end(6).build();
     let extras = gtk::Box::new(gtk::Orientation::Vertical, 0);
     extras.set_visible(false);
@@ -2561,7 +2577,9 @@ pub fn build_compose_view(
     more.set_popover(Some(&popover));
     let overflow = crate::ribbon::RibbonOverflow::new(&ribbon_style, &more, &overflow_box, &extras, &separator, &more_band);
     overflow.add_band(&editor_band);
-    overflow.attach(&editor_toolbar, &editor_stack);
+    overflow.add_band(&insert_band);
+    overflow.add_band(&options_band);
+    overflow.attach(&ribbon_row, &editor_stack);
     // Keep the controller alive for this editor's lifetime.
     popover.connect_show(move |_| overflow.sync_sections());
 
@@ -2781,6 +2799,7 @@ pub fn build_compose_view(
         .build();
     let from_line = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
     let from_label = gtk::Label::builder().label("From").width_request(72).xalign(0.0).build();
+    address_labels.add_widget(&from_label);
     from_line.append(&from_label);
     from_line.append(&from_dropdown);
     from_line.append(&identity_hint_icon);

@@ -6261,28 +6261,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .build();
     window.set_resizable(true);
     {
-        // On Wayland an interactive configure can change the allocated
-        // content without updating GtkWindow's remembered default size.
-        // Adopt the actual floating allocation while resizing; otherwise
-        // the next layout request can restore the stale startup size.
-        // GtkWindow dimensions exclude client-side decoration shadows.
-        let previous = Cell::new(None::<(i32, i32)>);
-        window.add_tick_callback(move |window, _| {
-            let size = (window.width(), window.height());
-            if size.0 <= 0 || size.1 <= 0 { return glib::ControlFlow::Continue; }
-            let old = previous.replace(Some(size));
-            if old.is_none() || old == Some(size) { return glib::ControlFlow::Continue; }
-            let state = window.surface().and_downcast::<gtk::gdk::Toplevel>().map(|toplevel| toplevel.state());
-            let constrained = window.is_maximized() || window.is_fullscreen()
-                || state.is_some_and(|state| state.contains(gtk::gdk::ToplevelState::TILED));
-            if !constrained && (window.default_width(), window.default_height()) != size {
-                tracing::debug!(width = size.0, height = size.1, "remember floating window allocation");
-                window.set_default_size(size.0, size.1);
-            }
-            glib::ControlFlow::Continue
-        });
-    }
-    {
         let scope_stack = scope_stack.clone();
         let search_entry = search_entry.clone();
         let last = Cell::new(-1);

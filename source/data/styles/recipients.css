@@ -77,3 +77,6 @@
 .compose-workspace .compose-picker-button { min-width: 72px; font-weight: normal; }
 .compose-workspace .compose-fields { border-bottom: none; padding: 0; }
 .compose-workspace .compose-address-input { min-height: 24px; }
+
+.compose-ribbon-tabs { margin-bottom: 2px; }
+.compose-ribbon-tabs button { padding: 5px 14px; }
