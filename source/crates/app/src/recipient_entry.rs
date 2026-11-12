@@ -1133,7 +1133,7 @@ mod tests {
         let field = RecipientEntry::new_compose("");
         let flow = field.flow.as_ref().unwrap();
         assert!(flow.has_css_class("compose-address-surface"));
-        assert!(flow.is_hexpand());
+        assert!(flow.property::<bool>("hexpand"));
         assert_eq!(flow.parent().unwrap(), field.header.clone().upcast::<gtk::Widget>());
         let entry_wrapper = field.entry.parent().unwrap();
         assert_eq!(entry_wrapper.parent().unwrap(), flow.clone().upcast::<gtk::Widget>());
