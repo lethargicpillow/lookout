@@ -210,6 +210,14 @@ impl DavClient {
     /// hard error - some minimal CalDAV servers do this), in which case
     /// scheduling is treated as unsupported (client-side iMIP remains).
     pub async fn discover_calendar(&self, credential: &Credential) -> Result<CalendarDiscovery> {
+        if self.is_davmail_collection("calendar") {
+            return Ok(CalendarDiscovery {
+                home_set_href: self.base_url.to_string(),
+                schedule_outbox_href: None,
+                schedule_inbox_href: None,
+                managed_attachments: false,
+            });
+        }
         let principal = self
             .propfind(self.base_url.clone(), 0, credential, &["D:current-user-principal"])
             .await?
@@ -256,6 +264,9 @@ impl DavClient {
 
 impl DavClient {
     pub async fn discover_addressbook_home(&self, credential: &Credential) -> Result<String> {
+        if self.is_davmail_collection("contacts") {
+            return Ok(self.base_url.to_string());
+        }
         let principal = self
             .propfind(self.base_url.clone(), 0, credential, &["D:current-user-principal"])
             .await?
@@ -288,7 +299,8 @@ impl DavClient {
 
     pub async fn list_addressbooks(&self, home_set_href: &str, account_id: &AccountId, credential: &Credential) -> Result<Vec<AddressBookInfo>> {
         let home_url = self.resolve(home_set_href)?;
-        let responses = self.propfind(home_url, 1, credential, &ADDRESSBOOK_PROPS).await?;
+        let depth = if self.is_davmail_collection("contacts") { 0 } else { 1 };
+        let responses = self.propfind(home_url, depth, credential, &ADDRESSBOOK_PROPS).await?;
 
         Ok(responses
             .into_iter()
@@ -411,8 +423,23 @@ impl DavClient {
         // GOA has been observed to embed it as userinfo (`https://user@host/`),
         // which some front-ends reject; scrub it so every request goes out clean.
         let _ = base_url.set_username("");
-        let http = reqwest::Client::builder().danger_accept_invalid_certs(accept_ssl_errors).build()?;
+        let mut builder = reqwest::Client::builder().danger_accept_invalid_certs(accept_ssl_errors);
+        if Self::is_local_davmail(&base_url) {
+            builder = builder.no_proxy().redirect(reqwest::redirect::Policy::none());
+        }
+        let http = builder.build()?;
         Ok(Self { http, base_url, username })
+    }
+
+    fn is_local_davmail(url: &reqwest::Url) -> bool {
+        url.scheme() == "http" && url.host_str() == Some("127.0.0.1") && url.port() == Some(1080)
+    }
+
+    fn is_davmail_collection(&self, kind: &str) -> bool {
+        if !Self::is_local_davmail(&self.base_url) { return false; }
+        let Some(parts) = self.base_url.path_segments() else { return false; };
+        let parts: Vec<_> = parts.collect();
+        matches!(parts.as_slice(), ["users", user, collection, ""] if !user.is_empty() && *collection == kind)
     }
 
     /// RFC 4791 discovery: PROPFIND `base_url` for `current-user-principal`,
@@ -457,10 +484,11 @@ impl DavClient {
     /// into a 403.
     pub async fn list_calendars(&self, home_set_href: &str, account_id: &AccountId, credential: &Credential) -> Result<Vec<CalendarInfo>> {
         let home_url = self.resolve(home_set_href)?;
+        let depth = if self.is_davmail_collection("calendar") { 0 } else { 1 };
         let responses = self
             .propfind(
                 home_url,
-                1,
+                depth,
                 credential,
                 &["D:displayname", "D:resourcetype", "IC:calendar-color", "C:supported-calendar-component-set"],
             )
@@ -475,7 +503,7 @@ impl DavClient {
                 // could hold them; an explicit component list without VTODO
                 // (Google) is a definitive no.
                 let advertised = r.prop(NS_CALDAV, "supported-calendar-component-set");
-                let supports_tasks = advertised.is_none() || r.supports_component(NS_CALDAV, "supported-calendar-component-set", "VTODO");
+                let supports_tasks = (advertised.is_none() && !self.is_davmail_collection("calendar")) || r.supports_component(NS_CALDAV, "supported-calendar-component-set", "VTODO");
                 CalendarInfo {
                     id: CalendarId::new(account_id, &r.href),
                     account_id: account_id.clone(),
@@ -802,6 +830,9 @@ impl DavClient {
         body: Option<Vec<u8>>,
         extra_headers: &[(&str, String)],
     ) -> Result<reqwest::Response> {
+        if Self::is_local_davmail(&self.base_url) && url.origin() != self.base_url.origin() {
+            return Err(Error::Discovery("DavMail href points outside the local bridge".into()));
+        }
         let method = Method::from_bytes(method_name.as_bytes()).expect("method name is a valid HTTP token");
         let request_url = url.clone();
         match &body {

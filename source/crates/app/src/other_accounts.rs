@@ -192,6 +192,63 @@ impl CredentialProvider for OtherCredentialProvider {
     }
 }
 
+/// Recognize the conventional local DavMail profile, never remote IMAP.
+pub(crate) fn davmail_accounts(account: &OtherAccount) -> Option<(lookout_goa::GoaCalendarAccount, lookout_goa::GoaContactsAccount)> {
+    let local = |host: &str| host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost");
+    if !local(&account.imap_host) || !local(&account.smtp_host)
+        || account.imap_port != 1143 || account.smtp_port != 1025
+        || account.resolved_imap_security() != Security::Plain
+        || account.resolved_smtp_security() != Security::Plain
+        || account.email.trim().is_empty() || account.imap_username.trim().is_empty()
+    {
+        return None;
+    }
+    let mut url = reqwest::Url::parse("http://127.0.0.1:1080/").ok()?;
+    {
+        let mut path = url.path_segments_mut().ok()?;
+        path.pop_if_empty().push("users").push(&account.email).push("calendar").push("");
+    }
+    let calendar_uri = url.to_string();
+    {
+        let mut path = url.path_segments_mut().ok()?;
+        path.pop_if_empty().pop().push("contacts").push("");
+    }
+    let contacts_uri = url.to_string();
+    let account_id = AccountId(account.id.clone());
+    let display_name = if account.display_name.is_empty() { account.email.clone() } else { account.display_name.clone() };
+    // Reuse the existing DAV account metadata; the root object path is a
+    // placeholder, never used for D-Bus authentication by manual sessions.
+    Some((
+        lookout_goa::GoaCalendarAccount {
+            account_id: account_id.clone(),
+            object_path: "/".try_into().expect("valid root object path"),
+            display_name: display_name.clone(),
+            identity: account.imap_username.clone(),
+            uri: calendar_uri,
+            accept_ssl_errors: false,
+            auth: lookout_goa::CalendarAuthMethod::Password { password_id: PROTOCOL_IMAP.into() },
+            provider_type: None,
+        },
+        lookout_goa::GoaContactsAccount {
+            account_id,
+            object_path: "/".try_into().expect("valid root object path"),
+            display_name,
+            identity: account.imap_username.clone(),
+            uri: contacts_uri,
+            accept_ssl_errors: false,
+            auth: lookout_goa::ContactsAuthMethod::Password { password_id: PROTOCOL_IMAP.into() },
+            provider_type: None,
+        },
+    ))
+}
+
+#[async_trait]
+impl lookout_dav::session::CalendarCredentialProvider for OtherCredentialProvider {
+    async fn calendar_credential(&self) -> Result<lookout_dav::Credential, String> {
+        self.keyring.load_password(&self.account_id, PROTOCOL_IMAP).await.map(lookout_dav::Credential::Password)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Add/edit dialog
 // ---------------------------------------------------------------------------
@@ -725,6 +782,51 @@ mod tests {
 
     fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(fut)
+    }
+
+    #[test]
+    fn davmail_endpoints_require_plain_local_mail_and_keep_account_identity() {
+        let mut account = OtherAccount {
+            id: "other:12345678-1234-4234-8234-123456789abc".into(),
+            display_name: "Example".into(),
+            email: "alice@example.test".into(),
+            imap_host: "localhost".into(),
+            imap_port: 1143,
+            imap_use_tls: false,
+            imap_username: "alice".into(),
+            smtp_host: "127.0.0.1".into(),
+            smtp_port: 1025,
+            smtp_use_tls: false,
+            smtp_username: "alice".into(),
+            use_same_password: true,
+            imap_security: Some(Security::Plain),
+            smtp_security: Some(Security::Plain),
+        };
+        let (calendar, contacts) = davmail_accounts(&account).unwrap();
+        assert_eq!(calendar.account_id.0, account.id);
+        assert_eq!(contacts.account_id, calendar.account_id);
+        assert_eq!(calendar.identity, "alice");
+        assert_eq!(calendar.uri, "http://127.0.0.1:1080/users/alice@example.test/calendar/");
+        assert_eq!(contacts.uri, "http://127.0.0.1:1080/users/alice@example.test/contacts/");
+        account.imap_host = "remote.example.test".into();
+        assert!(davmail_accounts(&account).is_none());
+        account.imap_host = "localhost".into();
+        account.smtp_security = Some(Security::StartTls);
+        assert!(davmail_accounts(&account).is_none());
+    }
+
+    #[test]
+    fn davmail_calendar_uses_the_existing_imap_secret() {
+        use lookout_dav::session::CalendarCredentialProvider;
+        let keyring = Arc::new(FakeKeyring::default());
+        let id = AccountId("other:test".into());
+        block_on(keyring.store_password(&id, PROTOCOL_IMAP, "imap-secret")).unwrap();
+        let provider = OtherCredentialProvider::new(id.clone(), keyring.clone());
+        block_on(async {
+            assert!(matches!(provider.calendar_credential().await.unwrap(), lookout_dav::Credential::Password(p) if p == "imap-secret"));
+            keyring.delete_account(&id).await.unwrap();
+            assert!(provider.calendar_credential().await.is_err());
+        });
     }
 
     #[test]

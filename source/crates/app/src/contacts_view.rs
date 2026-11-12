@@ -2290,12 +2290,29 @@ pub fn spawn_contacts_discovery(
                 root_stack.set_visible_child_name(name);
             }
         };
+        let manual_accounts: Vec<_> = state.borrow().app_config.borrow().other_accounts.iter()
+            .filter_map(crate::other_accounts::davmail_accounts)
+            .map(|(_, contacts)| contacts)
+            .filter(|account| state.borrow().account_enabled(&account.account_id))
+            .collect();
+        let mut manual_started = HashSet::new();
+        for account in manual_accounts {
+            let id = account.account_id.clone();
+            manual_started.insert(id.clone());
+            if state.borrow().contact_cmd_tx.contains_key(&id) { continue; }
+            let (cmd_tx, cmd_rx) = async_channel::unbounded();
+            state.borrow_mut().contact_cmd_tx.insert(id, cmd_tx);
+            sync_contacts_account(
+                worker.clone(), state.clone(), toast_overlay.clone(), None::<GoaClient>,
+                account, cmd_rx, refresh_contacts_ui.clone(), crate::window::offline_receiver(&state),
+            );
+        }
         match result {
             Ok((client, accounts, m365_mail)) => {
                 // The accounts a session was started for, so the Microsoft 365
                 // fallback below doesn't double-connect one GOA already
                 // reported a `Contacts` interface for.
-                let mut started: HashSet<AccountId> = HashSet::new();
+                let mut started: HashSet<AccountId> = manual_started;
                 for account in accounts {
                     let id = account.account_id.clone();
                     // Record the account in the GOA union (disabled ones
@@ -2414,7 +2431,7 @@ pub fn spawn_contacts_discovery(
                 // directory still has its People row (4.7.8).
                 let has_desktop = crate::desktop_contacts::reload_now(&state, &worker).await;
                 let has_directory = crate::directory::directory_configured_for_state(&state.borrow());
-                if has_desktop || has_directory {
+                if !manual_started.is_empty() || has_desktop || has_directory {
                     refresh_contacts_ui(None);
                     show_page("contacts");
                 } else {
@@ -2463,7 +2480,7 @@ pub fn sync_contacts_account(
     worker: Rc<Worker>,
     state: Rc<RefCell<UiState>>,
     toast_overlay: adw::ToastOverlay,
-    goa_client: GoaClient,
+    goa_client: impl Into<Option<GoaClient>>,
     account: GoaContactsAccount,
     cmd_rx: async_channel::Receiver<ContactCommand>,
     refresh_contacts_ui: Rc<dyn Fn(Option<i32>)>,
@@ -2475,6 +2492,7 @@ pub fn sync_contacts_account(
     // 5.2 / A-04), not CardDAV; access is opt-in (Config's "Sync with Outlook"
     // runs the consent flow), and discovery skips an unconsented account.
     let graph_backend = account.is_microsoft_365();
+    let goa_client = goa_client.into();
     let (tx, rx) = async_channel::unbounded();
     let cache_account_id = account_id.clone();
     worker.spawn(async move {
@@ -2650,17 +2668,22 @@ pub fn sync_contacts_account(
 /// Builds the authenticated DAV client + fresh credential for one CardDAV
 /// account - shared by the poll fetch and the write path, so a command
 /// executed between polls authenticates exactly like a poll would.
-async fn carddav_connection(goa_client: &GoaClient, account: &GoaContactsAccount) -> Result<(DavClient, Credential), String> {
-    goa_client.ensure_credentials_contacts(account).await.map_err(|e| e.to_string())?;
-    let credential = match &account.auth {
-        ContactsAuthMethod::OAuth2 => {
-            let (token, _expires_in) = goa_client.get_access_token_contacts(account).await.map_err(|e| e.to_string())?;
-            Credential::OAuth2AccessToken(token)
+async fn carddav_connection(goa_client: &Option<GoaClient>, account: &GoaContactsAccount) -> Result<(DavClient, Credential), String> {
+    let credential = if let Some(goa_client) = goa_client {
+        goa_client.ensure_credentials_contacts(account).await.map_err(|e| e.to_string())?;
+        match &account.auth {
+            ContactsAuthMethod::OAuth2 => {
+                let (token, _expires_in) = goa_client.get_access_token_contacts(account).await.map_err(|e| e.to_string())?;
+                Credential::OAuth2AccessToken(token)
+            }
+            ContactsAuthMethod::Password { .. } => {
+                let password = goa_client.get_contacts_password(account).await.map_err(|e| e.to_string())?;
+                Credential::Password(password)
+            }
         }
-        ContactsAuthMethod::Password { .. } => {
-            let password = goa_client.get_contacts_password(account).await.map_err(|e| e.to_string())?;
-            Credential::Password(password)
-        }
+    } else {
+        let keyring = crate::other_accounts::SecretServiceKeyring::new();
+        Credential::Password(keyring.load_password(&account.account_id, crate::other_accounts::PROTOCOL_IMAP).await?)
     };
 
     let config = CardDavAccountConfig {
@@ -2684,7 +2707,7 @@ async fn carddav_connection(goa_client: &GoaClient, account: &GoaContactsAccount
 /// The PUT half of a contact write: `etag` guards an update (`If-Match`), so
 /// an edit based on a stale copy fails with HTTP 412 instead of clobbering a
 /// concurrent change; `None` marks a create (`If-None-Match: *`).
-async fn put_contact(goa_client: GoaClient, account: GoaContactsAccount, href: String, card: &VCard, etag: Option<String>) -> Result<(), String> {
+async fn put_contact(goa_client: Option<GoaClient>, account: GoaContactsAccount, href: String, card: &VCard, etag: Option<String>) -> Result<(), String> {
     let (client, credential) = carddav_connection(&goa_client, &account).await?;
     client
         .put_contact_vcard(&href, card, &credential, etag.as_deref())
@@ -2694,7 +2717,7 @@ async fn put_contact(goa_client: GoaClient, account: GoaContactsAccount, href: S
 }
 
 /// The DELETE half of a contact write, with the same `If-Match` guard.
-async fn delete_contact(goa_client: GoaClient, account: GoaContactsAccount, href: String, etag: Option<String>) -> Result<(), String> {
+async fn delete_contact(goa_client: Option<GoaClient>, account: GoaContactsAccount, href: String, etag: Option<String>) -> Result<(), String> {
     let (client, credential) = carddav_connection(&goa_client, &account).await?;
     client.delete_contact_vcard(&href, &credential, etag.as_deref()).await.map_err(|e| e.to_string())
 }
@@ -2815,7 +2838,7 @@ async fn sync_addressbook_into(
     Ok(records)
 }
 
-async fn fetch_carddav_contacts(goa_client: GoaClient, account: GoaContactsAccount, cache: Option<&ContactsCache>) -> Result<ContactsAccountSnapshot, String> {
+async fn fetch_carddav_contacts(goa_client: Option<GoaClient>, account: GoaContactsAccount, cache: Option<&ContactsCache>) -> Result<ContactsAccountSnapshot, String> {
     let (client, credential) = carddav_connection(&goa_client, &account).await?;
     let home = client.discover_addressbook_home(&credential).await.map_err(|e| e.to_string())?;
     let books = client.list_addressbooks(&home, &account.account_id, &credential).await.map_err(|e| e.to_string())?;

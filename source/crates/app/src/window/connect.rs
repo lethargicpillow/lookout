@@ -2304,6 +2304,28 @@ pub(crate) fn spawn_calendar_discovery(
                 root_stack.set_visible_child_name(name);
             }
         };
+        // Manual DavMail discovery is independent of GOA availability.
+        let manual_accounts: Vec<_> = state.borrow().app_config.borrow().other_accounts.iter()
+            .filter_map(crate::other_accounts::davmail_accounts)
+            .map(|(calendar, _)| calendar)
+            .filter(|account| state.borrow().account_enabled(&account.account_id))
+            .collect();
+        for account in manual_accounts {
+            if !calendar_state.borrow().accounts.contains_key(&account.account_id) {
+                connect_calendar_account(
+                    worker.clone(), calendar_state.clone(), calendar_main.clone(),
+                    calendar_list_box.clone(), mini_calendar.clone(), mail_overview_day.clone(),
+                    mail_overview_day_list.clone(), reminders_engine.clone(), toast_overlay.clone(),
+                    None::<GoaClient>, account, tasks_view.clone(), Vec::new(),
+                );
+            }
+        }
+        let has_manual = !calendar_state.borrow().accounts.is_empty();
+        if has_manual {
+            show_page("calendar");
+            show_tasks_page("tasks");
+            show_lookout_page("lookout");
+        }
         match result {
             Ok((client, accounts)) => {
                 // Record every discovered calendar account into `state`'s GOA
@@ -2367,14 +2389,16 @@ pub(crate) fn spawn_calendar_discovery(
                         );
                     }
                     refresh_config();
-                } else {
+                } else if !has_manual {
                     show_page("calendar-empty");
                     show_tasks_page("tasks-empty");
                 }
             }
             Err(e) => {
-                show_page("calendar-empty");
-                show_tasks_page("tasks-empty");
+                if !has_manual {
+                    show_page("calendar-empty");
+                    show_tasks_page("tasks-empty");
+                }
                 if e.is_service_unavailable() {
                     state.borrow_mut().goa_unavailable = true;
                     refresh_config();
@@ -2765,7 +2789,7 @@ pub(crate) fn connect_calendar_account(
     mail_overview_day_list: gtk::Box,
     reminders_engine: Rc<RefCell<crate::reminders::ReminderEngine>>,
     toast_overlay: adw::ToastOverlay,
-    goa_client: GoaClient,
+    goa_client: impl Into<Option<GoaClient>>,
     account: GoaCalendarAccount,
     tasks_view: Rc<crate::tasks_view::TasksView>,
     // Other users' mailboxes whose calendars this Microsoft 365 account also
@@ -2794,7 +2818,10 @@ pub(crate) fn connect_calendar_account(
         // for providers that don't advertise an Identity.
         username: if account.identity.is_empty() { display_name.clone() } else { account.identity.clone() },
     };
-    let credentials: Rc<dyn lookout_dav::session::CalendarCredentialProvider> = Rc::new(GoaCalendarCredentialProvider::new(goa_client, account));
+    let credentials: Rc<dyn lookout_dav::session::CalendarCredentialProvider> = match goa_client.into() {
+        Some(client) => Rc::new(GoaCalendarCredentialProvider::new(client, account)),
+        None => Rc::new(crate::other_accounts::OtherCredentialProvider::new(account_id.clone(), crate::other_accounts::SecretServiceKeyring::new())),
+    };
     // Same unsafe Send/Sync wrapper pattern as `connect_account`, documented
     // there - `run_calendar_session` requires `Arc<dyn
     // CalendarCredentialProvider>`, but the provider is only ever driven
