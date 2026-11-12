@@ -6104,16 +6104,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // even the icon-only ribbon page does not fit, Layout is the first
     // control moved into More.
     let ribbon_chrome_band = crate::ribbon::RibbonBand::new(&ribbon_style, &[]);
-    ribbon_chrome_band.standalone().menu(&ribbon_layout_button, "view-grid-symbolic", "Layout");
+    let chrome = ribbon_chrome_band.standalone();
+    chrome.menu(&ribbon_layout_button, "view-grid-symbolic", "Layout");
+    chrome.theme_switch();
     let ribbon_chrome = ribbon_chrome_band.root().clone();
 
     // The trailing More button is a band of its own and must remain visible
     // at any width, so its natural width is always reserved by the overflow
     // fit (it is never wrapped in the shrinkable scroller below).
     let ribbon_more_band = crate::ribbon::RibbonBand::new(&ribbon_style, &[]);
-    let trailing = ribbon_more_band.standalone();
-    trailing.theme_switch();
-    trailing.menu(&more_button, "view-more-symbolic", "More");
+    ribbon_more_band.standalone().menu(&more_button, "view-more-symbolic", "More");
     let ribbon_more = ribbon_more_band.root().clone();
 
     let icon_toolbar_box = gtk::Box::builder()
@@ -6140,6 +6140,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // Shrink horizontally for overflow, but reserve the full command
         // height (icons, two-line labels and Classic group captions).
         .propagate_natural_height(true)
+        .propagate_natural_width(false)
+        .min_content_width(0)
         .vexpand(false)
         .hexpand(true)
         .build();

@@ -99,20 +99,17 @@ button.ribbon-control,
 .ribbon-icon.ribbon-tone-red { color: @lookout-icon-red; }
 .ribbon-icon.ribbon-tone-amber { color: @lookout-icon-amber; }
 
-/* A split command's arrow and main action share the row envelope. */
-.ribbon-classic .ribbon-control:not(.ribbon-overflow-control) > menubutton > button {
-    min-width: 12px;
-    padding-left: 2px;
-    padding-right: 2px;
+/* Only the arrow half of an actual split button gets narrow padding.
+   The primary MenuButton body must retain the width of its custom
+   caption, including the explicit in-content disclosure arrow. */
+.ribbon-classic splitbutton.ribbon-control:not(.ribbon-overflow-control) > menubutton > button {
+    min-width: 16px;
+    padding: 0 4px;
 }
-.ribbon-classic .ribbon-small-column { min-height: 72px; }
+.ribbon-menu-caption { margin: 0; }
+.ribbon-menu-arrow { margin-left: 2px; }
 
-/* Standalone commands (Layout, Light/Dark, More) have no group caption.
-   Reserve that same 18px caption + 1px group spacing below their row,
-   so their command baseline matches the named groups in Classic mode. */
-.ribbon-classic.ribbon-standalone {
-    padding-bottom: 23px;
-}
+/* Standalone commands now have a real footer, not a padding offset. */
 .ribbon-classic .ribbon-group-row,
 .ribbon-classic .ribbon-small-column {
     min-height: 72px;

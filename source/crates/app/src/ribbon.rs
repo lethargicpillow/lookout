@@ -142,6 +142,7 @@ type RelayoutListener = Rc<dyn Fn()>;
 pub(crate) struct RibbonStyle {
     mode: Rc<Cell<RibbonMode>>,
     bands: Rc<RefCell<Vec<BandRegistration>>>,
+    command_heights: gtk::SizeGroup,
     /// Callbacks run whenever the style changes, so the overflow controller
     /// can re-measure with the new control geometry.
     relayout_listeners: Rc<RefCell<Vec<RelayoutListener>>>,
@@ -161,6 +162,7 @@ impl RibbonStyle {
         RibbonStyle {
             mode: Rc::new(Cell::new(mode)),
             bands: Rc::new(RefCell::new(Vec::new())),
+            command_heights: gtk::SizeGroup::new(if mode == RibbonMode::Classic { gtk::SizeGroupMode::Vertical } else { gtk::SizeGroupMode::None }),
             relayout_listeners: Rc::new(RefCell::new(Vec::new())),
         }
     }
@@ -179,6 +181,7 @@ impl RibbonStyle {
     /// (a composer that has closed) are dropped from the registry.
     pub(crate) fn set_mode(&self, mode: RibbonMode) {
         self.mode.set(mode);
+        self.command_heights.set_mode(if mode == RibbonMode::Classic { gtk::SizeGroupMode::Vertical } else { gtk::SizeGroupMode::None });
         self.bands.borrow_mut().retain(|band| {
             let Some(root) = band.root.upgrade() else {
                 return false;
@@ -288,13 +291,15 @@ impl RibbonBand {
         group_box.update_property(&[gtk::accessible::Property::Label(name)]);
         let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(2).vexpand(true).valign(gtk::Align::Fill).build();
         row.add_css_class("ribbon-group-row");
+        self.style.command_heights.add_widget(&row);
         group_box.append(&row);
         // A collapsed group keeps the original command row in a popover;
         // no cloned commands, no lost toggle state or signal handlers.
-        let compact_menu = gtk::MenuButton::builder().visible(false).always_show_arrow(true).vexpand(true).valign(gtk::Align::Fill).build();
+        let compact_menu = gtk::MenuButton::builder().visible(false).always_show_arrow(false).vexpand(true).valign(gtk::Align::Fill).build();
         let compact_content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).build();
         let icon_name = match name {
             "Font" | "Basic Text" => "format-text-bold-symbolic",
+            "Clipboard" => "edit-paste-symbolic",
             "Paragraph" => "format-justify-left-symbolic",
             "Include" | "Insert" => "mail-attachment-symbolic",
             "Names" => "x-office-address-book-symbolic",
@@ -312,10 +317,17 @@ impl RibbonBand {
         apply_icon_tone(&icon, icon_name);
         icon.set_pixel_size(24);
         compact_content.append(&icon);
-        compact_content.append(&gtk::Label::new(Some(name)));
+        let caption = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        caption.set_halign(gtk::Align::Center);
+        caption.append(&gtk::Label::new(Some(name)));
+        let arrow = gtk::Image::from_icon_name("pan-down-symbolic");
+        arrow.set_pixel_size(12);
+        caption.append(&arrow);
+        compact_content.append(&caption);
         compact_menu.set_child(Some(&compact_content));
         compact_menu.set_tooltip_text(Some(name));
         compact_menu.add_css_class("ribbon-collapsed-group");
+        self.style.command_heights.add_widget(&compact_menu);
         let popover = gtk::Popover::new();
         compact_menu.set_popover(Some(&popover));
         group_box.append(&compact_menu);
@@ -352,16 +364,21 @@ impl RibbonBand {
     /// dressed just like a named group's.
     pub(crate) fn standalone(&self) -> RibbonGroup {
         self.root.add_css_class("ribbon-standalone");
-        let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(2).valign(gtk::Align::Fill).vexpand(false).build();
+        let container = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(1).valign(gtk::Align::Fill).build();
+        let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(2).valign(gtk::Align::Fill).vexpand(true).build();
         row.add_css_class("ribbon-group-row");
-        self.root.append(&row);
+        self.style.command_heights.add_widget(&row);
+        container.append(&row);
+        let footer = gtk::Label::builder().height_request(18).css_classes(["ribbon-group-title"]).visible(self.style.mode() == RibbonMode::Classic).build();
+        container.append(&footer);
+        self.root.append(&container);
         let group_index = {
             let mut state = self.state.borrow_mut();
             state.groups.push(BandGroup {
-                container: None,
+                container: Some(container.downgrade()),
                 row: row.downgrade(),
                 divider: None,
-                title: None,
+                title: Some(footer.downgrade()),
                 controls: Vec::new(),
                 compact_menu: None,
             });
@@ -496,7 +513,16 @@ impl RibbonGroup {
     fn dress_menu(&self, button: &gtk::MenuButton, icon: &str, label: &str, size: RibbonSize) -> RibbonIcon {
         let (content, image, text) = build_content(icon, label);
         button.set_child(Some(&content));
-        button.set_always_show_arrow(true);
+        button.set_always_show_arrow(false);
+        let caption = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        caption.add_css_class("ribbon-menu-caption");
+        content.remove(&text);
+        caption.append(&text);
+        let arrow = gtk::Image::from_icon_name("pan-down-symbolic");
+        arrow.set_pixel_size(12);
+        arrow.add_css_class("ribbon-menu-arrow");
+        caption.append(&arrow);
+        content.append(&caption);
         self.register(button.clone().upcast(), content, image, text, size)
     }
 
@@ -619,18 +645,34 @@ fn style_control(content: &gtk::Box, image: &gtk::Image, label: &gtk::Label, loo
     let large = look == Look::Large;
     // Reserve one equal caption slot per large command, so one-line
     // labels don't shift the icons down. The sync command needs two lines.
-    let is_sync = matches!(label.text().as_str(), "Send/Receive All Folders" | "Send/Receive\nAll Folders");
-    if is_sync {
-        label.set_text(if large { "Send/Receive\nAll Folders" } else { "Send/Receive All Folders" });
+    let original = label.text().replace('\n', " ");
+    let two_lines = match original.as_str() {
+        "Send/Receive All Folders" => Some("Send/Receive\nAll Folders"),
+        "New mail" => Some("New\nmail"),
+        "Address Book" => Some("Address\nBook"),
+        "Quick steps" => Some("Quick\nsteps"),
+        _ => None,
+    };
+    let is_sync = original == "Send/Receive All Folders";
+    if let Some(two_lines) = two_lines {
+        label.set_text(if large { two_lines } else { &original });
     }
-    label.set_wrap(large && !is_sync);
+    label.set_wrap(false);
     label.set_width_chars(if large && is_sync { 14 } else { -1 });
-    label.set_max_width_chars(if large { 14 } else { -1 });
+    label.set_max_width_chars(-1);
     label.set_size_request(-1, if large { 30 } else { -1 });
     label.set_valign(if large { gtk::Align::Start } else { gtk::Align::Center });
     label.set_yalign(if large { 0.0 } else { 0.5 });
     label.set_justify(if large { gtk::Justification::Center } else { gtk::Justification::Left });
     label.set_halign(if large { gtk::Align::Center } else { gtk::Align::Start });
+    if let Some(caption) = label.parent().and_downcast::<gtk::Box>().filter(|box_| box_.has_css_class("ribbon-menu-caption")) {
+        caption.set_halign(if large { gtk::Align::Center } else { gtk::Align::Start });
+        caption.set_valign(if large { gtk::Align::Start } else { gtk::Align::Center });
+        if let Some(arrow) = caption.last_child() {
+            arrow.set_valign(if large { gtk::Align::Start } else { gtk::Align::Center });
+            arrow.set_margin_top(if large { 3 } else { 0 });
+        }
+    }
 }
 
 /// Style one control for `mode`: its shape, and whether its label shows.
@@ -1043,7 +1085,14 @@ impl OverflowInner {
                 let mut groups: Vec<(usize, i32)> = state.groups.iter().enumerate()
                     .filter_map(|(i, group)| group.container.as_ref().and_then(|c| c.upgrade()).map(|c| (i, c.measure(gtk::Orientation::Horizontal, -1).1)))
                     .collect();
-                groups.sort_by_key(|(_, width)| std::cmp::Reverse(*width));
+                // Preserve the actual formatting panel on a typical compose
+                // window. Collapse secondary groups before Basic Text.
+                groups.sort_by_key(|(i, width)| {
+                    let basic_text = state.groups[*i].title.as_ref()
+                        .and_then(|title| title.upgrade())
+                        .is_some_and(|title| title.label().as_str() == "Basic Text");
+                    (basic_text, std::cmp::Reverse(*width))
+                });
                 for (index, _) in groups {
                     if root.measure(gtk::Orientation::Horizontal, -1).1 <= available { break; }
                     let before = root.measure(gtk::Orientation::Horizontal, -1).1;
@@ -1456,6 +1505,34 @@ mod tests {
         assert!(image.has_css_class("ribbon-tone-blue"));
         style_control(&content, &image, &label, Look::Simplified);
         assert_eq!(label.text().as_str(), "Send/Receive All Folders");
+    }
+
+    #[test]
+    fn classic_menu_arrow_is_inside_its_caption_and_rows_share_height() {
+        if !crate::gtk_test::gtk_ready() { return; }
+        let style = RibbonStyle::new(RibbonMode::Classic);
+        let band = RibbonBand::new(&style, &[]);
+        let menu = gtk::MenuButton::new();
+        let button = gtk::Button::new();
+        band.group("Move", |group| {
+            group.menu(&menu, "folder-move-symbolic", "Move to");
+        });
+        let right = RibbonBand::new(&style, &[]);
+        right.standalone().button(&button, "view-refresh-symbolic", "Send/Receive All Folders");
+        let content = menu.child().and_downcast::<gtk::Box>().unwrap();
+        let caption = content.last_child().and_downcast::<gtk::Box>().unwrap();
+        assert!(caption.has_css_class("ribbon-menu-caption"));
+        assert!(caption.last_child().unwrap().has_css_class("ribbon-menu-arrow"));
+        assert!(!menu.property::<bool>("always-show-arrow"));
+        let group = band.root().first_child().and_downcast::<gtk::Box>().unwrap();
+        let trailing = right.root().first_child().and_downcast::<gtk::Box>().unwrap();
+        let left_row = group.first_child().unwrap();
+        let right_row = trailing.first_child().unwrap();
+        assert_eq!(left_row.measure(gtk::Orientation::Vertical, -1).0,
+                   right_row.measure(gtk::Orientation::Vertical, -1).0);
+        assert!(trailing.last_child().unwrap().has_css_class("ribbon-group-title"));
+        style.set_mode(RibbonMode::Simplified);
+        assert!(!trailing.last_child().unwrap().is_visible());
     }
 
     #[test]

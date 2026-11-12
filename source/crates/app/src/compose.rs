@@ -1945,8 +1945,8 @@ pub fn build_compose_view(
         }
     }
 
-    // One address form, with Send beside the recipients and Subject
-    // on its own aligned row underneath. Optional fields stay hidden.
+    // One address form, with Send spanning the recipient and Subject
+    // rows. Optional fields stay hidden.
     let fields_group = gtk::Grid::builder().row_spacing(3).column_spacing(8).hexpand(true).vexpand(false).valign(gtk::Align::Start).css_classes(["compose-fields"]).build();
     let address_form = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(3).hexpand(true).build();
     for row in [&to_row, &cc_row, &bcc_row] { row.widget().set_hexpand(true); }
@@ -1963,7 +1963,7 @@ pub fn build_compose_view(
     address_labels.add_widget(&subject_label);
     subject_line.append(&subject_label);
     subject_line.append(&subject_row);
-    fields_group.attach(&subject_line, 1, 1, 1, 1);
+    address_form.append(&subject_line);
 
     // --- Attachments: a canonical in-session list, rendered as removable
     // chips below the fields, same repopulate-from-truth shape
@@ -2500,6 +2500,38 @@ pub fn build_compose_view(
     let insert_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
     let options_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
     let format = &format_controls;
+    // Real clipboard commands for both HTML and plain-text editing.
+    // Keep them in a single three-row column, as in the classic ribbon.
+    editor_band.group("Clipboard", |group| {
+        for (icon, label, command) in [
+            ("edit-paste-symbolic", "Paste", "Paste"),
+            ("edit-cut-symbolic", "Cut", "Cut"),
+            ("edit-copy-symbolic", "Copy", "Copy"),
+        ] {
+            let button = gtk::Button::new();
+            button.set_tooltip_text(Some(label));
+            let rich = rich_toggle.clone();
+            let web = rich_web_view.clone();
+            let text = body_view.clone();
+            button.connect_clicked(move |_| {
+                if rich.is_active() {
+                    web.grab_focus();
+                    web.execute_editing_command(command);
+                } else {
+                    text.grab_focus();
+                    let clipboard = text.clipboard();
+                    let buffer = text.buffer();
+                    match command {
+                        "Paste" => buffer.paste_clipboard(&clipboard, None, true),
+                        "Cut" => buffer.cut_clipboard(&clipboard, true),
+                        "Copy" => buffer.copy_clipboard(&clipboard),
+                        _ => {}
+                    }
+                }
+            });
+            group.small_button(&button, icon, label);
+        }
+    });
     // Outlook's Basic Text is one compact formatting surface. Both rows
     // share the same height across font and paragraph commands.
     editor_band.group("Basic Text", |group| {
@@ -2566,11 +2598,11 @@ pub fn build_compose_view(
     });
     editor_band.group("Include", |group| {
         group.small_button(&attach_button, "mail-attachment-symbolic", "Attach Files");
+        group.small_button(&format.link, "insert-link-symbolic", "Link");
         group.small_menu(&signature_button, "signature-1", "Signature");
     });
     insert_band.group("Insert", |group| {
         group.menu(&templates_button, "edit-copy-symbolic", "Templates");
-        group.small_button(&format.link, "insert-link-symbolic", "Link");
         group.small_button(&format.table, "view-grid-symbolic", "Table");
         group.small_button(&format.image, "insert-image-symbolic", "Picture");
         group.small_menu(&format.emoji, "face-smile-symbolic", "Emoji");
@@ -2618,6 +2650,8 @@ pub fn build_compose_view(
         .hscrollbar_policy(gtk::PolicyType::External)
         .vscrollbar_policy(gtk::PolicyType::Never)
         .propagate_natural_height(true)
+        .propagate_natural_width(false)
+        .min_content_width(0)
         .vexpand(false)
         .hexpand(true)
         .child(&editor_stack)
@@ -2625,9 +2659,10 @@ pub fn build_compose_view(
     ribbon_row.append(&editor_scroller);
     let more = gtk::MenuButton::builder().icon_name("view-more-symbolic").tooltip_text("More commands").build();
     let more_band = crate::ribbon::RibbonBand::new(&ribbon_style, &[]);
-    let trailing = more_band.standalone();
-    trailing.theme_switch();
-    trailing.menu(&more, "view-more-symbolic", "More");
+    let theme_band = crate::ribbon::RibbonBand::new(&ribbon_style, &[]);
+    theme_band.standalone().theme_switch();
+    ribbon_row.append(theme_band.root());
+    more_band.standalone().menu(&more, "view-more-symbolic", "More");
     ribbon_row.append(more_band.root());
     let overflow_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).margin_top(6).margin_bottom(6).margin_start(6).margin_end(6).build();
     let extras = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -2639,6 +2674,7 @@ pub fn build_compose_view(
     popover.set_child(Some(&overflow_scroller));
     more.set_popover(Some(&popover));
     let overflow = crate::ribbon::RibbonOverflow::new(&ribbon_style, &more, &overflow_box, &extras, &separator, &more_band);
+    overflow.set_layout_band(&theme_band);
     overflow.add_band(&editor_band);
     overflow.add_band(&insert_band);
     overflow.add_band(&options_band);
@@ -2887,10 +2923,10 @@ pub fn build_compose_view(
     send_content.append(&send_icon);
     send_content.append(&gtk::Label::new(Some("Send")));
     send_button.set_child(Some(&send_content));
-    send_button.set_size_request(68, 68);
-    send_button.set_valign(gtk::Align::Start);
+    send_button.set_size_request(68, -1);
+    send_button.set_valign(gtk::Align::Fill);
     send_button.add_css_class("compose-send");
-    // Send aligns with the recipient rows, not the Subject row.
+    // Send spans To, Cc and Subject, plus optional From/Bcc when shown.
     fields_group.attach(&send_button, 0, 0, 1, 1);
     top_row.append(&header_spacer);
     top_row.append(&title_label);
