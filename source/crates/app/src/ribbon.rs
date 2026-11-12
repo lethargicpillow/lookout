@@ -790,6 +790,16 @@ impl RibbonOverflow {
                 }
             });
         }
+        let inner = Rc::downgrade(&self.inner);
+        let last_width = Cell::new(-1);
+        bar.add_tick_callback(move |bar, _| {
+            let Some(inner) = inner.upgrade() else { return glib::ControlFlow::Break; };
+            let width = bar.width();
+            if last_width.replace(width) != width {
+                inner.refresh();
+            }
+            glib::ControlFlow::Continue
+        });
         self.inner.refresh();
     }
 

@@ -53,6 +53,9 @@ impl ComposeActionBar {
     /// another ribbon tab or module, the swap stays silent until they
     /// return.
     pub(crate) fn install(&self, toolbar: &gtk::Box) {
+        if self.stack.child_by_name("mail-home").as_ref() == Some(toolbar.upcast_ref::<gtk::Widget>()) {
+            return;
+        }
         let was_visible = self.stack.visible_child_name().as_deref() == Some("mail-home");
         if let Some(current) = self.stack.child_by_name("mail-home") {
             self.stack.remove(&current);
@@ -286,10 +289,18 @@ pub(crate) fn show_composer_in_reading_pane_full(
     account_id: Option<AccountId>,
     signature_kind: Option<crate::config_view::SignatureDefault>,
     imip_reply: Option<ImipReplySend>,
-    pop_out_on_open: bool,
+    _pop_out_on_open: bool,
 ) {
-    if let Some(existing) = reading_stack.child_by_name("compose") {
-        reading_stack.remove(&existing);
+    // There is one draft relay per window. Resume an existing session
+    // rather than displacing it and losing edits before its autosave tick.
+    let existing_window = state.borrow().compose_popout_window.as_ref().map(|(_, win)| win.clone());
+    if let Some(win) = existing_window {
+        win.present();
+        return;
+    }
+    if reading_stack.child_by_name("compose").is_some() {
+        reading_stack.set_visible_child_name("compose");
+        return;
     }
     // Seed the delivery-receipt checkbox (C-07) from the global "request for
     // all messages I send" setting. A composer that already carries a
@@ -452,11 +463,16 @@ pub(crate) fn show_composer_in_reading_pane_full(
             // close handler below performs the pop-back-in (the same path
             // as the window's own close button, minus the "already
             // finished" branch).
+            // Explicitly docking is different from closing the editor.
+            // Window-manager Close saves the draft, while this button
+            // moves the still-live session back to the reading pane.
+            let docking = Rc::new(Cell::new(false));
             let back_button = gtk::Button::from_icon_name(crate::window::themed_icon_name(&["popin1", "go-previous-symbolic", "go-back-symbolic"]));
-            back_button.set_tooltip_text(Some("Back to main window"));
+            back_button.set_tooltip_text(Some("Dock editor in main window"));
             {
                 let win = win.clone();
-                back_button.connect_clicked(move |_| win.close());
+                let docking = docking.clone();
+                back_button.connect_clicked(move |_| { docking.set(true); win.close(); });
             }
             // Header bar packing order: start-side children are prepended
             // (each new call lands leftmost), end-side children are appended
@@ -487,6 +503,10 @@ pub(crate) fn show_composer_in_reading_pane_full(
                 let compose_action_bar = compose_action_bar.clone();
                 let handle = handle;
                 win.connect_close_request(move |_| {
+                    if !handle.done.get() && !docking.replace(false) {
+                        handle.close_button.emit_clicked();
+                        return glib::Propagation::Stop;
+                    }
                     if !handle.done.get() {
                         handle.moving.set(true);
                         handle.popped_out.set(false);
@@ -745,7 +765,7 @@ pub(crate) fn show_composer_in_reading_pane_full(
                 }
             }))
         },
-        pop_out_on_open,
+        true, // keep the editor independent of mail selection
         ribbon_style,
     );
     // Replacing any previous composer's relay (dropped sender = its consumer
@@ -761,6 +781,19 @@ pub(crate) fn show_composer_in_reading_pane_full(
     // Cancel/Send.
     if let Some(bar) = &compose_action_bar {
         bar.install(&editor_toolbar);
+    }
+    if let Some(bar) = compose_action_bar {
+        let toolbar = editor_toolbar.clone();
+        let weak_composer = composer.downgrade();
+        reading_stack.connect_notify_local(Some("visible-child"), move |stack, _| {
+            let Some(composer) = weak_composer.upgrade() else { return; };
+            if composer.parent().as_ref() != Some(stack.upcast_ref::<gtk::Widget>()) { return; }
+            if stack.visible_child().as_ref() == Some(composer.upcast_ref::<gtk::Widget>()) {
+                bar.install(&toolbar);
+            } else {
+                bar.restore(&toolbar);
+            }
+        });
     }
     *compose_toolbar.borrow_mut() = Some(editor_toolbar);
     reading_stack.add_named(&composer, Some("compose"));

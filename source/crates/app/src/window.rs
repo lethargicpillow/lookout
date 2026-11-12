@@ -5333,9 +5333,22 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     mail_overview_box.append(&mail_calendar_overview.root);
     mail_overview_box.append(&mail_overview_day_list);
 
+    // Keep the calendar below the folder tree: the folder list scrolls
+    // independently and the agenda has a bounded height.
+    mail_overview_box.remove(&mail_overview_day_list);
+    let agenda_scroller = gtk::ScrolledWindow::builder()
+        .child(&mail_overview_day_list)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_height(true)
+        .max_content_height(150)
+        .build();
+    mail_overview_box.append(&agenda_scroller);
     let mail_calendar_overview_card = card_section(&mail_overview_box);
     mail_calendar_overview_card.add_css_class("folder-pane");
-    mail_calendar_overview_card.set_vexpand(true);
+    mail_calendar_overview_card.set_vexpand(false);
+    folder_card.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    folder_card.append(&mail_calendar_overview_card);
     // True while the window is too narrow to show the whole overview pane:
     // the pane is auto-hidden then instead of letting the paned clip it, and
     // stays hidden until a resize makes it fit again (the toggle handler and
@@ -6162,62 +6175,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     inner_content_box.append(&toolbars_box);
     inner_content_box.append(&root_stack);
 
-    // Resizable split between the main content and the overview pane -
-    // `nav_rail` stays a fixed-width sibling outside the split (it isn't
-    // meant to be resizable), but the overview pane's width is user-
-    // draggable like every other pane split in this app.
-    let content_and_overview_paned = gtk::Paned::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .start_child(&inner_content_box)
-        .end_child(&mail_calendar_overview_card)
-        .resize_start_child(true)
-        .resize_end_child(false)
-        .shrink_start_child(false)
-        .shrink_end_child(false)
-        .position(1340)
-        .build();
-    content_and_overview_paned.add_css_class("seamless-paned");
-
-    // If the window gets too narrow to fit the overview pane's whole minimum
-    // width beside the content's minimum, GTK clips the pane's right edge
-    // instead of shrinking it (both paned children refuse to shrink). Hide
-    // the pane in that case, and bring it back - if the View tab's toggle is
-    // still on - once a resize widens the window enough again. The separator
-    // also takes space between the children, so the fit threshold includes a
-    // small cushion so the pane neither clips nor flickers exactly at the
-    // boundary. `measure` ignores visibility, so the check works whether the
-    // pane is currently shown or hidden.
-    let check_overview_fits = {
-        let content_and_overview_paned = content_and_overview_paned.clone();
-        let mail_calendar_overview_card = mail_calendar_overview_card.clone();
-        let overview_pane_toggle = overview_pane_toggle.clone();
-        let overview_forced_hidden = overview_forced_hidden.clone();
-        let current_module = current_module.clone();
-        move || {
-            // Not allocated yet (build time / before the first map): leave
-            // visibility alone until the first real resize check.
-            if content_and_overview_paned.width() <= 0 {
-                return;
-            }
-            let start_min = content_and_overview_paned.start_child().map(|w| w.measure(gtk::Orientation::Horizontal, -1).0).unwrap_or(0);
-            let end_min = mail_calendar_overview_card.measure(gtk::Orientation::Horizontal, -1).0;
-            let fits = content_and_overview_paned.width() >= start_min + end_min + 8;
-            if !fits {
-                overview_forced_hidden.set(true);
-                mail_calendar_overview_card.set_visible(false);
-            } else if overview_forced_hidden.replace(false) {
-                // Only the Mail module shows the overview pane; the other
-                // modules' handlers own hiding it there.
-                if current_module.get() == "mail" {
-                    mail_calendar_overview_card.set_visible(overview_pane_toggle.is_active());
-                }
-            }
-        }
-    };
-
+    // The overview now belongs to the folder pane; the mail list and reading
+    // pane use the entire remaining width. No obsolete right-side split.
     let window_body = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).build();
     window_body.append(&nav_rail);
-    window_body.append(&content_and_overview_paned);
+    window_body.append(&inner_content_box);
 
     // The window's two modes: the app itself, and the File page (Outlook's
     // Backstage). The File page is built and added as "file" near the end of
@@ -6431,7 +6393,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let calendar_paned = calendar_paned.clone();
         let contacts_paned = contacts_paned.clone();
         let contacts_content_paned = contacts_content_paned.clone();
-        let content_and_overview_paned = content_and_overview_paned.clone();
         let state = state.clone();
         let pane_widths_applying = pane_widths_applying.clone();
         let mark_pane_restored = mark_pane_restored.clone();
@@ -6535,12 +6496,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 // the inner paneds are measured against, so restoring it last
                 // would leave every inner position computed against a stale
                 // allocation and guarantee a follow-up clamp.
-                restore(
-                    &content_and_overview_paned,
-                    PaneExtentKeys::fixed(crate::settings::PANE_MAIL_OVERVIEW_WIDTH_PCT),
-                    None,
-                    true,
-                );
                 restore(
                     &main_paned,
                     PaneExtentKeys::fixed(crate::settings::PANE_FOLDER_WIDTH_PCT),
@@ -6723,12 +6678,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             true,
             false,
         );
-        wire_pane_width_save(
-            &content_and_overview_paned,
-            PaneExtentKeys::fixed(crate::settings::PANE_MAIL_OVERVIEW_WIDTH_PCT),
-            true,
-            false,
-        );
     }
     // Each pane restores itself the moment it maps. This is what makes the
     // restore deterministic: every branch of `apply_stored_pane_widths` is
@@ -6761,7 +6710,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         wire_pane_width_restore(&calendar_paned, PaneExtentKeys::fixed(crate::settings::PANE_CALENDAR_SIDEBAR_WIDTH_PCT));
         wire_pane_width_restore(&contacts_paned, PaneExtentKeys::fixed(crate::settings::PANE_CONTACTS_SIDEBAR_WIDTH_PCT));
         wire_pane_width_restore(&contacts_content_paned, PaneExtentKeys::fixed(crate::settings::PANE_CONTACTS_DETAILS_WIDTH_PCT));
-        wire_pane_width_restore(&content_and_overview_paned, PaneExtentKeys::fixed(crate::settings::PANE_MAIL_OVERVIEW_WIDTH_PCT));
     }
     // --- Reading pane position: Right / Bottom / Off, shared by the View
     // ribbon's dropdown (the stateful `win.reading-pane-position` action) and
@@ -7008,7 +6956,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // so the applied percentages are against the final window size. Debounced
     // so the stored percentages are applied once the window stops resizing.
     {
-        let check_overview_fits = check_overview_fits.clone();
         let settings = settings.clone();
         let wired: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let schedule_apply_pane_widths = schedule_apply_pane_widths.clone();
@@ -7033,7 +6980,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             // whichever of the two notifies fires.
             let on_notify = {
                 let schedule_for_notify = schedule_apply_pane_widths.clone();
-                let check_for_notify = check_overview_fits.clone();
                 let settings_for_notify = settings.clone();
                 let window_for_width = window.clone();
                 let debounce = debounce.clone();
@@ -7043,7 +6989,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     }
                     let window_for_timeout = window_for_width.clone();
                     let schedule_for_timeout = schedule_for_notify.clone();
-                    let check_for_timeout = check_for_notify.clone();
                     let settings_for_timeout = settings_for_notify.clone();
                     let debounce_for_timeout = debounce.clone();
                     debounce.set(Some(glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
@@ -7055,7 +7000,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         // trail it by several frames, and a single shot here
                         // would restore them against half-settled widths.
                         schedule_for_timeout();
-                        check_for_timeout();
                         // Only the un-maximized size is worth restoring to -
                         // GTK4's own `default-width`/`default-height` follow
                         // the same rule (see comment above).
@@ -7074,8 +7018,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             // The window can also come up already too narrow (a restored
             // geometry) with no subsequent resize to trigger the check, so
             // run it once the initial allocation settles too.
-            let check_initial = check_overview_fits.clone();
-            glib::timeout_add_local_once(std::time::Duration::from_millis(150), check_initial);
         });
     }
     // Maximize/unmaximize toggles immediately (not a drag stream like a

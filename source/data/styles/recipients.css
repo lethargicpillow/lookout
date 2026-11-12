@@ -21,3 +21,30 @@
     min-height: 18px;
     padding: 0;
 }
+
+/* Composer-specific input surfaces, independent of theme accent/density. */
+.compose-recipient {
+    background-color: @view_bg_color;
+    border: 1px solid alpha(@view_fg_color, 0.22);
+    border-radius: 6px;
+    padding: 3px 8px;
+}
+.compose-recipient:focus-within {
+    border-color: @accent_bg_color;
+    box-shadow: inset 0 0 0 1px @accent_bg_color;
+}
+.compose-recipient text {
+    min-height: 24px;
+    color: @view_fg_color;
+}
+.compose-recipient label {
+    color: @view_fg_color;
+}
+.compose-subject, .compose-body {
+    border: 1px solid alpha(@view_fg_color, 0.22);
+    border-radius: 6px;
+    background-color: @view_bg_color;
+}
+.compose-subject:focus-within, .compose-body:focus-within {
+    border-color: @accent_bg_color;
+}

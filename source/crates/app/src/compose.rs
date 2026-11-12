@@ -66,6 +66,7 @@ pub struct PopOutHandle {
     /// the anchor for re-inserting the toolbar into the composer on pop-out.
     pub toolbar_anchor: gtk::Widget,
     pub cancel_button: gtk::Button,
+    pub close_button: gtk::Button,
     pub send_button: adw::SplitButton,
     pub from_dropdown: gtk::DropDown,
     pub read_receipt_toggle: gtk::ToggleButton,
@@ -1394,9 +1395,9 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, F
     let bullets = toolbar_command_button("list-bullet-symbolic", "Bulleted list", "InsertUnorderedList", &web_view);
     let numbering = toolbar_command_button("list-number-symbolic", "Numbered list", "InsertOrderedList", &web_view);
 
-    let font_sizes = gtk::StringList::new(&["Small", "Normal", "Large", "Huge"]);
-    let font_size_args = ["2", "3", "5", "7"];
-    let font_size = gtk::DropDown::builder().model(&font_sizes).selected(1).tooltip_text("Font size").build();
+    let font_sizes = gtk::StringList::new(&["8 pt", "10 pt", "12 pt", "14 pt", "18 pt", "24 pt", "36 pt"]);
+    let font_size_args = ["1", "2", "3", "4", "5", "6", "7"];
+    let font_size = gtk::DropDown::builder().model(&font_sizes).selected(2).tooltip_text("Font size").build();
     {
         let web_view = web_view.clone();
         font_size.connect_selected_notify(move |dropdown| {
@@ -1473,8 +1474,8 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, F
     let horizontal_rule = toolbar_command_button("insert-hr-symbolic", "Horizontal rule", "InsertHorizontalRule", &web_view);
     let clear_formatting = toolbar_command_button("edit-clear-all-symbolic", "Remove formatting", "RemoveFormat", &web_view);
 
-    let font_families = gtk::StringList::new(&["Sans-serif", "Serif", "Monospace", "Cursive"]);
-    let font_family_args = ["sans-serif", "serif", "monospace", "cursive"];
+    let font_family_args = ["sans-serif", "Arial", "Calibri", "Aptos", "Verdana", "Tahoma", "Times New Roman", "Liberation Sans", "Liberation Serif", "DejaVu Sans", "Noto Sans", "Courier New", "monospace"];
+    let font_families = gtk::StringList::new(&font_family_args);
     let font_family = gtk::DropDown::builder().model(&font_families).selected(0).tooltip_text("Font family").build();
     {
         let web_view = web_view.clone();
@@ -1809,19 +1810,17 @@ pub fn build_compose_view(
     // expandable list chip (P-05). The To row has no caption label of its
     // own: the To button in its header row (below) both labels the row and
     // opens the address-book picker.
-    let to_row = RecipientEntry::new("");
+    let to_row = RecipientEntry::new("To");
     if let Some(to) = &prefill.to {
         to_row.set_from_text(to);
     }
     let cc_row = RecipientEntry::new("Cc");
-    let cc_prefilled = prefill.cc.as_ref().is_some_and(|cc| !cc.trim().is_empty());
     if let Some(cc) = &prefill.cc {
         cc_row.set_from_text(cc);
     }
     // Bcc is only ever prefilled when reopening a saved draft; Reply and
     // Forward can't know a blind-copy list by definition.
     let bcc_row = RecipientEntry::new("Bcc");
-    let bcc_prefilled = prefill.bcc.as_ref().is_some_and(|bcc| !bcc.trim().is_empty());
     if let Some(bcc) = &prefill.bcc {
         bcc_row.set_from_text(bcc);
     }
@@ -1829,51 +1828,21 @@ pub fn build_compose_view(
         row.set_suggestion_source(suggestions.clone());
     }
 
-    // --- To/Cc/Bcc buttons: To leads the row (it doubles as the field's
-    // label, since the plain-line To field has no caption of its own) and
-    // opens the address-book picker; Cc/Bcc trail on the right, Gmail's
-    // classic reveal links, each hiding itself and showing its row once
-    // clicked. A row that already has prefilled content (e.g. Reply All's
-    // Cc list) starts shown, with its button skipped so there's nothing to
-    // click for a field the user can already see.
-    let to_button = gtk::Button::builder()
-        .label("To")
-        .css_classes(["flat"])
-        .tooltip_text("Add recipients from address book")
-        .build();
-    let cc_button = gtk::Button::builder().label("Cc").css_classes(["flat", "caption"]).tooltip_text("Show Cc").build();
-    let bcc_button = gtk::Button::builder().label("Bcc").css_classes(["flat", "caption"]).tooltip_text("Show Bcc").build();
-    to_row.add_header_suffix(&to_button);
-    to_row.add_header_suffix(&cc_button);
-    to_row.add_header_suffix(&bcc_button);
-    {
-        let to_row = to_row.clone();
-        to_button.connect_clicked(move |button| {
-            let on_add = {
-                let to_row = to_row.clone();
-                Rc::new(move |picked: Vec<Suggestion>| to_row.append_suggestions(&picked))
-            };
-            open_contact_picker(button.clone().upcast(), on_add);
-        });
-    }
-    cc_row.widget().set_visible(cc_prefilled);
-    cc_button.set_visible(!cc_prefilled);
-    bcc_row.widget().set_visible(bcc_prefilled);
-    bcc_button.set_visible(!bcc_prefilled);
-    {
-        let cc_row = cc_row.clone();
-        let cc_button_self = cc_button.clone();
-        cc_button.connect_clicked(move |_| {
-            cc_row.widget().set_visible(true);
-            cc_button_self.set_visible(false);
-        });
-    }
-    {
-        let bcc_row = bcc_row.clone();
-        let bcc_button_self = bcc_button.clone();
-        bcc_button.connect_clicked(move |_| {
-            bcc_row.widget().set_visible(true);
-            bcc_button_self.set_visible(false);
+    // All address fields remain visible. Each field has its own address
+    // book button, so GAL results can be added to To, Cc or Bcc directly.
+    for (row, label) in [(&to_row, "To"), (&cc_row, "Cc"), (&bcc_row, "Bcc")] {
+        row.widget().add_css_class("compose-recipient");
+        let button = gtk::Button::builder()
+            .label(if label == "To" { "Address Book…" } else { "Choose…" })
+            .tooltip_text(format!("Select {label} recipients from address book"))
+            .css_classes(["flat"])
+            .build();
+        row.add_header_suffix(&button);
+        let row = row.clone();
+        let open = open_contact_picker.clone();
+        button.connect_clicked(move |button| {
+            let row = row.clone();
+            open(button.clone().upcast(), Rc::new(move |picked: Vec<Suggestion>| row.append_suggestions(&picked)));
         });
     }
     let subject_row = adw::EntryRow::builder().title("Subject").build();
@@ -1943,11 +1912,13 @@ pub fn build_compose_view(
         }
     }
 
-    let fields_group = adw::PreferencesGroup::new();
-    fields_group.add(to_row.widget());
-    fields_group.add(cc_row.widget());
-    fields_group.add(bcc_row.widget());
-    fields_group.add(&subject_row);
+    let fields_group = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(5).build();
+    fields_group.append(to_row.widget());
+    fields_group.append(cc_row.widget());
+    fields_group.append(bcc_row.widget());
+    let subject_list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).css_classes(["boxed-list", "compose-subject"]).build();
+    subject_list.append(&subject_row);
+    fields_group.append(&subject_list);
 
     // --- Attachments: a canonical in-session list, rendered as removable
     // chips below the fields, same repopulate-from-truth shape
@@ -2068,7 +2039,7 @@ pub fn build_compose_view(
     let (rich_web_view, format_controls) = build_rich_editor(rich_initial);
     let format_controls = Rc::new(format_controls);
 
-    let body_stack = gtk::Stack::builder().hexpand(true).vexpand(true).build();
+    let body_stack = gtk::Stack::builder().hexpand(true).vexpand(true).css_classes(["compose-body"]).build();
     body_stack.add_named(&text_scroller, Some("text"));
     let rich_scroller = gtk::ScrolledWindow::builder().child(&*rich_web_view).hexpand(true).vexpand(true).build();
     body_stack.add_named(&rich_scroller, Some("rich"));
@@ -2259,7 +2230,8 @@ pub fn build_compose_view(
                 signature_list.remove(&child);
             }
             let signatures = signatures_source();
-            signature_button.set_sensitive(!signatures.is_empty());
+            // The management action is available even with zero signatures.
+            signature_button.set_sensitive(true);
             // Plain labels are appended (the ListBox wraps each in a row),
             // matching the recipient-suggestions popover. "Manage
             // Signatures…" is not part of the list - it's pinned below the
@@ -2473,18 +2445,13 @@ pub fn build_compose_view(
     // tags and its format.
     // Send and the Draft group act through the header's Send and Cancel and
     // the autosave, which are built further down; they are wired there.
-    let ribbon_send_button = gtk::Button::from_icon_name("mail-send-symbolic");
-    ribbon_send_button.set_tooltip_text(Some("Send"));
     let save_draft_button = gtk::Button::from_icon_name("document-save-symbolic");
     save_draft_button.set_tooltip_text(Some("Save draft"));
     let close_button = gtk::Button::from_icon_name("window-close-symbolic");
     close_button.set_tooltip_text(Some("Close (the draft is kept)"));
     let editor_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
-    editor_band.group("Send", |group| {
-        group.button(&ribbon_send_button, "mail-send-symbolic", "Send");
-    });
     let format = &format_controls;
-    editor_band.group("Basic Text", |group| {
+    editor_band.group("Font", |group| {
         group.plain();
         group.widget(&format.font_family);
         group.widget(&format.font_size);
@@ -2493,11 +2460,13 @@ pub fn build_compose_view(
         group.small_button(&format.italic, "format-text-italic-symbolic", "Italic");
         group.small_button(&format.underline, "format-text-underline-symbolic", "Underline");
         group.small_button(&format.strikethrough, "format-text-strikethrough-symbolic", "Strikethrough");
+        group.small_button(&format.clear_formatting, "edit-clear-all-symbolic", "Clear Formatting");
+    });
+    editor_band.group("Paragraph", |group| {
         group.small_button(&format.bullets, "list-bullet-symbolic", "Bullets");
         group.small_button(&format.numbering, "list-number-symbolic", "Numbering");
         group.small_button(&format.outdent, "format-indent-less-symbolic", "Decrease Indent");
         group.small_button(&format.indent, "format-indent-more-symbolic", "Increase Indent");
-        group.small_button(&format.clear_formatting, "edit-clear-all-symbolic", "Clear Formatting");
         group.small_button(&format.align_left, "format-justify-left-symbolic", "Align Left");
         group.small_button(&format.align_center, "format-justify-center-symbolic", "Center");
         group.small_button(&format.align_right, "format-justify-right-symbolic", "Align Right");
@@ -2529,7 +2498,35 @@ pub fn build_compose_view(
         group.button(&save_draft_button, "document-save-symbolic", "Save Draft");
         group.button(&close_button, "window-close-symbolic", "Close");
     });
-    let editor_toolbar = editor_band.root().clone();
+    // The composer owns its overflow controller, including when popped out.
+    let editor_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(4).hexpand(true).build();
+    let editor_stack = gtk::Stack::new();
+    editor_stack.add_named(editor_band.root(), Some("editor"));
+    let editor_scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::External)
+        .vscrollbar_policy(gtk::PolicyType::Never)
+        .hexpand(true)
+        .child(&editor_stack)
+        .build();
+    editor_toolbar.append(&editor_scroller);
+    let more = gtk::MenuButton::builder().icon_name("view-more-symbolic").tooltip_text("More commands").build();
+    let more_band = crate::ribbon::RibbonBand::new(&ribbon_style, &[]);
+    more_band.standalone().menu(&more, "view-more-symbolic", "More");
+    editor_toolbar.append(more_band.root());
+    let overflow_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).margin_top(6).margin_bottom(6).margin_start(6).margin_end(6).build();
+    let extras = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    extras.set_visible(false);
+    let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
+    separator.set_visible(false);
+    let popover = gtk::Popover::new();
+    let overflow_scroller = gtk::ScrolledWindow::builder().child(&overflow_box).max_content_height(420).propagate_natural_height(true).build();
+    popover.set_child(Some(&overflow_scroller));
+    more.set_popover(Some(&popover));
+    let overflow = crate::ribbon::RibbonOverflow::new(&ribbon_style, &more, &overflow_box, &extras, &separator, &more_band);
+    overflow.add_band(&editor_band);
+    overflow.attach(&editor_toolbar, &editor_stack);
+    // Keep the controller alive for this editor's lifetime.
+    popover.connect_show(move |_| overflow.sync_sections());
 
     {
         let web_view = rich_web_view.clone();
@@ -2793,10 +2790,6 @@ pub fn build_compose_view(
     }
     // The ribbon's Send, Save Draft and Close.
     {
-        let send_button = send_button.clone();
-        ribbon_send_button.connect_clicked(move |_| send_button.emit_by_name::<()>("clicked", &[]));
-    }
-    {
         let autosave = autosave.clone();
         // An explicit save: waits out an in-flight tick rather than doing
         // nothing, and stores even an untouched reply or forward.
@@ -3045,6 +3038,7 @@ pub fn build_compose_view(
         let title_label = title_label.clone();
         let status_label = status_label.clone();
         let cancel_button = cancel_button.clone();
+        let close_button = close_button.clone();
         let send_button = send_button.clone();
         let from_dropdown = from_dropdown.clone();
         let read_receipt_toggle = read_receipt_toggle.clone();
@@ -3063,6 +3057,7 @@ pub fn build_compose_view(
                 editor_toolbar: editor_toolbar.clone(),
                 toolbar_anchor: attachment_flow.clone().into(),
                 cancel_button: cancel_button.clone(),
+                close_button: close_button.clone(),
                 send_button: send_button.clone(),
                 from_dropdown: from_dropdown.clone(),
                 read_receipt_toggle: read_receipt_toggle.clone(),
