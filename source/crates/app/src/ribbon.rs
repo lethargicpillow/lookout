@@ -214,6 +214,7 @@ struct BandGroup {
     /// The group's name under its controls, drawn in the Classic layout only.
     title: Option<glib::WeakRef<gtk::Label>>,
     controls: Vec<usize>,
+    compact_menu: Option<glib::WeakRef<gtk::MenuButton>>,
 }
 
 struct ControlParts {
@@ -285,6 +286,34 @@ impl RibbonBand {
         let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(2).valign(gtk::Align::Center).build();
         row.add_css_class("ribbon-group-row");
         group_box.append(&row);
+        // A collapsed group keeps the original command row in a popover;
+        // no cloned commands, no lost toggle state or signal handlers.
+        let compact_menu = gtk::MenuButton::builder().visible(false).always_show_arrow(true).build();
+        let compact_content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).build();
+        let icon_name = match name {
+            "Font" | "Basic Text" => "format-text-bold-symbolic",
+            "Paragraph" => "format-justify-left-symbolic",
+            "Include" | "Insert" => "mail-attachment-symbolic",
+            "Names" => "address-book-symbolic",
+            "Draft" => "document-save-symbolic",
+            "Tracking" | "Tags" | "Options" => "emblem-important-symbolic",
+            "Respond" => "mail-reply-sender-symbolic",
+            "Delete" => "user-trash-symbolic",
+            "Move" => "folder-symbolic",
+            "Categories" => "tag-symbolic",
+            "Find" => "system-search-symbolic",
+            _ => "view-more-symbolic",
+        };
+        let icon = gtk::Image::from_icon_name(icon_name);
+        icon.set_pixel_size(24);
+        compact_content.append(&icon);
+        compact_content.append(&gtk::Label::new(Some(name)));
+        compact_menu.set_child(Some(&compact_content));
+        compact_menu.set_tooltip_text(Some(name));
+        compact_menu.add_css_class("ribbon-collapsed-group");
+        let popover = gtk::Popover::new();
+        compact_menu.set_popover(Some(&popover));
+        group_box.append(&compact_menu);
         let title = gtk::Label::builder().label(name).css_classes(["ribbon-group-title", "dim-label"]).build();
         title.set_visible(self.style.mode() == RibbonMode::Classic);
         group_box.append(&title);
@@ -300,6 +329,7 @@ impl RibbonBand {
                 divider: Some(divider.downgrade()),
                 title: Some(title.downgrade()),
                 controls: Vec::new(),
+                compact_menu: Some(compact_menu.downgrade()),
             });
             state.groups.len() - 1
         };
@@ -327,6 +357,7 @@ impl RibbonBand {
                 divider: None,
                 title: None,
                 controls: Vec::new(),
+                compact_menu: None,
             });
             state.groups.len() - 1
         };
@@ -638,6 +669,26 @@ fn children(widget: &gtk::Widget) -> Vec<gtk::Widget> {
     std::iter::successors(widget.first_child(), |child| child.next_sibling()).collect()
 }
 
+/// Collapse/restore a named group's actual widget row. Returning it to the
+/// original parent preserves all command state and restores its ordering.
+fn set_group_collapsed(group: &BandGroup, collapsed: bool) {
+    let Some(menu) = group.compact_menu.as_ref().and_then(|m| m.upgrade()) else { return; };
+    let Some(container) = group.container.as_ref().and_then(|c| c.upgrade()) else { return; };
+    let Some(row) = group.row.upgrade() else { return; };
+    let Some(popover) = menu.popover() else { return; };
+    if collapsed == menu.is_visible() { return; }
+    if collapsed {
+        container.remove(&row);
+        popover.set_child(Some(&row));
+        menu.set_visible(true);
+    } else {
+        menu.popdown();
+        popover.set_child(None::<&gtk::Widget>);
+        container.prepend(&row);
+        menu.set_visible(false);
+    }
+}
+
 fn apply_band(root: &gtk::Box, state: &BandState, mode: RibbonMode) {
     if mode == RibbonMode::Classic {
         root.add_css_class("ribbon-classic");
@@ -645,6 +696,7 @@ fn apply_band(root: &gtk::Box, state: &BandState, mode: RibbonMode) {
         root.remove_css_class("ribbon-classic");
     }
     for group in &state.groups {
+        if mode != RibbonMode::Classic { set_group_collapsed(group, false); }
         place_group(state, group, mode);
         if let Some(title) = group.title.as_ref().and_then(|title| title.upgrade()) {
             title.set_visible(mode == RibbonMode::Classic);
@@ -887,15 +939,44 @@ impl OverflowInner {
         // entire command ribbon into an anonymous row of glyphs.
         let mode = self.style.mode();
         if mode == RibbonMode::Classic {
+            // Collapse the widest groups first. A compact button stays in
+            // its original position and opens the group's full command row.
+            // Keep the standard Layout button whenever the groups can fit.
+            {
+                let state = active.state.borrow();
+                let mut groups: Vec<(usize, i32)> = state.groups.iter().enumerate()
+                    .filter_map(|(i, group)| group.container.as_ref().and_then(|c| c.upgrade()).map(|c| (i, c.measure(gtk::Orientation::Horizontal, -1).1)))
+                    .collect();
+                groups.sort_by_key(|(_, width)| std::cmp::Reverse(*width));
+                for (index, _) in groups {
+                    if root.measure(gtk::Orientation::Horizontal, -1).1 <= available { break; }
+                    let before = root.measure(gtk::Orientation::Horizontal, -1).1;
+                    set_group_collapsed(&state.groups[index], true);
+                    if root.measure(gtk::Orientation::Horizontal, -1).1 >= before {
+                        set_group_collapsed(&state.groups[index], false);
+                    }
+                }
+            }
+            if root.measure(gtk::Orientation::Horizontal, -1).1 <= available {
+                self.finish_fit(&active, layout.as_ref());
+                return;
+            }
             if let Some(layout) = &layout {
                 self.move_band_to_overflow(layout);
                 if let Some(root) = layout.root.upgrade() { root.set_visible(false); }
             }
             available = full_available;
-            let groups: Vec<Vec<usize>> = active.state.borrow().groups.iter().map(|group| group.controls.clone()).collect();
-            for group in groups.iter().rev() {
+            // At truly narrow widths move entire groups into More. Restore
+            // the group row before moving its commands out of that row.
+            let group_count = active.state.borrow().groups.len();
+            for index in (0..group_count).rev() {
                 if root.measure(gtk::Orientation::Horizontal, -1).1 <= available { break; }
-                for &index in group.iter().rev() {
+                let controls = {
+                    let state = active.state.borrow();
+                    set_group_collapsed(&state.groups[index], false);
+                    state.groups[index].controls.clone()
+                };
+                for index in controls.into_iter().rev() {
                     self.move_control_to_overflow(&active, index);
                 }
                 sync_group_visibility(&active.state.borrow());
@@ -1095,6 +1176,7 @@ fn restore_band(band: &RegisteredBand, mode: RibbonMode) {
     };
     let state = band.state.borrow();
     state.compact.set(false);
+    for group in &state.groups { set_group_collapsed(group, false); }
     for control in &state.controls {
         if control.in_overflow.replace(false) {
             if let Some(widget) = control.widget.upgrade() {
@@ -1177,6 +1259,28 @@ mod tests {
         for (i, mode) in RibbonMode::ALL.into_iter().enumerate() {
             assert_eq!(mode.index(), i as u32);
         }
+    }
+
+    #[test]
+    fn named_group_collapses_and_restores_original_commands() {
+        if !crate::gtk_test::gtk_ready() { return; }
+        let style = RibbonStyle::new(RibbonMode::Classic);
+        let band = RibbonBand::new(&style, &[]);
+        let button = gtk::Button::new();
+        band.group("Include", |group| { group.button(&button, "mail-attachment-symbolic", "Attach Files"); });
+        let state = band.state.borrow();
+        let group = &state.groups[0];
+        let row = group.row.upgrade().unwrap();
+        let container = group.container.as_ref().unwrap().upgrade().unwrap();
+        let menu = group.compact_menu.as_ref().unwrap().upgrade().unwrap();
+        set_group_collapsed(group, true);
+        assert!(menu.is_visible());
+        assert_eq!(menu.popover().unwrap().child().unwrap(), row.clone().upcast::<gtk::Widget>());
+        assert_eq!(button.parent().unwrap(), row.clone().upcast::<gtk::Widget>());
+        set_group_collapsed(group, false);
+        assert!(!menu.is_visible());
+        assert_eq!(row.parent().unwrap(), container.upcast::<gtk::Widget>());
+        assert_eq!(button.parent().unwrap(), row.upcast::<gtk::Widget>());
     }
 
     #[test]
