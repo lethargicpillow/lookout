@@ -363,6 +363,45 @@ impl DavClient {
     /// known to have contacts, i.e. it reads the empty filter as "match
     /// nothing" despite RFC 6352's own example using exactly that). Multiget
     /// avoids filter semantics entirely by asking for specific known hrefs.
+    /// A complete, verified member listing for DavMail. Unlike its unsupported
+    /// sync-collection REPORT, Depth:1 PROPFIND enumerates the actual objects.
+    /// Return membership separately from parsed cards: a missing or malformed
+    /// vCard must not be mistaken for a server-side deletion.
+    pub async fn fetch_davmail_contacts_snapshot(&self, addressbook: &AddressBookInfo, credential: &Credential) -> Result<(Vec<String>, Vec<ContactRecord>)> {
+        let url = self.resolve(&addressbook.href)?;
+        let members = self.propfind(url.clone(), 1, credential, &["D:getetag", "D:resourcetype"]).await?;
+        let own_href = addressbook.href.trim_end_matches('/');
+        if !members.iter().any(|r| r.href.trim_end_matches('/') == own_href) {
+            return Err(Error::Discovery("DavMail contact listing did not include its collection".into()));
+        }
+        let hrefs: Vec<String> = members.into_iter()
+            .filter(|r| r.href.trim_end_matches('/') != own_href)
+            .filter(|r| r.prop(NS_DAV, "getetag").is_some() || r.href.to_ascii_lowercase().ends_with(".vcf"))
+            .map(|r| r.href).collect();
+        if hrefs.is_empty() {
+            return Ok((hrefs, Vec::new()));
+        }
+        let body = xml::build_addressbook_multiget_body(&hrefs, &["D:getetag", "CD:address-data"]);
+        let responses = self.report(url, 1, credential, body).await?;
+        let mut records = Vec::new();
+        for response in responses {
+            let Some(data) = response.prop(NS_CARDDAV, "address-data") else { continue };
+            let href = response.href.clone();
+            let etag = response.prop(NS_DAV, "getetag").map(str::to_string);
+            if let Ok(card) = VCard::parse(data) {
+                records.push(ContactRecord { href, etag, card });
+            }
+        }
+        if records.is_empty() {
+            return Err(Error::Discovery("DavMail returned no readable cards for a non-empty address book".into()));
+        }
+        Ok((hrefs, records))
+    }
+
+    pub fn uses_davmail_contacts(&self) -> bool {
+        self.is_davmail_collection("contacts")
+    }
+
     pub async fn fetch_addressbook_contacts(&self, addressbook: &AddressBookInfo, credential: &Credential) -> Result<Vec<DavResponse>> {
         let url = self.resolve(&addressbook.href)?;
         let members = self.propfind(url.clone(), 1, credential, &["D:getetag"]).await?;

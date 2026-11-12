@@ -2804,6 +2804,15 @@ async fn sync_addressbook_into(
     book: &lookout_dav::AddressBookInfo,
     cache: &ContactsCache,
 ) -> Result<Vec<lookout_dav::ContactRecord>, String> {
+    if client.uses_davmail_contacts() {
+        let (hrefs, records) = client.fetch_davmail_contacts_snapshot(book, credential).await.map_err(|e| e.to_string())?;
+        let live: HashSet<&str> = hrefs.iter().map(String::as_str).collect();
+        let deleted: Vec<String> = cache.load_contacts().map_err(|e| e.to_string())?.into_iter()
+            .filter(|contact| contact.book_href == book.href && !live.contains(contact.href.as_str()))
+            .map(|contact| contact.href).collect();
+        cache.apply_delta(&book.href, None, &records, &deleted).map_err(|e| e.to_string())?;
+        return Ok(records);
+    }
     let stored_token = cache.sync_token(&book.href).map_err(|e| e.to_string())?;
     if stored_token.is_some() {
         match client.sync_addressbook_delta(book, credential, stored_token.as_deref()).await {
