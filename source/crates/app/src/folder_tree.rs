@@ -110,16 +110,43 @@ fn parent_path(path: &str, delimiter: char) -> Option<String> {
     path.rsplit_once(delimiter).map(|(parent, _)| parent.to_string())
 }
 
-/// Inbox first (Bulwark/most mail clients pin it), then alphabetical by
-/// display name - simple and predictable for Phase 1.
+/// Pin the standard mail folders in workflow order. DavMail exposes
+/// Exchange's Unsent Messages as a custom folder, not an IMAP special use.
+fn folder_rank(role: MailboxRole, name: &str) -> u8 {
+    match role {
+        MailboxRole::Inbox => 0,
+        MailboxRole::Sent => 1,
+        MailboxRole::Drafts => 2,
+        MailboxRole::Trash => 4,
+        _ if matches!(name.trim().to_lowercase().as_str(), "unsent messages" | "outbox" | "неотправленные" | "исходящие") => 3,
+        _ => 5,
+    }
+}
+
 fn sort_paths(paths: &mut [String], by_path: &HashMap<String, Mailbox>) {
     paths.sort_by(|a, b| {
         let ma = &by_path[a];
         let mb = &by_path[b];
-        let a_is_inbox = matches!(ma.role, MailboxRole::Inbox);
-        let b_is_inbox = matches!(mb.role, MailboxRole::Inbox);
-        b_is_inbox.cmp(&a_is_inbox).then_with(|| ma.name.to_lowercase().cmp(&mb.name.to_lowercase()))
+        folder_rank(ma.role, &ma.name).cmp(&folder_rank(mb.role, &mb.name))
+            .then_with(|| ma.name.to_lowercase().cmp(&mb.name.to_lowercase()))
+            .then_with(|| a.cmp(b))
     });
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+
+    #[test]
+    fn standard_mail_folders_follow_workflow_order() {
+        assert_eq!(folder_rank(MailboxRole::Inbox, "INBOX"), 0);
+        assert_eq!(folder_rank(MailboxRole::Sent, "Sent Items"), 1);
+        assert_eq!(folder_rank(MailboxRole::Drafts, "Drafts"), 2);
+        assert_eq!(folder_rank(MailboxRole::Custom, "Unsent Messages"), 3);
+        assert_eq!(folder_rank(MailboxRole::Trash, "Deleted Items"), 4);
+        assert_eq!(folder_rank(MailboxRole::Junk, "Junk Email"), 5);
+        assert_eq!(folder_rank(MailboxRole::Custom, "Conversation History"), 5);
+    }
 }
 
 /// Builds the `Gtk.TreeListModel` for the folder sidebar from every

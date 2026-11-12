@@ -25,9 +25,9 @@
 /* Composer-specific input surfaces, independent of theme accent/density. */
 .compose-recipient {
     background-color: @view_bg_color;
-    border: 1px solid alpha(@view_fg_color, 0.22);
+    border: 1px solid alpha(@view_fg_color, 0.30);
     border-radius: 6px;
-    padding: 3px 8px;
+    padding: 3px 6px;
 }
 .compose-recipient:focus-within {
     border-color: @accent_bg_color;
@@ -47,4 +47,20 @@
 }
 .compose-subject:focus-within, .compose-body:focus-within {
     border-color: @accent_bg_color;
+}
+
+/* The actual editable widget, not just the outer recipient container. */
+.compose-address-input {
+    background-color: alpha(@view_fg_color, 0.08);
+    border: 1px solid alpha(@view_fg_color, 0.32);
+    border-radius: 4px;
+    padding: 4px 8px;
+    min-height: 24px;
+}
+.compose-address-input:focus {
+    border-color: @accent_bg_color;
+    background-color: @view_bg_color;
+}
+.compose-address-input placeholder {
+    color: alpha(@view_fg_color, 0.66);
 }

@@ -232,6 +232,28 @@ impl RecipientEntry {
         Self::build(title, false)
     }
 
+    /// Composer variant: a compact, full-width text input alongside its
+    /// label and picker; committed chips wrap below only when present.
+    pub fn new_compose(title: &str) -> Self {
+        let this = Self::build(title, false);
+        let flow = this.flow.as_ref().expect("chip mode");
+        let wrapper = flow.first_child().and_downcast::<gtk::FlowBoxChild>().expect("entry wrapper");
+        wrapper.set_child(None::<&gtk::Widget>);
+        flow.remove(&wrapper);
+        if let Some(label) = this.header.first_child().and_downcast::<gtk::Label>() {
+            label.set_hexpand(false);
+            label.set_width_chars(4);
+            label.remove_css_class("dim-label");
+            label.remove_css_class("caption");
+        }
+        this.entry.set_width_request(0);
+        this.entry.set_placeholder_text(Some("Type a name or email"));
+        this.entry.add_css_class("compose-address-input");
+        this.header.append(&this.entry);
+        flow.set_visible(false);
+        this
+    }
+
     /// A plain-line field: recipients are raw comma-separated text, no
     /// chips. An empty `title` omits the caption label. Kept for test
     /// coverage of the plain path; the composer and event editor both use
@@ -664,6 +686,9 @@ impl RecipientEntry {
         // An expanded list contributes its member chips right after its own
         // list chip.
         let chips = self.tokens.borrow().clone();
+        if self.entry.parent().as_ref() == Some(self.header.upcast_ref::<gtk::Widget>()) {
+            flow.set_visible(!chips.is_empty());
+        }
         let mut position = 0i32;
         for (index, chip) in chips.iter().enumerate() {
             match chip {

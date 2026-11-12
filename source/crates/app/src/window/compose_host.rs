@@ -440,7 +440,7 @@ pub(crate) fn show_composer_in_reading_pane_full(
             // A header bar of its own is what gives the window a drag
             // region - a bare `adw::Window` has none (the People pop-out
             // needed the same, see 0.8.0).
-            let win = adw::Window::builder().default_width(860).default_height(640).build();
+            let win = adw::Window::builder().default_width(1000).default_height(720).build();
             let header = adw::HeaderBar::new();
             header.set_title_widget(Some(&adw::WindowTitle::new(&title, "")));
             // Cancel, Send, From and the read-receipt toggle live in the

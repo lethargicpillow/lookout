@@ -1810,17 +1810,17 @@ pub fn build_compose_view(
     // expandable list chip (P-05). The To row has no caption label of its
     // own: the To button in its header row (below) both labels the row and
     // opens the address-book picker.
-    let to_row = RecipientEntry::new("To");
+    let to_row = RecipientEntry::new_compose("To");
     if let Some(to) = &prefill.to {
         to_row.set_from_text(to);
     }
-    let cc_row = RecipientEntry::new("Cc");
+    let cc_row = RecipientEntry::new_compose("Cc");
     if let Some(cc) = &prefill.cc {
         cc_row.set_from_text(cc);
     }
     // Bcc is only ever prefilled when reopening a saved draft; Reply and
     // Forward can't know a blind-copy list by definition.
-    let bcc_row = RecipientEntry::new("Bcc");
+    let bcc_row = RecipientEntry::new_compose("Bcc");
     if let Some(bcc) = &prefill.bcc {
         bcc_row.set_from_text(bcc);
     }
@@ -1834,6 +1834,7 @@ pub fn build_compose_view(
         row.widget().add_css_class("compose-recipient");
         let button = gtk::Button::builder()
             .label(if label == "To" { "Address Book…" } else { "Choose…" })
+            .width_request(116)
             .tooltip_text(format!("Select {label} recipients from address book"))
             .css_classes(["flat"])
             .build();
@@ -1912,7 +1913,7 @@ pub fn build_compose_view(
         }
     }
 
-    let fields_group = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(5).build();
+    let fields_group = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).build();
     fields_group.append(to_row.widget());
     fields_group.append(cc_row.widget());
     fields_group.append(bcc_row.widget());
@@ -2040,6 +2041,8 @@ pub fn build_compose_view(
     let format_controls = Rc::new(format_controls);
 
     let body_stack = gtk::Stack::builder().hexpand(true).vexpand(true).css_classes(["compose-body"]).build();
+    body_stack.set_hhomogeneous(false);
+    body_stack.set_vhomogeneous(false);
     body_stack.add_named(&text_scroller, Some("text"));
     let rich_scroller = gtk::ScrolledWindow::builder().child(&*rich_web_view).hexpand(true).vexpand(true).build();
     body_stack.add_named(&rich_scroller, Some("rich"));
@@ -2758,9 +2761,9 @@ pub fn build_compose_view(
         .margin_end(12)
         .build();
     content.append(&top_row);
+    content.append(&editor_toolbar);
     content.append(&fields_group);
     content.append(&attachment_flow);
-    content.append(&editor_toolbar);
     content.append(&body_stack);
 
     // File drop (item 1.20 / C-15): dropping files onto the composer body
@@ -3045,7 +3048,6 @@ pub fn build_compose_view(
         let delivery_receipt_toggle = delivery_receipt_toggle.clone();
         let light_view_button = light_view_button.clone();
         let editor_toolbar = editor_toolbar.clone();
-        let attachment_flow = attachment_flow.clone();
         pop_out_button.connect_clicked(move |_| {
             if popped_out.get() {
                 return;
@@ -3055,7 +3057,7 @@ pub fn build_compose_view(
             on_pop_out(PopOutHandle {
                 widget: content.clone(),
                 editor_toolbar: editor_toolbar.clone(),
-                toolbar_anchor: attachment_flow.clone().into(),
+                toolbar_anchor: top_row.clone().into(),
                 cancel_button: cancel_button.clone(),
                 close_button: close_button.clone(),
                 send_button: send_button.clone(),

@@ -2795,7 +2795,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // state it searches, and parented to the header later.
     let search_entry = gtk::SearchEntry::builder()
         .placeholder_text("Search mail")
-        .width_request(360)
+        .width_request(140)
+        .hexpand(true)
         .tooltip_text("Search mail (Ctrl+F)")
         .css_classes(["header-search-entry"])
         .build();
@@ -2850,6 +2851,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     message_box.append(&search_refiner_row);
     message_box.append(&message_list_stack);
     let message_card = card_section(&message_box);
+    message_card.set_hexpand(true);
     message_card.add_css_class("card-flush-start");
     message_card.set_margin_start(0);
     // Halves the gap to the reading pane: that gap is this margin plus the
@@ -3832,8 +3834,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .end_child(&reading_card)
         .resize_start_child(false)
         .resize_end_child(true)
-        .shrink_start_child(false)
-        .shrink_end_child(false)
+        .shrink_start_child(true)
+        .shrink_end_child(true)
         .position(368)
         .build();
     // The message list's row style follows the split's position (the list
@@ -3907,7 +3909,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .resize_start_child(false)
         .resize_end_child(true)
         .shrink_start_child(false)
-        .shrink_end_child(false)
+        .shrink_end_child(true)
         .position(220)
         .build();
     main_paned.add_css_class("seamless-paned");
@@ -4110,7 +4112,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // start side is empty. Strict centring keeps the search cluster in the
     // true middle of the bar instead of letting the asymmetric end-side
     // controls pull it toward the start.
-    window_header.set_centering_policy(adw::CenteringPolicy::Strict);
+    window_header.set_centering_policy(adw::CenteringPolicy::Loose);
     // The centred search cluster (UX-11): a scope dropdown, the search entry,
     // and a "Refine" button that opens the advanced-search form. The title
     // widget is the header bar's centre slot, so this replaces the redundant
@@ -4131,6 +4133,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     calendar_scope_dropdown.set_selected(if calendar_scope_checked { 1 } else { 0 });
     calendar_scope_dropdown.set_tooltip_text(Some("Calendar search scope"));
     let scope_stack = gtk::Stack::new();
+    scope_stack.set_hhomogeneous(false);
     scope_stack.add_named(&scope_dropdown, Some("mail"));
     scope_stack.add_named(&calendar_scope_dropdown, Some("calendar"));
     scope_stack.set_visible_child_name("mail");
@@ -5345,6 +5348,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .build();
     mail_overview_box.append(&agenda_scroller);
     let mail_calendar_overview_card = card_section(&mail_overview_box);
+    mail_calendar_overview_card.set_margin_start(2);
+    mail_calendar_overview_card.set_margin_end(2);
+    mail_calendar_overview_card.set_margin_top(2);
+    mail_calendar_overview_card.set_margin_bottom(2);
     mail_calendar_overview_card.add_css_class("folder-pane");
     mail_calendar_overview_card.set_vexpand(false);
     folder_card.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
@@ -6218,6 +6225,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     background_dim.set_opacity(0.75);
     window_overlay.add_overlay(&background_dim);
     window_overlay.add_overlay(&toast_overlay);
+    // The wallpaper is decorative; the actual application must participate
+    // in window geometry. Otherwise GtkOverlay can allocate a child wider
+    // than the window, clipping the ribbon and even window header controls.
+    window_overlay.set_measure_overlay(&toast_overlay, true);
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
