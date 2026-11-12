@@ -390,7 +390,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(MAIL_FAVORITES, Value::Strv(Vec::new()));
     map.insert(MAIL_FAVORITES_CUSTOM_ORDER, Value::Bool(false));
     map.insert(ACCOUNTS_DISABLED, Value::Strv(Vec::new()));
-    map.insert(MAIL_THREADED, Value::Bool(true));
+    map.insert(MAIL_THREADED, Value::Bool(false));
     map.insert(MAIL_CONVERSATION_ORDER, Value::String("newest-top".into()));
     map.insert(MAIL_CONVERSATION_INCLUDE_SENT, Value::Bool(true));
     map.insert(MAIL_FILTERS, Value::Strv(Vec::new()));

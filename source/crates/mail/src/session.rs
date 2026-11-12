@@ -7885,11 +7885,15 @@ async fn fetch_previews(
 /// server-side - the UI layer decides if/when to mark as read, per the
 /// mark-as-read setting (item 1.8).
 async fn fetch_body(session: &mut Session<SessionStream>, uid: Uid) -> Result<Option<Vec<u8>>> {
-    let fetches: Vec<_> = session.uid_fetch(uid.0.to_string(), "BODY.PEEK[]").await?.try_collect().await?;
-    let Some(fetch) = fetches.into_iter().find(|f| f.uid == Some(uid.0)) else {
+    tracing::debug!(uid = uid.0, "full MIME fetch started");
+    let fetches: Vec<_> = session.uid_fetch(uid.0.to_string(), "(UID BODY.PEEK[])").await?.try_collect().await?;
+    let Some(fetch) = fetches.iter().find(|f| f.uid == Some(uid.0) && f.body().is_some()) else {
+        tracing::warn!(uid = uid.0, responses = fetches.len(), matching_uid = fetches.iter().any(|f| f.uid == Some(uid.0)), "full MIME fetch returned no matching body");
         return Ok(None);
     };
-    Ok(fetch.body().map(|body| body.to_vec()))
+    let body = fetch.body().map(|body| body.to_vec());
+    tracing::debug!(uid = uid.0, bytes = body.as_ref().map_or(0, Vec::len), "full MIME fetch completed");
+    Ok(body)
 }
 
 /// Fetches a message's whole raw RFC 5322 bytes, serving a previously-fetched
@@ -8428,6 +8432,9 @@ async fn fetch_body_cached(
             .await?
             .and_then(|raw| parse_body(uid, &raw)),
     };
+    if body.is_none() && whole_mime_only {
+        tracing::warn!(uid = uid.0, "DavMail full MIME body unavailable or could not be decoded");
+    }
     if let Some(body) = &body {
         if let Some(Err(e)) = cache_op(cache, {
             let mailbox = mailbox.clone();

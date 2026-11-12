@@ -210,7 +210,7 @@
       <description>AccountIds of GOA accounts whose mail, calendars, tasks and contacts Lookout must not process; everything else is enabled by default.</description>
     </key>
     <key name="mail-threaded" type="b">
-      <default>true</default>
+      <default>false</default>
       <summary>Group replies into conversations</summary>
       <description>Show replies as collapsible conversation threads in the message list instead of bare messages.</description>
     </key>
