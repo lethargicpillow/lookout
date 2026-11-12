@@ -5,7 +5,6 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use adw::prelude::*;
 use chrono::Timelike;
 use gtk::{gio, glib};
 use lookout_core::calendar_protocol::CalendarCommand;

@@ -7,7 +7,6 @@ use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use adw::prelude::*;
 use gtk::{gio, glib};
 use lookout_core::text::human_size;
 use lookout_core::{BodyPart, EmailSummary, MailboxId, Uid};

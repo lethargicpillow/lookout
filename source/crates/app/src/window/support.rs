@@ -7,7 +7,6 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use adw::prelude::*;
 use gtk::glib;
 use lookout_core::{AccountId, EmailSummary, Mailbox, MailboxId, MailboxRole, SystemFlagBit, Uid};
 use lookout_mail::session::AccountCommand;

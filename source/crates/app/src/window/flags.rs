@@ -5,7 +5,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use adw::prelude::*;
 use gtk::glib;
 use lookout_core::{EmailSummary, MailboxId, Uid};
 use lookout_mail::session::AccountCommand;

@@ -5,11 +5,9 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use adw::prelude::*;
 use gtk::{gio, glib};
 use lookout_core::{AccountId, EmailAddress, EmailSummary, MailboxId, Uid, UidValidity};
 use lookout_mail::session::AccountCommand;
-use webkit::prelude::*;
 
 use crate::worker::Worker;
 

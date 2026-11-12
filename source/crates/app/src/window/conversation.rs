@@ -6,12 +6,10 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use adw::prelude::*;
 use gtk::{gio, glib};
 use lookout_core::text::human_size;
 use lookout_core::{BodyPart, EmailBody, EmailSummary, MailboxId, MailboxRole, Uid, UidValidity};
 use lookout_mail::session::AccountCommand;
-use webkit::prelude::*;
 
 use crate::message_list::ThreadId;
 use crate::worker::Worker;

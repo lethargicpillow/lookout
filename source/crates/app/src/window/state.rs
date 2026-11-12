@@ -9,7 +9,6 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use adw::prelude::*;
 use gtk::{gio, glib};
 use lookout_core::calendar_protocol::{CalendarCommand, ConnectionState as CalConnectionState};
 use lookout_core::{

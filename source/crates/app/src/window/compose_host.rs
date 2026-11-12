@@ -5,7 +5,6 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use adw::prelude::*;
 use gtk::glib;
 use lookout_core::{AccountId, CalendarEvent, ContactsProvider, EmailAddress, EmailSummary};
 use lookout_mail::session::AccountCommand;

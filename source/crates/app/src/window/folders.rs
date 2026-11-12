@@ -6,7 +6,6 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use adw::prelude::*;
 use gtk::glib;
 use lookout_core::{display_name, AccountId, Mailbox, MailboxId, MailboxRole};
 use lookout_mail::session::AccountCommand;

@@ -6,12 +6,10 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use adw::prelude::*;
 use gtk::glib;
 use lookout_core::calendar_protocol::CalendarCommand;
 use lookout_core::{AccountId, BodyPart, CalendarId, CalendarTask, EmailBody, EmailSummary, MailboxId, MailboxRole, SystemFlagBit, TaskPriority, TaskStatus, TaskUid, Uid};
 use lookout_mail::session::AccountCommand;
-use webkit::prelude::*;
 
 use crate::google_tasks::{self, GoogleTasksCommand};
 use crate::graph_account::GraphFeatureClient;

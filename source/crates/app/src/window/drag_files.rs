@@ -249,7 +249,6 @@ impl MessageFilesProvider {
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
-    use gtk::prelude::*;
     use lookout_core::AccountId;
 
     use super::*;

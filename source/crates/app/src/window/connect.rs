@@ -6,7 +6,6 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use adw::prelude::*;
 use gtk::{gio, glib};
 use lookout_core::calendar_protocol::{CalendarCommand, CalendarSessionEvent, ConnectionState as CalConnectionState};
 use lookout_core::{AccountId, CalendarId, CalendarInfo, Mailbox, MailboxId, MailboxRole, SchedulingInfo, Uid};
