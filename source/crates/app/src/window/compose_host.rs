@@ -435,7 +435,7 @@ pub(crate) fn show_composer_in_reading_pane_full(
             if let Some(bar) = &compose_action_bar {
                 bar.restore(&handle.editor_toolbar);
                 handle.editor_toolbar.add_css_class("window-icon-toolbar-background");
-                handle.widget.insert_child_after(&handle.editor_toolbar, Some(&handle.toolbar_anchor));
+                handle.widget.prepend(&handle.editor_toolbar);
             }
             // A header bar of its own is what gives the window a drag
             // region - a bare `adw::Window` has none (the People pop-out
@@ -443,51 +443,16 @@ pub(crate) fn show_composer_in_reading_pane_full(
             let win = adw::Window::builder().default_width(1000).default_height(720).build();
             let header = adw::HeaderBar::new();
             header.set_title_widget(Some(&adw::WindowTitle::new(&title, "")));
-            // Cancel, Send, From and the read-receipt toggle live in the
-            // title bar while popped out - the composer's own header row is
-            // redundant once the window has a title bar (and is hidden
-            // wholesale, see compose.rs's `root-notify` handler) - and are
-            // moved back on pop-back-in (see the close handler below).
-            // They're the same widgets, so their handlers keep working
-            // across the move. The draft status label moves into the title
-            // bar with them; the title label stays hidden with its row.
-            handle.top_row.remove(&handle.cancel_button);
-            handle.top_row.remove(&handle.send_button);
-            handle.top_row.remove(&handle.status_label);
-            handle.top_row.remove(&handle.from_dropdown);
-            handle.top_row.remove(&handle.read_receipt_toggle);
-            handle.top_row.remove(&handle.delivery_receipt_toggle);
-            handle.top_row.remove(&handle.light_view_button);
-            // A button to pop the composer back into the reading pane
-            // without closing the session: it closes the window, and the
-            // close handler below performs the pop-back-in (the same path
-            // as the window's own close button, minus the "already
-            // finished" branch).
-            // Explicitly docking is different from closing the editor.
-            // Window-manager Close saves the draft, while this button
-            // moves the still-live session back to the reading pane.
+            // A normal title bar contains only the window title and window controls.
+            // All message commands stay in the composer, including while docked.
             let docking = Rc::new(Cell::new(false));
-            let back_button = gtk::Button::from_icon_name(crate::window::themed_icon_name(&["popin1", "go-previous-symbolic", "go-back-symbolic"]));
-            back_button.set_tooltip_text(Some("Dock editor in main window"));
+            let dock = gtk::Button::with_label("Dock in reading pane");
             {
                 let win = win.clone();
                 let docking = docking.clone();
-                back_button.connect_clicked(move |_| { docking.set(true); win.close(); });
+                dock.connect_clicked(move |_| { docking.set(true); win.close(); });
             }
-            // Header bar packing order: start-side children are prepended
-            // (each new call lands leftmost), end-side children are appended
-            // outward (each new call lands further right), so this yields,
-            // left to right: [from, send | title | status, cancel, back,
-            // read receipt, light view] - "View in Light Mode" is now the
-            // outermost widget on the right.
-            header.pack_start(&handle.send_button);
-            header.pack_start(&handle.from_dropdown);
-            header.pack_end(&handle.status_label);
-            header.pack_end(&handle.cancel_button);
-            header.pack_end(&back_button);
-            header.pack_end(&handle.read_receipt_toggle);
-            header.pack_end(&handle.delivery_receipt_toggle);
-            header.pack_end(&handle.light_view_button);
+            handle.top_row.append(&dock);
             let content_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
             content_box.append(&header);
             content_box.append(&handle.widget);
@@ -513,32 +478,7 @@ pub(crate) fn show_composer_in_reading_pane_full(
                         if let Some(parent) = handle.widget.parent().and_then(|parent| parent.downcast::<gtk::Box>().ok()) {
                             parent.remove(&handle.widget);
                         }
-                        // Send Cancel, Send, From and the read-receipt
-                        // toggle home to the composer's header row, out of
-                        // the title bar they're about to leave. `pack_start`/
-                        // `pack_end` parent a widget to an internal box
-                        // inside `AdwHeaderBar`, not the header bar itself,
-                        // so a type-checked removal off the header bar never
-                        // matches - `unparent()` detaches a widget from
-                        // whatever its actual current parent is.
-                        handle.cancel_button.unparent();
-                        handle.send_button.unparent();
-                        handle.status_label.unparent();
-                        handle.from_dropdown.unparent();
-                        handle.read_receipt_toggle.unparent();
-                        handle.delivery_receipt_toggle.unparent();
-                        handle.light_view_button.unparent();
-                        handle.top_row.prepend(&handle.from_dropdown);
-                        handle.top_row.prepend(&handle.send_button);
-                        handle.top_row.append(&handle.cancel_button);
-                        handle.top_row.append(&handle.status_label);
-                        handle.top_row.reorder_child_after(&handle.status_label, Some(&handle.title_label));
-                        handle.top_row.append(&handle.read_receipt_toggle);
-                        handle.top_row.append(&handle.delivery_receipt_toggle);
-                        handle.top_row.append(&handle.light_view_button);
-                        handle.top_row.reorder_child_after(&handle.light_view_button, Some(&handle.status_label));
-                        handle.top_row.reorder_child_after(&handle.read_receipt_toggle, Some(&handle.light_view_button));
-                        handle.top_row.reorder_child_after(&handle.delivery_receipt_toggle, Some(&handle.read_receipt_toggle));
+                        handle.top_row.remove(&dock);
                         if let Some(existing) = reading_stack_for_close.child_by_name("compose") {
                             reading_stack_for_close.remove(&existing);
                         }

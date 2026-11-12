@@ -1810,17 +1810,17 @@ pub fn build_compose_view(
     // expandable list chip (P-05). The To row has no caption label of its
     // own: the To button in its header row (below) both labels the row and
     // opens the address-book picker.
-    let to_row = RecipientEntry::new_compose("To");
+    let to_row = RecipientEntry::new_compose("");
     if let Some(to) = &prefill.to {
         to_row.set_from_text(to);
     }
-    let cc_row = RecipientEntry::new_compose("Cc");
+    let cc_row = RecipientEntry::new_compose("");
     if let Some(cc) = &prefill.cc {
         cc_row.set_from_text(cc);
     }
     // Bcc is only ever prefilled when reopening a saved draft; Reply and
     // Forward can't know a blind-copy list by definition.
-    let bcc_row = RecipientEntry::new_compose("Bcc");
+    let bcc_row = RecipientEntry::new_compose("");
     if let Some(bcc) = &prefill.bcc {
         bcc_row.set_from_text(bcc);
     }
@@ -1833,12 +1833,12 @@ pub fn build_compose_view(
     for (row, label) in [(&to_row, "To"), (&cc_row, "Cc"), (&bcc_row, "Bcc")] {
         row.widget().add_css_class("compose-recipient");
         let button = gtk::Button::builder()
-            .label("Address Book…")
-            .width_request(124)
+            .label(label)
+            .width_request(72)
             .tooltip_text(format!("Select {label} recipients from address book"))
             .css_classes(["compose-picker-button"])
             .build();
-        row.add_header_suffix(&button);
+        row.add_header_prefix(&button);
         let row = row.clone();
         let open = open_contact_picker.clone();
         button.connect_clicked(move |button| {
@@ -1918,7 +1918,7 @@ pub fn build_compose_view(
     fields_group.append(cc_row.widget());
     fields_group.append(bcc_row.widget());
     let subject_line = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["compose-subject-line"]).build();
-    let subject_label = gtk::Label::builder().label("Subject").xalign(0.0).width_chars(7).build();
+    let subject_label = gtk::Label::builder().label("Subject").xalign(0.0).width_request(72).build();
     subject_line.append(&subject_label);
     subject_line.append(&subject_row);
     fields_group.append(&subject_line);
@@ -2487,7 +2487,11 @@ pub fn build_compose_view(
         group.small_menu(&format.emoji, "face-smile-symbolic", "Emoji");
         group.small_button(&format.horizontal_rule, "insert-hr-symbolic", "Horizontal Line");
     });
-    editor_band.group("Options", |group| {
+    editor_band.group("Tracking", |group| {
+        group.small_toggle(&read_receipt_toggle, "mark-location-symbolic", "Read Receipt");
+        group.small_toggle(&delivery_receipt_toggle, "document-send-symbolic", "Delivery Receipt");
+    });
+    editor_band.group("Tags", |group| {
         group.small_toggle(&high_importance_toggle, "emblem-important-symbolic", "High Importance");
         group.small_toggle(&low_importance_toggle, "go-down-symbolic", "Low Importance");
         group.widget(&sensitivity_dropdown);
@@ -2740,18 +2744,27 @@ pub fn build_compose_view(
         .margin_start(6)
         .margin_end(6)
         .build();
-    top_row.append(&send_button);
-    top_row.append(&from_dropdown);
-    top_row.append(&identity_hint_icon);
+    let from_line = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
+    let from_label = gtk::Label::builder().label("From").width_request(72).xalign(0.0).build();
+    from_line.append(&from_label);
+    from_line.append(&from_dropdown);
+    from_line.append(&identity_hint_icon);
+    fields_group.prepend(&from_line);
+    send_button.set_size_request(90, 76);
+    send_button.set_valign(gtk::Align::Start);
+    let address_block = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
+    fields_group.set_hexpand(true);
+    address_block.append(&send_button);
+    address_block.append(&fields_group);
     top_row.append(&header_spacer);
     top_row.append(&title_label);
     top_row.append(&status_label);
+    light_view_button.set_label("Light / Dark");
     top_row.append(&light_view_button);
-    top_row.append(&read_receipt_toggle);
-    top_row.append(&delivery_receipt_toggle);
     if on_pop_out.is_some() {
         top_row.append(&pop_out_button);
     }
+    cancel_button.set_label("Discard");
     top_row.append(&cancel_button);
 
     let content = gtk::Box::builder()
@@ -2763,11 +2776,11 @@ pub fn build_compose_view(
         .margin_end(8)
         .build();
     content.add_css_class("compose-workspace");
-    content.append(&top_row);
     content.append(&editor_toolbar);
-    content.append(&fields_group);
+    content.append(&address_block);
     content.append(&attachment_flow);
     content.append(&body_stack);
+    content.append(&top_row);
 
     // File drop (item 1.20 / C-15): dropping files onto the composer body
     // attaches them - on the plain-text and rich editors and the column
@@ -3116,7 +3129,7 @@ pub fn build_compose_view(
                 // whole composer on pop-back-in.
                 let shown = !popped_out.get();
                 pop_out_button.set_visible(shown);
-                top_row.set_visible(shown);
+                top_row.set_visible(true);
             }
         });
     }
