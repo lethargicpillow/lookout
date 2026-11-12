@@ -245,7 +245,9 @@ impl RibbonBand {
     /// A new, shrinkable band. `css_classes` are the extra style classes the
     /// row wants on top of `.ribbon` (e.g. `.toolbar` for the legacy look).
     pub(crate) fn new(style: &RibbonStyle, css_classes: &[&str]) -> Self {
-        let root = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(2).valign(gtk::Align::Fill).build();
+        // Group rows may expand within the band to align their captions,
+        // but that expansion must never escape into the window layout.
+        let root = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(2).valign(gtk::Align::Fill).vexpand(false).build();
         root.add_css_class("ribbon");
         for class in css_classes {
             root.add_css_class(class);
@@ -1365,9 +1367,25 @@ mod tests {
         let group = band.root().first_child().and_downcast::<gtk::Box>().unwrap();
         let row = group.first_child().and_downcast::<gtk::Box>().unwrap();
         assert_eq!(band.root().valign(), gtk::Align::Fill);
+        assert!(!band.root().compute_expand(gtk::Orientation::Vertical));
         assert_eq!(row.valign(), gtk::Align::Fill);
         assert_eq!(button.valign(), gtk::Align::Center);
         assert!(group.last_child().unwrap().has_css_class("ribbon-group-title"));
+        // A normal vertical window layout must give spare height to the
+        // message/editor body, not to the ribbon, including its scroller.
+        let stack = gtk::Stack::new();
+        stack.add_named(band.root(), Some("home"));
+        let scroller = gtk::ScrolledWindow::builder()
+            .child(&stack)
+            .hscrollbar_policy(gtk::PolicyType::External)
+            .vscrollbar_policy(gtk::PolicyType::Never)
+            .propagate_natural_height(true)
+            .build();
+        let toolbar = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        toolbar.append(&scroller);
+        assert!(!toolbar.compute_expand(gtk::Orientation::Vertical));
+        style.set_mode(RibbonMode::Simplified);
+        assert!(!toolbar.compute_expand(gtk::Orientation::Vertical));
     }
 
     #[test]

@@ -5119,6 +5119,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let help_toolbar = help_band.root().clone();
 
     let view_toolbar_stack = gtk::Stack::new();
+    view_toolbar_stack.set_vexpand(false);
     view_toolbar_stack.set_hhomogeneous(false);
     view_toolbar_stack.set_vhomogeneous(false);
     view_toolbar_stack.add_named(&command_toolbar, Some("mail-home"));
@@ -6110,6 +6111,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let icon_toolbar_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .css_classes(["window-icon-toolbar-background"])
+        .vexpand(false)
         .overflow(gtk::Overflow::Hidden)
         .margin_start(6)
         .margin_end(6)
@@ -6130,6 +6132,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // Shrink horizontally for overflow, but reserve the full command
         // height (icons, two-line labels and Classic group captions).
         .propagate_natural_height(true)
+        .vexpand(false)
         .hexpand(true)
         .build();
     view_toolbar_stack.set_hexpand(true);
@@ -6192,6 +6195,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let toolbars_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .css_classes(["window-toolbars-background"])
+        // Only root_stack should absorb spare vertical window space.
+        .vexpand(false)
+        .valign(gtk::Align::Start)
         .overflow(gtk::Overflow::Hidden)
         .margin_start(6)
         .margin_end(6)

@@ -1946,7 +1946,7 @@ pub fn build_compose_view(
     }
 
     // A single address grid, shared with Send, rather than nested cards.
-    let fields_group = gtk::Grid::builder().row_spacing(5).column_spacing(12).hexpand(true).css_classes(["compose-fields"]).build();
+    let fields_group = gtk::Grid::builder().row_spacing(5).column_spacing(12).hexpand(true).vexpand(false).valign(gtk::Align::Start).css_classes(["compose-fields"]).build();
     for row in [&to_row, &cc_row, &bcc_row] { row.widget().set_hexpand(true); }
     fields_group.attach(to_row.widget(), 1, 1, 1, 1);
     fields_group.attach(cc_row.widget(), 1, 2, 1, 1);
@@ -2555,8 +2555,9 @@ pub fn build_compose_view(
         );
     });
     // The composer owns its overflow controller, including when popped out.
-    let editor_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(0).hexpand(true).css_classes(["compose-ribbon"]).build();
+    let editor_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(0).hexpand(true).vexpand(false).valign(gtk::Align::Start).css_classes(["compose-ribbon"]).build();
     let editor_stack = gtk::Stack::new();
+    editor_stack.set_vexpand(false);
     editor_stack.set_hhomogeneous(false);
     // Keep the address form stationary when switching ribbon tabs.
     editor_stack.set_vhomogeneous(true);
@@ -2566,12 +2567,13 @@ pub fn build_compose_view(
     let tabs = gtk::StackSwitcher::builder().stack(&editor_stack).halign(gtk::Align::Start).build();
     tabs.add_css_class("compose-ribbon-tabs");
     editor_toolbar.append(&tabs);
-    let ribbon_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(4).hexpand(true).css_classes(["compose-ribbon-commands"]).build();
+    let ribbon_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(4).hexpand(true).vexpand(false).css_classes(["compose-ribbon-commands"]).build();
     editor_toolbar.append(&ribbon_row);
     let editor_scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::External)
         .vscrollbar_policy(gtk::PolicyType::Never)
         .propagate_natural_height(true)
+        .vexpand(false)
         .hexpand(true)
         .child(&editor_stack)
         .build();
