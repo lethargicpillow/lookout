@@ -43,6 +43,9 @@ const INITIAL_FETCH_LIMIT: u32 = 200;
 /// so a command arriving mid-IDLE is picked up right away.
 const IDLE_SLICE: Duration = Duration::from_secs(25 * 60);
 
+/// Poll servers without the optional IMAP IDLE extension.
+const NO_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(30);
+
 /// How many folder-count STATUS calls the drain runs between `FoldersUpdated`
 /// emits. The drain itself yields to the command queue before *every* round
 /// trip - this only bounds how often the sidebar repaints while the counts
@@ -1939,17 +1942,14 @@ async fn connect_and_run(
             return Err(error);
         }
     };
-    // `has_idle` isn't consulted here - the primary connection's own IDLE
-    // wait is unconditional, as before. It's only used by the dedicated
-    // IDLE-only connection's own `login()` (see `run_idle_supervisor`) to
-    // decide whether that second connection is worth attempting at all.
+    // Both the primary and dedicated connections must respect IDLE capability.
     let ServerCapabilities {
         has_move,
         condstore,
         has_list_status,
         qresync,
         has_uidplus,
-        has_idle: _,
+        has_idle,
         sieve,
     } = caps;
 
@@ -2092,6 +2092,8 @@ async fn connect_and_run(
         /// open mailbox's `UIDNEXT` had moved. Resynced exactly like an
         /// IDLE wake.
         ServerChanged,
+        /// Periodic refresh for servers without IDLE.
+        Poll,
         /// Work Offline turned on while waiting in IDLE.
         Offline,
         ChannelClosed,
@@ -2121,6 +2123,7 @@ async fn connect_and_run(
     let mut server_snooze_wake: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut local_snooze_wake: Option<chrono::DateTime<chrono::Utc>> = cache_op(cache, |c| c.next_snooze_wake()).await.and_then(|r| r.ok()).flatten();
     let mut next_scheduled_scan = chrono::Utc::now();
+    let mut next_poll = tokio::time::Instant::now() + NO_IDLE_POLL_INTERVAL;
 
     loop {
         // Work Offline (M-40): checked before the outbox drain so a toggle
@@ -2412,6 +2415,38 @@ async fn connect_and_run(
                         Ok(cmd) => Wake::Command(cmd),
                         Err(async_channel::TryRecvError::Closed) => return Ok(ShutdownReason::Requested),
                         Err(async_channel::TryRecvError::Empty) => {
+                            if !has_idle {
+                                // No IDLE/DONE on this connection. Keep the socket open,
+                                // wake immediately for interactive work, and poll on a
+                                // monotonic deadline that commands cannot reset.
+                                let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Idle)).await;
+                                let remaining = next_poll.saturating_duration_since(tokio::time::Instant::now());
+                                let scan_due = scheduled_folder(&folders, &account_id)
+                                    .filter(|_| scheduled_keywords_ok != Some(false))
+                                    .map(|_| next_scheduled_scan);
+                                let next_due = earliest([next_outbox_due, local_snooze_wake, server_snooze_wake, scan_due]);
+                                let slice = if prefetch_policy.aggressive { remaining.min(prefetch_policy.batch_interval) } else { remaining };
+                                let slice = cap_slice_for_outbox(slice, next_due, chrono::Utc::now()).min(remaining);
+                                tokio::select! {
+                                    _ = tokio::time::sleep(slice) => {
+                                        if tokio::time::Instant::now() >= next_poll { Wake::Poll }
+                                        else { Wake::Idle(Ok(async_imap::extensions::idle::IdleResponse::Timeout)) }
+                                    },
+                                    c = interactive_commands.recv() => match c {
+                                        Ok(cmd) => Wake::Command(cmd),
+                                        Err(_) => Wake::ChannelClosed,
+                                    },
+                                    c = commands.recv() => match c {
+                                        Ok(cmd) => Wake::Command(cmd),
+                                        Err(_) => Wake::ChannelClosed,
+                                    },
+                                    changed = offline_rx.changed() => match changed {
+                                        Ok(()) if *offline_rx.borrow() => Wake::Offline,
+                                        Ok(()) => Wake::Idle(Ok(async_imap::extensions::idle::IdleResponse::Timeout)),
+                                        Err(_) => Wake::ChannelClosed,
+                                    },
+                                }
+                            } else {
                             let idle_entry_started = std::time::Instant::now();
                             let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Idle)).await;
 
@@ -2578,6 +2613,7 @@ async fn connect_and_run(
                                     wake
                                 }
                             }
+                            }
                         }
                     },
                 },
@@ -2615,6 +2651,19 @@ async fn connect_and_run(
                 .await?;
                 dirty_mailboxes.remove(&current_mailbox_id);
                 session_selected = current_mailbox_id.clone();
+            }
+            Wake::Poll => {
+                // Refresh INBOX even while another folder is on screen. A
+                // fresh SELECT catches UIDVALIDITY changes and updates the
+                // server's view before the flags/membership refresh.
+                if current_mailbox_id != inbox_id {
+                    sync_mailbox(&mut session, &account_id, "INBOX", &inbox_id, events, cache, &mut folders, interactive_commands, None, condstore, qresync, local_focus).await?;
+                    dirty_mailboxes.remove(&inbox_id);
+                }
+                sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache, &mut folders, interactive_commands, None, condstore, qresync, local_focus).await?;
+                dirty_mailboxes.remove(&current_mailbox_id);
+                session_selected = current_mailbox_id.clone();
+                next_poll = tokio::time::Instant::now() + NO_IDLE_POLL_INTERVAL;
             }
             Wake::Idle(Err(e)) => return Err(Error::Imap(e)),
             Wake::IdlePush(mailbox_id) => match idle_push_outcome(&mailbox_id, &current_mailbox_id) {
@@ -6390,7 +6439,7 @@ struct ServerCapabilities {
     qresync: bool,
     has_uidplus: bool,
     /// RFC 2177 IDLE. Gates both the primary connection's own IDLE wait (a
-    /// server lacking it falls back to a plain timed sleep) and whether the
+    /// server lacking it polls with a timed sleep) and whether the
     /// dedicated IDLE-only connection (`run_idle_supervisor`) is worth
     /// attempting at all.
     has_idle: bool,
