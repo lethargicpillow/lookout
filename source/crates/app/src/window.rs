@@ -295,7 +295,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             action_box.set_visible(false);
             let overlay = gtk::Overlay::new();
             overlay.set_child(Some(&expander));
-            overlay.add_overlay(&action_box);
+            // The sync indicator, unread count and menu are separate slots.
+            // An overlay hid the spinner whenever the pointer entered.
+            row_box.append(&action_box);
             let expunge_data: Rc<RefCell<Option<Mailbox>>> = Rc::new(RefCell::new(None));
             let expunge_enabled: Rc<Cell<bool>> = Rc::new(Cell::new(false));
             {
@@ -380,7 +382,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let Some(icon) = row_box.first_child().and_downcast::<gtk::Image>() else { return };
             let Some(label) = icon.next_sibling().and_downcast::<gtk::Label>() else { return };
             let Some(spinner) = label.next_sibling().and_downcast::<gtk::Spinner>() else { return };
-            let Some(count) = row_box.last_child().and_downcast::<gtk::Label>() else { return };
+            let Some(count) = spinner.next_sibling().and_downcast::<gtk::Label>() else { return };
             // A zero count is hidden rather than blanked: an empty label still
             // reserves its spacing, which would leave every quiet folder's name
             // ending short of the ones beside it.
@@ -5338,24 +5340,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     mail_overview_box.append(&mail_calendar_overview.root);
     mail_overview_box.append(&mail_overview_day_list);
 
-    // Keep the calendar below the folder tree: the folder list scrolls
-    // independently and the agenda has a bounded height.
-    mail_overview_box.remove(&mail_overview_day_list);
-    let agenda_scroller = gtk::ScrolledWindow::builder()
-        .child(&mail_overview_day_list)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vscrollbar_policy(gtk::PolicyType::Automatic)
-        .propagate_natural_height(true)
-        .max_content_height(150)
-        .build();
-    mail_overview_box.append(&agenda_scroller);
+    // Only the outer overview scroller scrolls. Its child must expose the
+    // whole agenda's natural height, rather than capping it at 150px.
+    // Increasing the splitter height now reveals more events and tasks.
     let mail_calendar_overview_card = card_section(&mail_overview_box);
     mail_calendar_overview_card.set_margin_start(2);
     mail_calendar_overview_card.set_margin_end(2);
     mail_calendar_overview_card.set_margin_top(2);
     mail_calendar_overview_card.set_margin_bottom(2);
     mail_calendar_overview_card.add_css_class("folder-pane");
-    mail_calendar_overview_card.set_vexpand(false);
+    mail_calendar_overview_card.set_vexpand(true);
     // A real splitter lets the user choose how much vertical space the
     // folder tree and calendar occupy. Both halves can scroll independently.
     folder_card.remove(&folder_scroller);
@@ -5364,6 +5358,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vscrollbar_policy(gtk::PolicyType::Automatic)
         .min_content_height(100)
+        .vexpand(true)
         .build();
     mail_calendar_overview_card.bind_property("visible", &overview_scroller, "visible").sync_create().build();
     let folder_calendar_paned = gtk::Paned::builder()
@@ -6998,110 +6993,49 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // Seed the row from the pack in force without writing anything back.
         apply(initial_style, false);
     }
-    // GTK4 only updates `default-width` when the window is resized while
-    // resizable and not maximized/tiled/fullscreen (see `should_remember_size`
-    // in gtkwindow.c), so instead we listen on the window's GdkSurface
-    // `width`, which is updated on every surface resize in every state. The
-    // surface only exists once the window is realized, so it's wired from the
-    // window's `map` signal (guarded so re-maps don't stack handlers). The
-    // width is read at timeout time - by then the new allocation has settled,
-    // so the applied percentages are against the final window size. Debounced
-    // so the stored percentages are applied once the window stops resizing.
+    // Restore percentages at map/page changes only. During an interactive
+    // resize GtkPaned itself keeps the folder/list widths and assigns the
+    // remaining space to reading. Do not repeatedly rewrite its positions
+    // from old settings in the middle of a compositor configure sequence.
     {
         let settings = settings.clone();
-        let wired: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let wired = Rc::new(Cell::new(false));
         let schedule_apply_pane_widths = schedule_apply_pane_widths.clone();
         window.connect_map(move |window| {
-            // Ahead of both guards below, and deliberately on every map: a
-            // window restored maximized is *created* at its final size, so no
-            // surface resize ever follows to trigger the reapply, and a window
-            // that was hidden to the tray and shown again wants the same
-            // treatment. Nothing else restores the panes at startup.
             schedule_apply_pane_widths();
-            let Some(surface) = window.surface() else {
-                return;
-            };
-            if wired.get() {
-                return;
-            }
-            wired.set(true);
+            let Some(surface) = window.surface() else { return; };
+            if wired.replace(true) { return; }
             let debounce: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
-            // Width and height changes both funnel into the same debounced
-            // save/reapply - a resize that changes both only needs to settle
-            // once, and dragging just one edge still triggers this via
-            // whichever of the two notifies fires.
             let on_notify = {
-                let schedule_for_notify = schedule_apply_pane_widths.clone();
-                let settings_for_notify = settings.clone();
-                let window_for_width = window.clone();
+                let window = window.clone();
+                let settings = settings.clone();
                 let debounce = debounce.clone();
                 move || {
-                    if let Some(id) = debounce.take() {
-                        id.remove();
-                    }
-                    let window_for_timeout = window_for_width.clone();
-                    let schedule_for_timeout = schedule_for_notify.clone();
-                    let settings_for_timeout = settings_for_notify.clone();
-                    let debounce_for_timeout = debounce.clone();
-                    debounce.set(Some(glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
-                        debounce_for_timeout.set(None);
-                        // Through the shared scheduler rather than straight to
-                        // the apply, so a resize gets the same settle-and-retry
-                        // treatment as every other trigger. The window width has
-                        // stopped moving by now, but the paneds' own allocations
-                        // trail it by several frames, and a single shot here
-                        // would restore them against half-settled widths.
-                        schedule_for_timeout();
-                        // Only the un-maximized size is worth restoring to -
-                        // GTK4's own `default-width`/`default-height` follow
-                        // the same rule (see comment above).
-                        if !window_for_timeout.is_maximized() {
-                            settings_for_timeout.set_int(crate::settings::WINDOW_WIDTH, window_for_timeout.width());
-                            settings_for_timeout.set_int(crate::settings::WINDOW_HEIGHT, window_for_timeout.height());
+                    if let Some(id) = debounce.take() { id.remove(); }
+                    let window = window.clone();
+                    let settings = settings.clone();
+                    let pending = debounce.clone();
+                    debounce.set(Some(glib::timeout_add_local_once(std::time::Duration::from_millis(180), move || {
+                        pending.set(None);
+                        let Some(surface) = window.surface() else { return; };
+                        let (min, natural, _, _) = window.measure(gtk::Orientation::Horizontal, -1);
+                        tracing::debug!(surface_width = surface.width(), surface_height = surface.height(), widget_width = window.width(), widget_height = window.height(), default_width = window.default_width(), default_height = window.default_height(), min_width = min, natural_width = natural, maximized = window.is_maximized(), "window geometry settled");
+                        if !window.is_maximized() && !window.is_fullscreen() {
+                            settings.set_int(crate::settings::WINDOW_WIDTH, surface.width());
+                            settings.set_int(crate::settings::WINDOW_HEIGHT, surface.height());
                         }
                     })));
                 }
             };
-            {
-                let on_notify = on_notify.clone();
-                surface.connect_width_notify(move |_| on_notify());
-            }
+            let width_notify = on_notify.clone();
+            surface.connect_width_notify(move |_| width_notify());
             surface.connect_height_notify(move |_| on_notify());
-            // The window can also come up already too narrow (a restored
-            // geometry) with no subsequent resize to trigger the check, so
-            // run it once the initial allocation settles too.
         });
     }
-    // Maximize/unmaximize toggles immediately (not a drag stream like a
-    // resize, so no debounce needed) - separate from the width/height save
-    // above since GTK4 doesn't report a width/height surface-notify purely
-    // from maximizing. The pane widths are reapplied here for the same reason:
-    // the window's width has just changed by a lot, and the stored percentages
-    // are of the window width, so they'd otherwise only be reapplied if some
-    // surface notify happened to follow. Debounced along with every other
-    // trigger, so a maximize that *does* also produce a resize notify still
-    // only runs one apply.
     {
         let settings = settings.clone();
-        let schedule_apply_pane_widths = schedule_apply_pane_widths.clone();
         window.connect_maximized_notify(move |win| {
             settings.set_bool(crate::settings::WINDOW_MAXIMIZED, win.is_maximized());
-            schedule_apply_pane_widths();
-        });
-    }
-    // A third width signal, because neither of the two above is guaranteed to
-    // fire. The GdkSurface notify is wired from the window's `map`, so a
-    // compositor that maps the window *already* at its final maximized size
-    // produces no post-map surface resize at all; and `notify::maximized` can
-    // arrive before the new allocation, which is the race the width-stability
-    // check in the scheduler exists to survive. GtkWindow's own `default-width`
-    // moves on an ordinary resize, so listening here as well means a width
-    // change has to evade all three to go unnoticed. Everything shares the one
-    // debounce, so the redundancy costs nothing.
-    {
-        let schedule_apply_pane_widths = schedule_apply_pane_widths.clone();
-        window.connect_notify_local(Some("default-width"), move |_, _| {
-            schedule_apply_pane_widths();
         });
     }
     // The calendar and people panes live in `root_stack`, so they're only
