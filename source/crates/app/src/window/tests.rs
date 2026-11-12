@@ -498,6 +498,16 @@ fn mailbox_account_id_splits_the_account_prefix() {
         mailbox_account_id(&MailboxId("/org/gnome/OnlineAccounts/Accounts/account_7:INBOX".into())),
         Some(AccountId("/org/gnome/OnlineAccounts/Accounts/account_7".into()))
     );
+    // Manual accounts include a colon in their account ID. Folder names
+    // containing colons must not change the account identity either.
+    let account = AccountId("other:12345678-1234-4234-8234-123456789abc".into());
+    for path in ["INBOX", "Projects:2026/Reports"] {
+        let mailbox = MailboxId::new(&account, path);
+        assert_eq!(mailbox_account_id(&mailbox), Some(account.clone()));
+    }
+    // Preserve ordinary IDs and folder names containing colons.
+    assert_eq!(mailbox_account_id(&MailboxId("other:INBOX".into())), Some(AccountId("other".into())));
+    assert_eq!(mailbox_account_id(&MailboxId("acct:Projects:2026".into())), Some(AccountId("acct".into())));
     // No account prefix (an id not shaped "account:path").
     assert_eq!(mailbox_account_id(&MailboxId("INBOX".into())), None);
 }

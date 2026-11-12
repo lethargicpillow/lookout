@@ -19,15 +19,31 @@ use crate::worker::Worker;
 
 use super::*;
 
+/// Split the account prefix from the folder path. Manually configured
+/// accounts use `other:<uuid>` as the account id, so the first colon is
+/// part of the account itself. Folder paths may also contain colons.
+fn mailbox_account_and_path(mailbox: &MailboxId) -> Option<(&str, &str)> {
+    let value = mailbox.0.as_str();
+    if let Some(rest) = value.strip_prefix(crate::app_config::OTHER_ACCOUNT_ID_PREFIX) {
+        if let Some((uuid, path)) = rest.split_once(':') {
+            if uuid::Uuid::parse_str(uuid).is_ok() {
+                let account_len = crate::app_config::OTHER_ACCOUNT_ID_PREFIX.len() + uuid.len();
+                return Some((&value[..account_len], path));
+            }
+        }
+    }
+    value.split_once(':')
+}
+
 pub(crate) fn mailbox_account_id(mailbox: &MailboxId) -> Option<AccountId> {
-    mailbox.0.split_once(':').map(|(account_id, _)| AccountId(account_id.to_string()))
+    mailbox_account_and_path(mailbox).map(|(account_id, _)| AccountId(account_id.to_string()))
 }
 
 /// Whether `mailbox` belongs to an account currently running the Graph mail
 /// transport (item 5.7.6). IMAP-only capabilities use this to hide themselves
 /// rather than failing (item 5.7.7); the account id is a GOA object path for
-/// the only accounts that can opt in, so `mailbox_account_id`'s first-`:` rule
-/// is safe here.
+/// the only accounts that can opt in. The shared mailbox parser also handles
+/// manually configured accounts.
 pub(crate) fn mailbox_uses_graph_mail(state: &UiState, mailbox: &MailboxId) -> bool {
     mailbox_account_id(mailbox)
         .and_then(|account_id| state.accounts.get(&account_id))
@@ -235,7 +251,7 @@ pub(crate) fn current_view_title(state: &Rc<RefCell<UiState>>) -> (String, Strin
     let folder = handle
         .and_then(|h| h.folders.iter().find(|m| &m.id == mailbox_id))
         .map(crate::settings::folder_display_name)
-        .or_else(|| mailbox_id.0.split_once(':').map(|(_, path)| crate::settings::folder_display_name_of(path, role)))
+        .or_else(|| mailbox_account_and_path(mailbox_id).map(|(_, path)| crate::settings::folder_display_name_of(path, role)))
         .unwrap_or_else(|| crate::settings::folder_display_name_of(&mailbox_id.0, role));
     let account = handle
         .map(|h| if h.display_name.is_empty() { h.email.clone() } else { h.display_name.clone() })
