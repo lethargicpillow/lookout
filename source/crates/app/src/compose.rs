@@ -678,7 +678,7 @@ fn html_document(body: &str, dark: bool) -> String {
         r#"<!DOCTYPE html><html><head><meta charset="utf-8"><style>
 :root {{ color-scheme: light; }}
 html, body {{ background: transparent; }}
-body {{ font-family: system-ui, sans-serif; font-size: 12pt; margin: 8px; }}
+body {{ font-family: system-ui, sans-serif; font-size: 12pt; margin: 12px; }}
 blockquote {{ margin: 4px 0 4px 16px; padding-left: 8px; border-left: 2px solid #999; color: #555; }}
 </style><style id="{DARK_VIEW_STYLE_ID}" media="{media}">
 {dark_view}</style></head><body>{body}</body></html>"#
@@ -1944,16 +1944,18 @@ pub fn build_compose_view(
         }
     }
 
-    let fields_group = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).css_classes(["compose-fields"]).build();
-    fields_group.append(to_row.widget());
-    fields_group.append(cc_row.widget());
-    fields_group.append(bcc_row.widget());
+    // A single address grid, shared with Send, rather than nested cards.
+    let fields_group = gtk::Grid::builder().row_spacing(4).column_spacing(10).hexpand(true).css_classes(["compose-fields"]).build();
+    for row in [&to_row, &cc_row, &bcc_row] { row.widget().set_hexpand(true); }
+    fields_group.attach(to_row.widget(), 1, 1, 1, 1);
+    fields_group.attach(cc_row.widget(), 1, 2, 1, 1);
+    fields_group.attach(bcc_row.widget(), 1, 3, 1, 1);
     let subject_line = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["compose-subject-line"]).build();
     let subject_label = gtk::Label::builder().label("Subject").xalign(0.0).width_request(72).build();
     address_labels.add_widget(&subject_label);
     subject_line.append(&subject_label);
     subject_line.append(&subject_row);
-    fields_group.append(&subject_line);
+    fields_group.attach(&subject_line, 1, 4, 1, 1);
 
     // --- Attachments: a canonical in-session list, rendered as removable
     // chips below the fields, same repopulate-from-truth shape
@@ -2551,11 +2553,8 @@ pub fn build_compose_view(
             "Rich Text",
         );
     });
-    editor_band.group("Draft", |group| {
-        group.button(&save_draft_button, "document-save-symbolic", "Save Draft");
-    });
     // The composer owns its overflow controller, including when popped out.
-    let editor_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).hexpand(true).build();
+    let editor_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(0).hexpand(true).css_classes(["compose-ribbon"]).build();
     let editor_stack = gtk::Stack::new();
     editor_stack.set_hhomogeneous(false);
     editor_stack.set_vhomogeneous(false);
@@ -2565,7 +2564,7 @@ pub fn build_compose_view(
     let tabs = gtk::StackSwitcher::builder().stack(&editor_stack).halign(gtk::Align::Start).build();
     tabs.add_css_class("compose-ribbon-tabs");
     editor_toolbar.append(&tabs);
-    let ribbon_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(4).hexpand(true).build();
+    let ribbon_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(4).hexpand(true).css_classes(["compose-ribbon-commands"]).build();
     editor_toolbar.append(&ribbon_row);
     let editor_scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::External)
@@ -2804,7 +2803,8 @@ pub fn build_compose_view(
     let dock_button = gtk::Button::with_label("Dock");
     dock_button.set_tooltip_text(Some("Dock in reading pane"));
     dock_button.set_visible(false);
-    editor_band.group("Message", |group| {
+    editor_band.group("Draft", |group| {
+        group.button(&save_draft_button, "document-save-symbolic", "Save Draft");
         group.button(&cancel_button, "user-trash-symbolic", "Discard");
     });
     options_band.group("Window", |group| {
@@ -2828,19 +2828,21 @@ pub fn build_compose_view(
     from_line.append(&from_label);
     from_line.append(&from_dropdown);
     from_line.append(&identity_hint_icon);
-    fields_group.prepend(&from_line);
+    from_line.set_hexpand(true);
+    from_dropdown.set_hexpand(true);
+    from_dropdown.add_css_class("compose-from-select");
+    fields_group.attach(&from_line, 1, 0, 1, 1);
     let send_content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).halign(gtk::Align::Center).build();
     let send_icon = gtk::Image::from_icon_name("mail-send-symbolic");
     send_icon.set_pixel_size(26);
     send_content.append(&send_icon);
     send_content.append(&gtk::Label::new(Some("Send")));
     send_button.set_child(Some(&send_content));
-    send_button.set_size_request(90, 76);
-    send_button.set_valign(gtk::Align::Start);
-    let address_block = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
-    fields_group.set_hexpand(true);
-    address_block.append(&send_button);
-    address_block.append(&fields_group);
+    send_button.set_size_request(84, -1);
+    send_button.set_valign(gtk::Align::Fill);
+    send_button.add_css_class("compose-send");
+    // Send spans To and Cc, while From, Bcc and Subject stay aligned.
+    fields_group.attach(&send_button, 0, 1, 1, 2);
     top_row.append(&header_spacer);
     top_row.append(&title_label);
     top_row.append(&status_label);
@@ -2855,16 +2857,17 @@ pub fn build_compose_view(
 
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(8)
-        .margin_top(8)
-        .margin_bottom(8)
-        .margin_start(8)
-        .margin_end(8)
+        .spacing(0)
+        .vexpand(true)
+        .hexpand(true)
         .build();
     content.add_css_class("compose-workspace");
     content.append(&editor_toolbar);
-    content.append(&address_block);
+    content.append(&fields_group);
+    attachment_flow.set_margin_start(12);
+    attachment_flow.set_margin_end(12);
     content.append(&attachment_flow);
+    content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     content.append(&body_stack);
     content.append(&top_row);
 

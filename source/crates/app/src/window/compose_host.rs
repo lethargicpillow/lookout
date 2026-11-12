@@ -435,7 +435,7 @@ pub(crate) fn show_composer_in_reading_pane_full(
             // window too.
             if let Some(bar) = &compose_action_bar {
                 bar.restore(&handle.editor_toolbar);
-                handle.editor_toolbar.add_css_class("window-icon-toolbar-background");
+                handle.editor_toolbar.add_css_class("compose-ribbon-surface");
                 handle.widget.prepend(&handle.editor_toolbar);
             }
             // A header bar of its own is what gives the window a drag
@@ -497,7 +497,7 @@ pub(crate) fn show_composer_in_reading_pane_full(
                         // pop-out's own strip styling comes off with it: the
                         // action bar's strip provides that background again.
                         if let Some(bar) = &compose_action_bar {
-                            handle.editor_toolbar.remove_css_class("window-icon-toolbar-background");
+                            handle.editor_toolbar.remove_css_class("compose-ribbon-surface");
                             bar.install(&handle.editor_toolbar);
                         }
                         handle.moving.set(false);

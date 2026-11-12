@@ -7,18 +7,9 @@ use crate::util::action_button;
 
 pub const AVATAR_COLOR_CLASSES: [&str; 6] = ["avatar-color-0", "avatar-color-1", "avatar-color-2", "avatar-color-3", "avatar-color-4", "avatar-color-5"];
 
-/// Reading-pane header: a full-bleed subject strip (`subject_bar`), the
-/// sender/action block (`widget`) - avatar, `Name<address>`, a flat labelled
-/// Reply/Reply All/Forward cluster (duplicating the top command toolbar's, by
-/// design - see the plan this shipped under), the live "Switch message theme"
-/// toggle, and the live "View contact" button (wired in `window.rs`) plus a
-/// disabled overflow placeholder - and a `To:`+date
-/// row - and a bottom action bar (`action_bar`) with its own Reply/Forward
-/// repeated below the body. The caller packs all three separately into the
-/// reading pane's stack page. Content is set via `update()` from whatever
-/// `EmailSummary` is selected - deliberately not from the (slower, async)
-/// `EmailBody` fetch, so the header appears the instant a message is selected
-/// rather than waiting on the body to load.
+/// Shared message header for the reading pane and standalone reader.
+/// One local Reply / Reply All / Forward row precedes the body.
+/// The global mail ribbon remains independent; there is no footer action row.
 #[derive(Clone)]
 pub struct MessageHeader {
     pub subject_bar: gtk::Box,
@@ -69,15 +60,6 @@ fn placeholder_button(icon: &str, tooltip: &str) -> gtk::Button {
 }
 
 pub fn build() -> MessageHeader {
-    build_with_commands(true)
-}
-
-/// The main window already has Reply / Reply All / Forward on its ribbon.
-pub fn build_for_reading_pane() -> MessageHeader {
-    build_with_commands(false)
-}
-
-fn build_with_commands(show_commands: bool) -> MessageHeader {
     let subject_label = gtk::Label::builder().xalign(0.0).wrap(true).css_classes(["message-header-subject"]).build();
     let subject_bar = gtk::Box::builder().orientation(gtk::Orientation::Vertical).css_classes(["message-subject-bar"]).build();
     subject_bar.set_widget_name("subject-bar");
@@ -166,12 +148,8 @@ fn build_with_commands(show_commands: bool) -> MessageHeader {
         button.add_css_class("message-command");
         commands.append(button);
     }
-    if show_commands {
-        commands.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-        commands.append(&theme_button);
-    } else {
-        sender_row.append(&theme_button);
-    }
+    sender_row.append(&theme_button);
+    commands.set_halign(gtk::Align::Start);
     // Do not show a dead More button in every opened message.
     header_more_button.set_visible(false);
 
@@ -196,12 +174,9 @@ fn build_with_commands(show_commands: bool) -> MessageHeader {
         .margin_start(12)
         .margin_end(12)
         .build();
-    if show_commands {
-        widget.append(&commands);
-        widget.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    }
     widget.append(&sender_row);
     widget.append(&meta_row);
+    widget.append(&commands);
 
     MessageHeader {
         subject_bar,
@@ -282,6 +257,17 @@ pub fn avatar_color_class(seed: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reader_commands_are_attached_to_the_header() {
+        if !crate::gtk_test::gtk_ready() { return; }
+        let header = build();
+        for button in [&header.reply_button, &header.reply_all_button, &header.forward_button] {
+            let row = button.parent().expect("local message action row");
+            assert_eq!(row.parent().unwrap(), header.widget.clone().upcast::<gtk::Widget>());
+            assert!(button.is_visible());
+        }
+    }
 
     #[test]
     fn initials_uses_first_and_last_word_of_a_multi_word_name() {

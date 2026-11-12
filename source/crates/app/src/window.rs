@@ -3202,7 +3202,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // toolbar's (see below). Lives inside the "message" page below, so it's
     // visible only while an actual message is shown, not for the empty
     // placeholder or the in-place composer.
-    let message_header = crate::message_header::build_for_reading_pane();
+    let message_header = crate::message_header::build();
 
     // The reading pane crossfades between three top-level pages: a single
     // "message" page that groups the message header with the body - so both

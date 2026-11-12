@@ -31,11 +31,11 @@
 .avatar-color-4 { background-color: @lookout-avatar-4; }
 .avatar-color-5 { background-color: @lookout-avatar-5; }
 
-.message-command-row { padding: 4px 0 6px; }
-.message-command-row button, .message-action-bar button {
+.message-command-row { padding: 4px 0 2px; }
+.message-command-row button {
     background-color: alpha(@view_fg_color, 0.08);
     border: 1px solid alpha(@view_fg_color, 0.20);
     border-radius: 5px;
     padding: 5px 8px;
 }
-.message-command-row button:hover, .message-action-bar button:hover { background-color: alpha(@view_fg_color, 0.16); }
+.message-command-row button:hover { background-color: alpha(@view_fg_color, 0.16); }
