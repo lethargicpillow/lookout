@@ -882,8 +882,29 @@ impl OverflowInner {
             return;
         }
 
-        // 2. Icon-only, labels dropped.
+        // In classic mode retain captions and move complete trailing
+        // command groups into More. A narrow window should not turn the
+        // entire command ribbon into an anonymous row of glyphs.
         let mode = self.style.mode();
+        if mode == RibbonMode::Classic {
+            if let Some(layout) = &layout {
+                self.move_band_to_overflow(layout);
+                if let Some(root) = layout.root.upgrade() { root.set_visible(false); }
+            }
+            available = full_available;
+            let groups: Vec<Vec<usize>> = active.state.borrow().groups.iter().map(|group| group.controls.clone()).collect();
+            for group in groups.iter().rev() {
+                if root.measure(gtk::Orientation::Horizontal, -1).1 <= available { break; }
+                for &index in group.iter().rev() {
+                    self.move_control_to_overflow(&active, index);
+                }
+                sync_group_visibility(&active.state.borrow());
+            }
+            self.finish_fit(&active, layout.as_ref());
+            return;
+        }
+
+        // 2. Icon-only, labels dropped in the simplified ribbon.
         set_compact(&active, true, mode);
         let mut compact_width = root.measure(gtk::Orientation::Horizontal, -1).1;
         if layout_visible {
