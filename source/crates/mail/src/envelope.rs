@@ -6,86 +6,20 @@ use async_imap::types::Fetch;
 use chrono::{DateTime, Utc};
 use lookout_core::{header_value, importance_from_headers, sensitivity_from_headers, EmailAddress, EmailSummary, MailboxId, SystemFlagBit, ThreadKey, Uid};
 
-/// Decodes RFC 2047 MIME encoded-words (`=?charset?Q|B?...?=`) found in a
-/// raw header value. IMAP's `ENVELOPE` response returns header fields
-/// verbatim, still encoded, so subjects/names need this before display.
-/// Supports UTF-8, US-ASCII, and ISO-8859-1/Latin-1 (the overwhelming
-/// majority of real-world mail); any other declared charset falls back to a
-/// lossy UTF-8 decode of the raw bytes rather than failing outright.
+/// Decode RFC 2047 words in an IMAP ENVELOPE value using the same MIME
+/// parser as message bodies, including legacy Cyrillic and Japanese charsets.
 pub fn decode_mime_words(input: &str) -> String {
-    let mut out = String::new();
-    let mut rest = input;
-    while let Some(start) = rest.find("=?") {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        let Some(q1) = after.find('?') else {
-            out.push_str(&rest[start..]);
-            return out;
-        };
-        let charset = &after[..q1];
-        let after_charset = &after[q1 + 1..];
-        let Some(q2) = after_charset.find('?') else {
-            out.push_str(&rest[start..]);
-            return out;
-        };
-        let encoding = &after_charset[..q2];
-        let after_encoding = &after_charset[q2 + 1..];
-        let Some(end) = after_encoding.find("?=") else {
-            out.push_str(&rest[start..]);
-            return out;
-        };
-        let encoded_text = &after_encoding[..end];
-
-        let bytes: Option<Vec<u8>> = match encoding.to_ascii_uppercase().as_str() {
-            "B" => base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded_text).ok(),
-            "Q" => Some(decode_q_encoding(encoded_text)),
-            _ => None,
-        };
-
-        match bytes {
-            Some(bytes) => out.push_str(&decode_charset(&bytes, charset)),
-            None => out.push_str(&rest[start..start + 2 + q1 + 1 + q2 + 1 + end + 2]),
-        }
-
-        rest = &after_encoding[end + 2..];
-        // Whitespace directly between two encoded-words is part of the
-        // folding syntax, not literal content (RFC 2047 §2).
-        if rest.starts_with(' ') && rest.trim_start().starts_with("=?") {
-            rest = rest.trim_start();
-        }
+    if !input.contains("=?") {
+        return input.to_owned();
     }
-    out.push_str(rest);
-    out
-}
-
-fn decode_q_encoding(s: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(s.len());
-    let mut chars = s.bytes();
-    while let Some(b) = chars.next() {
-        match b {
-            b'_' => out.push(b' '),
-            b'=' => {
-                let hi = chars.next();
-                let lo = chars.next();
-                if let (Some(hi), Some(lo)) = (hi, lo) {
-                    if let (Some(hi), Some(lo)) = ((hi as char).to_digit(16), (lo as char).to_digit(16)) {
-                        out.push(((hi << 4) | lo) as u8);
-                        continue;
-                    }
-                }
-            }
-            _ => out.push(b),
-        }
-    }
-    out
-}
-
-fn decode_charset(bytes: &[u8], charset: &str) -> String {
-    match charset.to_ascii_lowercase().as_str() {
-        "utf-8" | "utf8" | "us-ascii" | "ascii" => String::from_utf8_lossy(bytes).into_owned(),
-        "iso-8859-1" | "latin1" => bytes.iter().map(|&b| b as char).collect(),
-        _ => String::from_utf8_lossy(bytes).into_owned(),
-    }
+    // Treat the IMAP value as one unstructured header. Never let a newline
+    // in that value introduce a second header into the synthetic message.
+    let unfolded = input.replace(['\r', '\n'], " ");
+    let raw = format!("Subject: {unfolded}\r\n\r\n");
+    mail_parser::MessageParser::default()
+        .parse(raw.as_bytes())
+        .and_then(|message| message.subject().map(str::to_owned))
+        .unwrap_or_else(|| input.to_owned())
 }
 
 fn cow_to_decoded_string(cow: &[u8]) -> String {
@@ -250,6 +184,27 @@ mod tests {
         // "café" in ISO-8859-1: c a f =E9
         let encoded = "=?ISO-8859-1?Q?caf=E9?=";
         assert_eq!(decode_mime_words(encoded), "café");
+    }
+
+    #[test]
+    fn decodes_legacy_cyrillic_and_japanese_encoded_words() {
+        // Synthetic subject, represented in each encoding used by legacy
+        // Exchange messages. ISO-2022-JP also has Cyrillic code points.
+        for encoded in [
+            "=?windows-1251?B?z/Du4uXw6uAg8eL/5+g=?=",
+            "=?koi8-r?B?8NLP18XSy8Eg09fR2sk=?=",
+            "=?iso-2022-jp?B?GyRCJzEnYidgJ1MnVidiJ1wnURsoQiAbJEInYydTJ3EnWSdaGyhC?=",
+        ] {
+            assert_eq!(decode_mime_words(encoded), "Проверка связи");
+        }
+    }
+
+    #[test]
+    fn decodes_cyrillic_q_words_and_preserves_prefix() {
+        assert_eq!(
+            decode_mime_words("Re: =?windows-1251?Q?=CF=F0=E8=E2=E5=F2?="),
+            "Re: Привет"
+        );
     }
 
     #[test]
