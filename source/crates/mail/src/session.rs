@@ -133,6 +133,16 @@ const INLINE_BODY_FETCH_SIZE_CAP: u32 = 2 * 1024 * 1024;
 const ENVELOPE_FETCH_ITEMS: &str =
     "(UID FLAGS ENVELOPE RFC822.SIZE INTERNALDATE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (IMPORTANCE X-PRIORITY X-MSMAIL-PRIORITY PRIORITY SENSITIVITY LIST-ID AUTHENTICATION-RESULTS)])";
 
+// DavMail can return invalid nested MESSAGE/RFC822 BODYSTRUCTUREs,
+// aborting the entire FETCH stream. The full MIME is already fetched
+// separately for DavMail when a message is opened.
+const DAVMAIL_ENVELOPE_FETCH_ITEMS: &str =
+    "(UID FLAGS ENVELOPE RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER.FIELDS (IMPORTANCE X-PRIORITY X-MSMAIL-PRIORITY PRIORITY SENSITIVITY LIST-ID AUTHENTICATION-RESULTS)])";
+
+fn envelope_fetch_items(davmail_compat: bool) -> &'static str {
+    if davmail_compat { DAVMAIL_ENVELOPE_FETCH_ITEMS } else { ENVELOPE_FETCH_ITEMS }
+}
+
 /// The `FETCH` items for the prefetch's non-indexing branch, which only needs
 /// sizes and part structures to warm bodies - no summary is built, so neither
 /// the envelope nor the header block is requested.
@@ -3123,7 +3133,7 @@ async fn connect_and_run(
                         session.select(&path).await?;
                         session_selected = mailbox.clone();
                     }
-                    let messages = match search_mailbox(&mut session, &account_id, &mailbox, &query, interactive_commands).await {
+                    let messages = match search_mailbox(&mut session, &account_id, &mailbox, &query, interactive_commands, davmail_compat).await {
                         Ok(messages) => messages,
                         // A failed search must still complete the app's live
                         // pass (an empty answer), or its "searching" state
@@ -7089,6 +7099,7 @@ async fn search_mailbox(
     mailbox: &MailboxId,
     query: &str,
     interactive_commands: &async_channel::Receiver<AccountCommand>,
+    davmail_compat: bool,
 ) -> Result<Vec<EmailSummary>> {
     let parsed = SearchQuery::parse(query);
     let criteria = parsed.to_imap_criteria();
@@ -7116,7 +7127,7 @@ async fn search_mailbox(
             tracing::debug!(account = %account_id, mailbox = %mailbox, "mailbox search interrupted by interactive command");
             break;
         }
-        let chunk: Vec<_> = session.uid_fetch(uid_set, ENVELOPE_FETCH_ITEMS).await?.try_collect().await?;
+        let chunk: Vec<_> = session.uid_fetch(uid_set, envelope_fetch_items(davmail_compat)).await?.try_collect().await?;
         fetches.extend(chunk);
     }
     let mut messages: Vec<EmailSummary> = fetches.iter().filter_map(|f| summary_from_fetch(mailbox, f)).collect();
@@ -7369,11 +7380,11 @@ async fn sync_mailbox(
         // (the same `1:*` the flag fetch above already uses). Otherwise the
         // new arrivals are chunked into server-safe sequence-set lines.
         let fetches: Vec<_> = if cached.is_empty() {
-            session.uid_fetch("1:*", ENVELOPE_FETCH_ITEMS).await?.try_collect().await?
+            session.uid_fetch("1:*", envelope_fetch_items(davmail_compat)).await?.try_collect().await?
         } else {
             let mut fetches = Vec::new();
             for uid_set in &uid_set_chunks(&new_uids) {
-                let chunk: Vec<_> = session.uid_fetch(uid_set, ENVELOPE_FETCH_ITEMS).await?.try_collect().await?;
+                let chunk: Vec<_> = session.uid_fetch(uid_set, envelope_fetch_items(davmail_compat)).await?.try_collect().await?;
                 fetches.extend(chunk);
             }
             fetches
@@ -8452,6 +8463,14 @@ async fn fetch_body_cached(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn davmail_envelope_fetch_omits_unreliable_structure() {
+        let safe = envelope_fetch_items(true);
+        assert!(!safe.contains("BODYSTRUCTURE"));
+        assert!(safe.contains("ENVELOPE") && safe.contains("BODY.PEEK[HEADER.FIELDS"));
+        assert!(envelope_fetch_items(false).contains("BODYSTRUCTURE"));
+    }
 
     #[test]
     fn davmail_compat_is_scoped_to_the_local_bridge() {
