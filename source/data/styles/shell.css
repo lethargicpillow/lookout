@@ -31,11 +31,12 @@ paned > separator {
 }
 .window-toolbars-background {
     background-color: @lookout-toolbar-band;
-    border-radius: 8px;
+    border: 1px solid alpha(@window_fg_color, 0.09);
+    border-radius: 6px;
 }
 .window-icon-toolbar-background {
     background-color: @lookout-icon-toolbar-bg;
-    border-radius: 8px;
+    border-radius: 4px;
 }
 
 /* The module buttons in the app rail (UX-14): a rounded pill, muted until
@@ -62,7 +63,7 @@ paned > separator {
 
 /* The vertical folder/calendar splitter is deliberately visible and easy to grab. */
 .folder-calendar-split > separator {
-    background-color: alpha(@view_fg_color, 0.20);
+    background-color: alpha(@view_fg_color, 0.12);
     min-height: 6px;
     min-width: 1px;
 }

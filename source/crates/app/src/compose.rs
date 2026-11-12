@@ -653,7 +653,7 @@ fn on_dark_surface(widget: &impl IsA<gtk::Widget>) -> bool {
 /// popping out or back in) and when the app's scheme flips. "View in Light
 /// Mode" sits on top of this, via the element's `disabled`.
 fn sync_dark_view(web_view: &webkit::WebView) {
-    let media = if on_dark_surface(web_view) { "all" } else { "not all" };
+    let media = if adw::StyleManager::default().is_dark() { "all" } else { "not all" };
     let script = format!("var el = document.getElementById('{DARK_VIEW_STYLE_ID}'); if (el) el.media = '{media}';");
     let web_view = web_view.clone();
     glib::spawn_future_local(async move {
@@ -2541,7 +2541,7 @@ pub fn build_compose_view(
             let to = to.clone();
             open(button.clone().upcast(), Rc::new(move |picked: Vec<Suggestion>| to.append_suggestions(&picked)));
         });
-        group.button(&address_book, "address-book-symbolic", "Address Book");
+        group.button(&address_book, crate::window::themed_icon_name(&["x-office-address-book-symbolic", "address-book-symbolic", "avatar-default-symbolic"]), "Address Book");
     });
     editor_band.group("Include", |group| {
         group.button(&attach_button, "mail-attachment-symbolic", "Attach Files");
@@ -2832,7 +2832,16 @@ pub fn build_compose_view(
         group.button(&cancel_button, "user-trash-symbolic", "Discard");
     });
     options_band.group("Window", |group| {
-        group.small_toggle(&light_view_button, "display-brightness-symbolic", "Light / Dark");
+        let app_theme_button = gtk::Button::new();
+        // The floating composer is a bare adw::Window, not an ApplicationWindow.
+        // Activate the app action explicitly in both hosting modes.
+        app_theme_button.connect_clicked(|_| {
+            if let Some(app) = gio::Application::default() {
+                app.activate_action("toggle-theme", None);
+            }
+        });
+        group.small_button(&app_theme_button, "display-brightness-symbolic", "Light / Dark");
+        group.small_toggle(&light_view_button, "view-reveal-symbolic", "Page Background");
         group.small_button(&pop_out_button, "window-new-symbolic", "Pop Out");
         group.small_button(&dock_button, "view-restore-symbolic", "Dock");
         group.small_button(&close_button, "window-close-symbolic", "Close");

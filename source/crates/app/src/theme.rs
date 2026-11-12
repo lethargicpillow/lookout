@@ -63,6 +63,10 @@ impl ThemeManager {
     /// Reloads the stack: `base.css`, then the selected theme's overrides
     /// (nothing for `system`), then the custom accent when one is set.
     pub fn apply(&self, theme_id: &str, accent: Option<&str>) {
+        // Keep native controls and all secondary windows on the same scheme
+        // as the app palette, including WebKit's dark-notify listeners.
+        let theme_id = THEMES[theme_index(theme_id) as usize];
+        adw::StyleManager::default().set_color_scheme(color_scheme_for(theme_id));
         let mut css = bundled_css("base.css");
         if theme_id != "system" {
             let themed = bundled_css(&format!("{theme_id}.css"));
@@ -76,6 +80,14 @@ impl ThemeManager {
             css.push_str(&accent_css(hex));
         }
         self.provider.load_from_string(&css);
+    }
+}
+
+fn color_scheme_for(theme_id: &str) -> adw::ColorScheme {
+    match theme_id {
+        "flat-dark" => adw::ColorScheme::ForceDark,
+        "flat-light" => adw::ColorScheme::ForceLight,
+        _ => adw::ColorScheme::Default,
     }
 }
 
@@ -168,6 +180,13 @@ mod tests {
     }
 
     #[test]
+    fn explicit_themes_set_the_native_color_scheme() {
+        assert_eq!(color_scheme_for("flat-dark"), adw::ColorScheme::ForceDark);
+        assert_eq!(color_scheme_for("flat-light"), adw::ColorScheme::ForceLight);
+        assert_eq!(color_scheme_for("system"), adw::ColorScheme::Default);
+    }
+
+    #[test]
     fn accent_storage_round_trips() {
         // Byte-exact values: the stored string is 8-bit quantized.
         let rgba = gdk::RGBA::new(0.2, 0.4, 0.8, 1.0);
@@ -185,7 +204,7 @@ mod tests {
         assert!(bundled_css("base.css").contains("lookout-pane-bg"));
         assert!(bundled_css("flat-dark.css").contains("lookout-unread"));
         assert!(bundled_css("flat-light.css").contains("lookout-pane-bg"));
-        assert!(bundled_css("flat-light.css").contains("alpha(@theme_bg_color, 0.85)"));
+        assert!(bundled_css("flat-light.css").contains("lookout-pane-bg @view_bg_color"));
         assert!(bundled_css("no-such.css").is_empty());
     }
 

@@ -103,6 +103,7 @@ impl RibbonIcon {
     /// Swap the glyph, as the button's own `set_icon_name` used to.
     pub(crate) fn set_icon_name(&self, name: &str) {
         self.image.set_icon_name(Some(name));
+        apply_icon_tone(&self.image, name);
     }
 
     /// Swap the control's label, for a command whose name names the action
@@ -296,7 +297,7 @@ impl RibbonBand {
             "Font" | "Basic Text" => "format-text-bold-symbolic",
             "Paragraph" => "format-justify-left-symbolic",
             "Include" | "Insert" => "mail-attachment-symbolic",
-            "Names" => "address-book-symbolic",
+            "Names" => "x-office-address-book-symbolic",
             "Draft" => "document-save-symbolic",
             "Tracking" | "Tags" | "Options" => "emblem-important-symbolic",
             "Respond" => "mail-reply-sender-symbolic",
@@ -307,6 +308,8 @@ impl RibbonBand {
             _ => "view-more-symbolic",
         };
         let icon = gtk::Image::from_icon_name(icon_name);
+        icon.add_css_class("ribbon-icon");
+        apply_icon_tone(&icon, icon_name);
         icon.set_pixel_size(24);
         compact_content.append(&icon);
         compact_content.append(&gtk::Label::new(Some(name)));
@@ -522,11 +525,33 @@ impl RibbonGroup {
 
 /// Build the icon+label content box a control wears (its orientation is set by
 /// [`style_control`], which runs for the current mode and on every switch).
+// Color is semantic and applies only to the glyph, not the button label.
+const ICON_TONES: [&str; 5] = ["ribbon-tone-blue", "ribbon-tone-purple", "ribbon-tone-green", "ribbon-tone-red", "ribbon-tone-amber"];
+
+fn icon_tone(name: &str) -> Option<&'static str> {
+    if name.contains("reply") { Some(ICON_TONES[1]) }
+    else if name.contains("forward") || name.contains("calendar") || name.contains("appointment") || name.contains("refresh") || name.contains("synchroniz") || name.contains("mail-send") || name.contains("folder-move") { Some(ICON_TONES[0]) }
+    else if name.contains("archive") || name.contains("contact-new") || name.contains("mail-mark-read") { Some(ICON_TONES[2]) }
+    else if name.contains("trash") || name.contains("junk") || name.contains("flag") || name.contains("important") { Some(ICON_TONES[3]) }
+    else if name.contains("tag") || name.contains("categor") || name.contains("pin") || name.contains("starred") { Some(ICON_TONES[4]) }
+    else { None }
+}
+
+fn apply_icon_tone(image: &gtk::Image, name: &str) {
+    for class in ICON_TONES {
+        image.remove_css_class(class);
+    }
+    if let Some(class) = icon_tone(name) {
+        image.add_css_class(class);
+    }
+}
+
 fn build_content(icon: &str, label: &str) -> (gtk::Box, gtk::Image, gtk::Label) {
     let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     content.add_css_class("ribbon-content");
     let image = gtk::Image::from_icon_name(icon);
     image.add_css_class("ribbon-icon");
+    apply_icon_tone(&image, icon);
     let text = gtk::Label::builder().label(label).build();
     text.add_css_class("ribbon-label");
     content.append(&image);
@@ -537,7 +562,7 @@ fn build_content(icon: &str, label: &str) -> (gtk::Box, gtk::Image, gtk::Label) 
 fn style_control(content: &gtk::Box, image: &gtk::Image, label: &gtk::Label, look: Look) {
     let (orientation, spacing, icon, halign) = match look {
         Look::Simplified => (gtk::Orientation::Horizontal, 8, 20, gtk::Align::Fill),
-        Look::Large => (gtk::Orientation::Vertical, 2, 32, gtk::Align::Center),
+        Look::Large => (gtk::Orientation::Vertical, 3, 28, gtk::Align::Center),
         // A column's buttons share its width; keep each icon at its leading
         // edge so the column's icons line up, as a menu's entries do.
         Look::Small | Look::Overflow => (gtk::Orientation::Horizontal, 6, 16, gtk::Align::Start),
@@ -552,8 +577,17 @@ fn style_control(content: &gtk::Box, image: &gtk::Image, label: &gtk::Label, loo
     // A large button's label may take two lines ("New / Message"), centred
     // under its icon; everywhere else it stays on one.
     let large = look == Look::Large;
-    label.set_wrap(large);
-    label.set_max_width_chars(if large { 10 } else { -1 });
+    // Reserve one equal caption slot per large command, so one-line
+    // labels don't shift the icons down. The sync command needs two lines.
+    let is_sync = matches!(label.text().as_str(), "Send/Receive All Folders" | "Send/Receive\nAll Folders");
+    if is_sync {
+        label.set_text(if large { "Send/Receive\nAll Folders" } else { "Send/Receive All Folders" });
+    }
+    label.set_wrap(large && !is_sync);
+    label.set_width_chars(if large && is_sync { 14 } else { -1 });
+    label.set_max_width_chars(if large { 14 } else { -1 });
+    label.set_size_request(-1, if large { 30 } else { -1 });
+    label.set_valign(if large { gtk::Align::Start } else { gtk::Align::Center });
     label.set_justify(if large { gtk::Justification::Center } else { gtk::Justification::Left });
     label.set_halign(if large { gtk::Align::Center } else { gtk::Align::Start });
 }
@@ -1351,6 +1385,21 @@ mod tests {
         assert_eq!(row_orientation(&button), gtk::Orientation::Horizontal);
         assert!(!title.is_visible());
         assert!(content.is_visible());
+    }
+
+    #[test]
+    fn classic_sync_caption_and_semantic_icons() {
+        assert_eq!(icon_tone("mail-reply-all-symbolic"), Some("ribbon-tone-purple"));
+        assert_eq!(icon_tone("user-trash-symbolic"), Some("ribbon-tone-red"));
+        assert_eq!(icon_tone("document-save-symbolic"), None);
+        if !crate::gtk_test::gtk_ready() { return; }
+        let (content, image, label) = build_content("view-refresh-symbolic", "Send/Receive All Folders");
+        style_control(&content, &image, &label, Look::Large);
+        assert_eq!(label.text().as_str(), "Send/Receive\nAll Folders");
+        assert!(!label.property::<bool>("wrap"));
+        assert!(image.has_css_class("ribbon-tone-blue"));
+        style_control(&content, &image, &label, Look::Simplified);
+        assert_eq!(label.text().as_str(), "Send/Receive All Folders");
     }
 
     #[test]

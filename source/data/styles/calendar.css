@@ -67,7 +67,18 @@
     padding: 4px 6px;
 }
 .mini-calendar-today {
-    color: @accent_bg_color;
+    background-color: @accent_bg_color;
+    color: @accent_fg_color;
+    border-radius: 999px;
+}
+.mini-calendar-compact button.dim-label,
+.mini-calendar-sidebar button.dim-label {
+    color: alpha(@view_fg_color, 0.42);
+}
+.mini-calendar-compact button:not(.mini-calendar-today):hover,
+.mini-calendar-sidebar button:not(.mini-calendar-today):hover {
+    background-color: alpha(@view_fg_color, 0.09);
+    border-radius: 4px;
 }
 .calendar-account-header {
     font-weight: bold;

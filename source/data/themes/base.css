@@ -15,19 +15,19 @@
 /* The translucent pane fill (the folder/config cards and the Calendar view's
    main panel): fixed black so the window background artwork reads through
    identically in both schemes. */
-@define-color lookout-pane-bg rgba(0, 0, 0, 0.5);
+@define-color lookout-pane-bg @view_bg_color;
 /* The overlay that dims the window background toward black. */
 @define-color lookout-dim #000000;
 /* The menu bar's full-width band. */
-@define-color lookout-toolbar-band #000000;
+@define-color lookout-toolbar-band @window_bg_color;
 /* The icon toolbar strip and the checked ribbon tab. */
-@define-color lookout-icon-toolbar-bg #2e2e32;
+@define-color lookout-icon-toolbar-bg @headerbar_bg_color;
 /* The search entry in the message-list pane header. */
-@define-color lookout-header-search-bg #202020;
+@define-color lookout-header-search-bg @view_bg_color;
 /* Message-list section header bands. */
-@define-color lookout-section-header-bg rgba(0, 0, 0, 0.55);
+@define-color lookout-section-header-bg @headerbar_bg_color;
 /* Message-list column header band. */
-@define-color lookout-column-header-bg rgba(0, 0, 0, 0.3);
+@define-color lookout-column-header-bg @headerbar_bg_color;
 
 /* --- File (Backstage) --------------------------------------------------- */
 
@@ -59,7 +59,7 @@
    accent so every blue accent in the app stays one axis. */
 @define-color lookout-unread @accent_color;
 /* Warm subject colour for read messages. Fixed: works on both schemes. */
-@define-color lookout-subject #c1815c;
+@define-color lookout-subject @theme_fg_color;
 /* Muted metadata (read dates, previews). Scheme-aware. */
 @define-color lookout-muted alpha(@theme_fg_color, 0.6);
 /* Column-header labels. Scheme-aware. */
@@ -101,3 +101,10 @@
 
 /* Overdue task text: the standard error red, legible on both schemes. */
 @define-color lookout-task-overdue #f66151;
+
+/* Semantic icon accents blend toward the current scheme's text color. */
+@define-color lookout-icon-blue mix(@view_fg_color, #3484c4, 0.72);
+@define-color lookout-icon-purple mix(@view_fg_color, #9670bd, 0.72);
+@define-color lookout-icon-green mix(@view_fg_color, #398b65, 0.72);
+@define-color lookout-icon-red mix(@view_fg_color, #c75e63, 0.72);
+@define-color lookout-icon-amber mix(@view_fg_color, #b58b45, 0.72);

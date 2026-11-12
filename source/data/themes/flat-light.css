@@ -2,13 +2,13 @@
    black translucency and become theme-coloured translucency, the fixed dark
    bands become theme-coloured, and the fixed status hues shift darker so
    they keep contrast on light backgrounds. */
-@define-color lookout-pane-bg alpha(@theme_bg_color, 0.85);
+@define-color lookout-pane-bg @view_bg_color;
 @define-color lookout-toolbar-band @theme_bg_color;
 @define-color lookout-icon-toolbar-bg @theme_bg_color;
 @define-color lookout-header-search-bg @theme_base_color;
 @define-color lookout-section-header-bg alpha(@theme_bg_color, 0.9);
 @define-color lookout-column-header-bg alpha(@theme_bg_color, 0.85);
-@define-color lookout-subject #b06a3f;
+@define-color lookout-subject @theme_fg_color;
 @define-color lookout-muted alpha(@theme_fg_color, 0.55);
 @define-color lookout-column-header-fg alpha(@theme_fg_color, 0.55);
 @define-color lookout-row-separator alpha(@theme_fg_color, 0.1);
@@ -25,3 +25,9 @@
 @define-color lookout-file-nav-hover-bg alpha(@accent_fg_color, 0.12);
 @define-color lookout-file-nav-active-bg alpha(@accent_fg_color, 0.22);
 @define-color lookout-file-nav-marker transparent;
+
+@define-color lookout-icon-blue #3979a7;
+@define-color lookout-icon-purple #79559e;
+@define-color lookout-icon-green #43835e;
+@define-color lookout-icon-red #ad4b51;
+@define-color lookout-icon-amber #967131;

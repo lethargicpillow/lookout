@@ -49,15 +49,17 @@
 .compose-fields { padding: 8px; background-color: @window_bg_color; }
 .compose-recipient { padding: 0; border: none; background: transparent; }
 .compose-address-surface, .compose-subject-input {
-    background-color: @view_bg_color;
+    background-color: transparent;
     color: @view_fg_color;
-    border: 1px solid alpha(@view_fg_color, 0.40);
+    border: none;
+    border-bottom: 1px solid alpha(@view_fg_color, 0.19);
     border-radius: 0;
+    box-shadow: none;
 }
 .compose-address-surface { padding: 0 4px; }
 .compose-address-surface flowboxchild { padding: 0; }
 .compose-address-surface:focus-within, .compose-subject-input:focus-within {
-    border-color: @accent_bg_color;
+    border-bottom-color: @accent_bg_color;
 }
 .compose-address-surface .compose-address-input {
     background: transparent; border: none; box-shadow: none;
@@ -65,10 +67,10 @@
 }
 .compose-subject-input { padding: 2px 5px; min-height: 22px; }
 .compose-picker-button, .compose-from-select > button, button.compose-send {
-    min-height: 22px; padding: 2px 6px; border-radius: 0;
-    background-color: @view_bg_color;
+    min-height: 22px; padding: 2px 6px; border-radius: 3px;
+    background-color: alpha(@view_fg_color, 0.055);
     color: @view_fg_color;
-    border: 1px solid alpha(@view_fg_color, 0.40);
+    border: 1px solid alpha(@view_fg_color, 0.22);
     font-weight: normal;
     box-shadow: none;
 }
@@ -81,8 +83,9 @@
 }
 button.compose-send { padding: 4px 6px; }
 .compose-body {
-    background-color: @view_bg_color;
-    border: 1px solid alpha(@view_fg_color, 0.40);
+    background-color: @window_bg_color;
+    border: none;
+    border-top: 1px solid alpha(@view_fg_color, 0.13);
     border-radius: 0;
 }
 .compose-status { color: @window_fg_color; }

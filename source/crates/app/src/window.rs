@@ -4185,7 +4185,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let settings_button = gtk::Button::from_icon_name("preferences-system-symbolic");
     settings_button.set_css_classes(&["flat"]);
     settings_button.set_tooltip_text(Some("Settings"));
+    let theme_button = gtk::Button::from_icon_name("display-brightness-symbolic");
+    theme_button.set_css_classes(&["flat"]);
+    theme_button.set_action_name(Some("app.toggle-theme"));
+    theme_button.set_tooltip_text(Some("Switch app light / dark theme"));
     window_header.pack_end(&settings_button);
+    window_header.pack_end(&theme_button);
     window_header.pack_end(&header_privacy_toggle);
     // Work Offline's title-bar indicator (M-40): visible in every module
     // while the switch is on, so the paused state is never a Mail-only secret.
@@ -8579,6 +8584,34 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // One action for the whole application, also available in a composer.
+    // The existing preference row owns persistence and applies the palette.
+    {
+        let row = config_view.theme_row.clone();
+        let action = gio::SimpleAction::new("toggle-theme", None);
+        action.connect_activate(move |_, _| {
+            let next = if adw::StyleManager::default().is_dark() { "flat-light" } else { "flat-dark" };
+            row.set_selected(crate::theme::theme_index(next));
+        });
+        app.add_action(&action);
+        let update_icon = |button: &gtk::Button, dark: bool| {
+            button.set_icon_name(if dark {
+                themed_icon_name(&["weather-clear-symbolic", "display-brightness-symbolic"])
+            } else {
+                themed_icon_name(&["weather-clear-night-symbolic", "night-light-symbolic", "display-brightness-symbolic"])
+            });
+            button.set_tooltip_text(Some(if dark { "Switch app to light theme" } else { "Switch app to dark theme" }));
+        };
+        let manager = adw::StyleManager::default();
+        update_icon(&theme_button, manager.is_dark());
+        let weak = theme_button.downgrade();
+        manager.connect_dark_notify(move |manager| {
+            if let Some(button) = weak.upgrade() {
+                update_icon(&button, manager.is_dark());
+            }
+        });
+    }
+
     // View ▸ Layout ▸ Density and Config → Appearance → "Density" (UX-83)
     // share this one apply path: it swaps the `spacing-*` CSS class on the
     // folder and message list panes, so every row in both reflows live (see
@@ -9606,6 +9639,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let theme_id = persisted.get_string(crate::theme::THEME_ID_KEY);
         config_view.theme_row.set_selected(crate::theme::theme_index(&theme_id));
         let accent = persisted.get_string(crate::theme::ACCENT_COLOR_KEY);
+        // A ComboRow may already have the stored index.
+        theme_manager.apply(&theme_id, Some(&accent));
         if let Some(rgba) = crate::theme::accent_rgba(&accent) {
             config_view.accent_color_button.set_rgba(&rgba);
         }

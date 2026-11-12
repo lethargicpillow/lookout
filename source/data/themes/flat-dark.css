@@ -1,10 +1,19 @@
-/* Flat Dark: the classic Lookout look, expressed as token overrides. Where
-   `base.css` is scheme-aware (muted text, row separators, chips), this theme
-   re-pins the original hardcoded dark values so the UI is identical to
-   pre-theming Lookout in any scheme. */
+/* Neutral graphite surfaces, with restrained blue accents and hairlines. */
+@define-color lookout-pane-bg #252629;
+@define-color lookout-toolbar-band #252629;
+@define-color lookout-icon-toolbar-bg #2b2c30;
+@define-color lookout-header-search-bg #303136;
+@define-color lookout-section-header-bg #2b2c30;
+@define-color lookout-column-header-bg #292a2d;
 @define-color lookout-unread #4d9dff;
-@define-color lookout-muted #a9b7c6;
-@define-color lookout-column-header-fg #8a97a5;
-@define-color lookout-row-separator rgba(255, 255, 255, 0.06);
+@define-color lookout-subject #dedfe3;
+@define-color lookout-muted #b1b4bc;
+@define-color lookout-column-header-fg #a4a7af;
+@define-color lookout-row-separator rgba(255, 255, 255, 0.09);
 @define-color lookout-chip-bg rgba(77, 157, 255, 0.18);
 @define-color lookout-chip-border rgba(77, 157, 255, 0.35);
+@define-color lookout-icon-blue #79acd2;
+@define-color lookout-icon-purple #b39acb;
+@define-color lookout-icon-green #83b59b;
+@define-color lookout-icon-red #d28b8e;
+@define-color lookout-icon-amber #c7ac76;
