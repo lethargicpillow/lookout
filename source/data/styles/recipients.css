@@ -39,27 +39,39 @@
     border-bottom-color: @accent_bg_color;
 }
 .compose-ribbon-tabs button:hover { background-color: alpha(@window_fg_color, 0.07); }
-.compose-ribbon-commands { padding: 3px 8px; }
+.compose-ribbon-commands { padding: 4px 8px; }
 .compose-format-block { padding: 2px 4px; }
 .compose-format-block .compose-format-button {
     min-width: 26px; min-height: 26px; padding: 3px; border-radius: 3px;
 }
 .compose-format-block .compose-format-button:hover { background-color: alpha(@view_fg_color, 0.15); }
-.compose-fields { padding: 10px 12px 8px; }
+.compose-fields { padding: 10px 12px 10px; background-color: @window_bg_color; }
 .compose-recipient { padding: 0; border: none; background: transparent; }
-.compose-address-input {
-    background-color: alpha(@view_fg_color, 0.06);
-    border: 1px solid alpha(@view_fg_color, 0.30);
-    border-radius: 3px; padding: 3px 8px; min-height: 22px;
+.compose-address-surface, .compose-subject-input {
+    background-color: @view_bg_color;
+    color: @view_fg_color;
+    border: 1px solid alpha(@view_fg_color, 0.35);
+    border-radius: 4px;
 }
-.compose-address-input:focus { border-color: @accent_bg_color; background-color: @view_bg_color; }
+.compose-address-surface { padding: 2px 7px; }
+.compose-address-surface:focus-within, .compose-subject-input:focus-within {
+    border-color: @accent_bg_color;
+    box-shadow: inset 0 0 0 1px @accent_bg_color;
+}
+.compose-address-surface .compose-address-input {
+    background: transparent; border: none; box-shadow: none;
+    padding: 2px 0; min-height: 24px;
+}
+.compose-subject-input { padding: 4px 7px; min-height: 24px; }
 .compose-address-input placeholder { color: alpha(@view_fg_color, 0.62); }
 .compose-picker-button, .compose-from-select > button {
-    min-height: 22px; padding: 3px 8px; border-radius: 3px;
+    min-height: 24px; padding: 4px 8px; border-radius: 4px;
     background-color: alpha(@view_fg_color, 0.08);
     border: 1px solid alpha(@view_fg_color, 0.25); font-weight: normal;
 }
 .compose-picker-button:hover { background-color: alpha(@view_fg_color, 0.17); }
-.compose-send > button { border-radius: 3px 0 0 3px; }
+.compose-send > button { border-radius: 4px 0 0 4px; padding: 8px 10px; }
 .compose-send > menubutton > button { border-radius: 0 3px 3px 0; }
 .compose-body { background-color: @view_bg_color; border: none; border-radius: 0; }
+
+.compose-status { color: @window_fg_color; }

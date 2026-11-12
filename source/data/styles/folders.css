@@ -42,3 +42,18 @@ button.folder-color-swatch.selected {
     outline: 2px solid @theme_fg_color;
     outline-offset: 2px;
 }
+
+/* Mail navigation and message list use the same single theme surface.
+   Inner viewports must not paint an opaque theme view or a second tint. */
+.mail-navigation-pane,
+.mail-message-pane {
+    background-color: @lookout-pane-bg;
+}
+.mail-navigation-pane .mail-calendar-overview,
+.mail-navigation-pane viewport,
+.mail-message-pane scrolledwindow,
+.mail-message-pane viewport,
+.mail-message-pane listview,
+.mail-message-pane list {
+    background-color: transparent;
+}

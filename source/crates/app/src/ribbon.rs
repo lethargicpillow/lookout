@@ -245,7 +245,7 @@ impl RibbonBand {
     /// A new, shrinkable band. `css_classes` are the extra style classes the
     /// row wants on top of `.ribbon` (e.g. `.toolbar` for the legacy look).
     pub(crate) fn new(style: &RibbonStyle, css_classes: &[&str]) -> Self {
-        let root = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(2).valign(gtk::Align::Center).build();
+        let root = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(2).valign(gtk::Align::Fill).build();
         root.add_css_class("ribbon");
         for class in css_classes {
             root.add_css_class(class);
@@ -280,15 +280,15 @@ impl RibbonBand {
     /// handles (e.g. a dynamic icon) for the caller to keep.
     /// `name` isn't drawn; it is the group's accessible label.
     pub(crate) fn group<T>(&self, name: &str, build: impl FnOnce(&RibbonGroup) -> T) -> T {
-        let group_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(1).build();
+        let group_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(1).valign(gtk::Align::Fill).build();
         group_box.add_css_class("ribbon-group");
         group_box.update_property(&[gtk::accessible::Property::Label(name)]);
-        let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(2).valign(gtk::Align::Center).build();
+        let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(2).vexpand(true).valign(gtk::Align::Fill).build();
         row.add_css_class("ribbon-group-row");
         group_box.append(&row);
         // A collapsed group keeps the original command row in a popover;
         // no cloned commands, no lost toggle state or signal handlers.
-        let compact_menu = gtk::MenuButton::builder().visible(false).always_show_arrow(true).build();
+        let compact_menu = gtk::MenuButton::builder().visible(false).always_show_arrow(true).vexpand(true).valign(gtk::Align::Center).build();
         let compact_content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).build();
         let icon_name = match name {
             "Font" | "Basic Text" => "format-text-bold-symbolic",
@@ -543,6 +543,9 @@ fn style_control(content: &gtk::Box, image: &gtk::Image, label: &gtk::Label, loo
     content.set_orientation(orientation);
     content.set_spacing(spacing);
     content.set_halign(halign);
+    content.set_valign(gtk::Align::Center);
+    image.set_halign(gtk::Align::Center);
+    image.set_valign(gtk::Align::Center);
     image.set_pixel_size(icon);
     // A large button's label may take two lines ("New / Message"), centred
     // under its icon; everywhere else it stays on one.
@@ -631,10 +634,11 @@ fn place_group(state: &BandState, group: &BandGroup, mode: RibbonMode) {
         match slot {
             Slot::Alone(widget) => {
                 widget.set_halign(gtk::Align::Fill);
+                widget.set_valign(gtk::Align::Center);
                 row.append(&widget);
             }
             Slot::Column(widgets) => {
-                let column = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(0).build();
+                let column = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(0).valign(gtk::Align::Center).build();
                 column.add_css_class("ribbon-small-column");
                 for widget in widgets {
                     widget.set_halign(gtk::Align::Fill);
@@ -1345,6 +1349,25 @@ mod tests {
         assert_eq!(row_orientation(&button), gtk::Orientation::Horizontal);
         assert!(!title.is_visible());
         assert!(content.is_visible());
+    }
+
+    #[test]
+    fn ribbon_centers_controls_and_keeps_group_captions_at_the_bottom() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        let style = RibbonStyle::new(RibbonMode::Classic);
+        let band = RibbonBand::new(&style, &[]);
+        let button = gtk::Button::new();
+        band.group("Respond", |group| {
+            group.button(&button, "mail-reply-sender-symbolic", "Reply");
+        });
+        let group = band.root().first_child().and_downcast::<gtk::Box>().unwrap();
+        let row = group.first_child().and_downcast::<gtk::Box>().unwrap();
+        assert_eq!(band.root().valign(), gtk::Align::Fill);
+        assert_eq!(row.valign(), gtk::Align::Fill);
+        assert_eq!(button.valign(), gtk::Align::Center);
+        assert!(group.last_child().unwrap().has_css_class("ribbon-group-title"));
     }
 
     #[test]

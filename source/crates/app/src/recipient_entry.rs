@@ -249,7 +249,18 @@ impl RecipientEntry {
         this.entry.set_width_request(0);
         this.entry.set_placeholder_text(Some("Type a name or email"));
         this.entry.add_css_class("compose-address-input");
-        this.header.append(&this.entry);
+        // The picker occupies the leading column. The input and its chips
+        // share a single expanding surface, so chips never spill under To/Cc.
+        this.root.remove(flow);
+        let input = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(3)
+            .hexpand(true)
+            .css_classes(["compose-address-surface"])
+            .build();
+        input.append(&this.entry);
+        input.append(flow);
+        this.header.append(&input);
         flow.set_visible(false);
         this
     }
@@ -690,7 +701,9 @@ impl RecipientEntry {
         // An expanded list contributes its member chips right after its own
         // list chip.
         let chips = self.tokens.borrow().clone();
-        if self.entry.parent().as_ref() == Some(self.header.upcast_ref::<gtk::Widget>()) {
+        // The composer places its entry outside the chip flow, in the
+        // shared address surface. The calendar keeps its entry in the flow.
+        if self.entry.has_css_class("compose-address-input") {
             flow.set_visible(!chips.is_empty());
         }
         let mut position = 0i32;
@@ -1132,6 +1145,28 @@ mod tests {
         // A comma inside a display name isn't a separator.
         assert_eq!(segment("\"Lovelace, Ada\" <ada@x.com>, bob"), "bob");
         assert_eq!(current_segment_start(""), 0);
+    }
+
+    #[test]
+    fn compose_input_and_chips_share_the_expanding_address_surface() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        let field = RecipientEntry::new_compose("");
+        let flow = field.flow.as_ref().unwrap();
+        let surface = field.entry.parent().unwrap();
+        assert!(surface.has_css_class("compose-address-surface"));
+        assert!(surface.hexpand());
+        assert_eq!(flow.parent().unwrap(), surface);
+        assert_eq!(surface.parent().unwrap(), field.header.clone().upcast::<gtk::Widget>());
+        assert!(!flow.is_visible());
+
+        field.set_from_text("ada@x.com, bob@y.com");
+        assert!(flow.is_visible());
+        assert_eq!(field.addresses(), vec!["ada@x.com", "bob@y.com"]);
+        field.set_from_text("");
+        assert!(!flow.is_visible());
+        assert!(field.addresses().is_empty());
     }
 
     #[test]

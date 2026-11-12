@@ -553,6 +553,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let folder_scroller = gtk::ScrolledWindow::builder().child(&folder_list_view).vexpand(true).build();
     let folder_card = card_section(&folder_scroller);
     folder_card.add_css_class("folder-pane");
+    folder_card.add_css_class("mail-navigation-pane");
     folder_card.add_css_class("card-flush-end");
     folder_card.add_css_class(crate::settings::spacing_class(&settings.get_string(crate::settings::LAYOUT_SPACING)));
     folder_card.set_margin_end(0);
@@ -2854,6 +2855,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     message_box.append(&message_list_stack);
     let message_card = card_section(&message_box);
     message_card.set_hexpand(true);
+    message_card.add_css_class("mail-message-pane");
     message_card.add_css_class("card-flush-start");
     message_card.set_margin_start(0);
     // Halves the gap to the reading pane: that gap is this margin plus the
@@ -5311,12 +5313,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .vexpand(true)
         .build();
 
-    // --- Mail-screen calendar overview pane: a mini month-picker + a list
-    // of the clicked day's events and every outstanding task, docked to the
-    // far right of the window, spanning the same full height as `nav_rail`
-    // (it's a sibling in `window_body`, not nested inside `root_stack`).
-    // Mail-only - the Calendar view already has its own full sidebar with a
-    // mini-calendar.
+    // Mail-only overview below the folder tree: a mini month-picker plus
+    // the selected day's events and outstanding tasks. The Calendar module
+    // has its own full sidebar.
     let mail_calendar_overview = calendar_view::build_mini(calendar_prefs.week_start);
     // Half-width day cells (see `.mini-calendar-compact` in
     // `data/styles/calendar.css`). The day buttons' own natural size is what set
@@ -5343,17 +5342,21 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // whole agenda's natural height, rather than capping it at 150px.
     // Increasing the splitter height now reveals more events and tasks.
     let mail_calendar_overview_card = card_section(&mail_overview_box);
-    mail_calendar_overview_card.set_margin_start(2);
-    mail_calendar_overview_card.set_margin_end(2);
-    mail_calendar_overview_card.set_margin_top(2);
-    mail_calendar_overview_card.set_margin_bottom(2);
-    mail_calendar_overview_card.add_css_class("folder-pane");
+    mail_calendar_overview_card.set_margin_start(0);
+    mail_calendar_overview_card.set_margin_end(0);
+    mail_calendar_overview_card.set_margin_top(0);
+    mail_calendar_overview_card.set_margin_bottom(0);
+    // The folder card already paints the navigation surface. Do not
+    // composite a second translucent card over it for the mini-calendar.
+    mail_calendar_overview_card.remove_css_class("card");
+    mail_calendar_overview_card.add_css_class("mail-calendar-overview");
     mail_calendar_overview_card.set_vexpand(true);
     // A real splitter lets the user choose how much vertical space the
     // folder tree and calendar occupy. Both halves can scroll independently.
     folder_card.remove(&folder_scroller);
     let overview_scroller = gtk::ScrolledWindow::builder()
         .child(&mail_calendar_overview_card)
+        .has_frame(false)
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vscrollbar_policy(gtk::PolicyType::Automatic)
         .min_content_height(100)
@@ -6124,6 +6127,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .vscrollbar_policy(gtk::PolicyType::Never)
         .has_frame(false)
         .kinetic_scrolling(false)
+        // Shrink horizontally for overflow, but reserve the full command
+        // height (icons, two-line labels and Classic group captions).
+        .propagate_natural_height(true)
         .hexpand(true)
         .build();
     view_toolbar_stack.set_hexpand(true);

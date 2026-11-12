@@ -1865,6 +1865,7 @@ pub fn build_compose_view(
         let button = gtk::Button::builder()
             .label(label)
             .width_request(72)
+            .valign(gtk::Align::Start)
             .tooltip_text(format!("Select {label} recipients from address book"))
             .css_classes(["compose-picker-button"])
             .build();
@@ -1877,7 +1878,7 @@ pub fn build_compose_view(
             open(button.clone().upcast(), Rc::new(move |picked: Vec<Suggestion>| row.append_suggestions(&picked)));
         });
     }
-    let subject_row = gtk::Entry::builder().hexpand(true).placeholder_text("Subject").css_classes(["compose-address-input"]).build();
+    let subject_row = gtk::Entry::builder().hexpand(true).placeholder_text("Subject").css_classes(["compose-address-input", "compose-subject-input"]).build();
     if let Some(subject) = &prefill.subject {
         subject_row.set_text(subject);
     }
@@ -1945,7 +1946,7 @@ pub fn build_compose_view(
     }
 
     // A single address grid, shared with Send, rather than nested cards.
-    let fields_group = gtk::Grid::builder().row_spacing(4).column_spacing(10).hexpand(true).css_classes(["compose-fields"]).build();
+    let fields_group = gtk::Grid::builder().row_spacing(5).column_spacing(12).hexpand(true).css_classes(["compose-fields"]).build();
     for row in [&to_row, &cc_row, &bcc_row] { row.widget().set_hexpand(true); }
     fields_group.attach(to_row.widget(), 1, 1, 1, 1);
     fields_group.attach(cc_row.widget(), 1, 2, 1, 1);
@@ -2557,7 +2558,8 @@ pub fn build_compose_view(
     let editor_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(0).hexpand(true).css_classes(["compose-ribbon"]).build();
     let editor_stack = gtk::Stack::new();
     editor_stack.set_hhomogeneous(false);
-    editor_stack.set_vhomogeneous(false);
+    // Keep the address form stationary when switching ribbon tabs.
+    editor_stack.set_vhomogeneous(true);
     editor_stack.add_titled(editor_band.root(), Some("message"), "Message");
     editor_stack.add_titled(insert_band.root(), Some("insert"), "Insert");
     editor_stack.add_titled(options_band.root(), Some("options"), "Options");
@@ -2569,6 +2571,7 @@ pub fn build_compose_view(
     let editor_scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::External)
         .vscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
         .hexpand(true)
         .child(&editor_stack)
         .build();
@@ -2816,6 +2819,7 @@ pub fn build_compose_view(
 
     let top_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
+        .css_classes(["compose-status"])
         .spacing(6)
         .margin_top(6)
         .margin_bottom(6)
@@ -2838,11 +2842,12 @@ pub fn build_compose_view(
     send_content.append(&send_icon);
     send_content.append(&gtk::Label::new(Some("Send")));
     send_button.set_child(Some(&send_content));
-    send_button.set_size_request(84, -1);
-    send_button.set_valign(gtk::Align::Fill);
+    send_button.set_size_request(92, 76);
+    send_button.set_valign(gtk::Align::Start);
     send_button.add_css_class("compose-send");
-    // Send spans To and Cc, while From, Bcc and Subject stay aligned.
-    fields_group.attach(&send_button, 0, 1, 1, 2);
+    // Keep Send in the leading column, starting at From. It has a stable
+    // size even when a recipient field grows to show several chip rows.
+    fields_group.attach(&send_button, 0, 0, 1, 3);
     top_row.append(&header_spacer);
     top_row.append(&title_label);
     top_row.append(&status_label);

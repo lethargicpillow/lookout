@@ -18,7 +18,7 @@
    inner button at Adwaita's default size. Hence `button.ribbon-control`
    for the plain cases and the `>` child selectors for the rest. */
 .ribbon {
-    padding: 1px 2px;
+    padding: 4px 2px;
 }
 .ribbon-group {
     margin: 0 2px;
@@ -40,13 +40,13 @@ button.ribbon-control,
    `button` the same way. Commands moved into More keep the menu-row
    geometry below, although the popover sits inside a Classic band. */
 .ribbon-classic .ribbon-group-row {
-    min-height: 66px;
+    min-height: 72px;
 }
 .ribbon-classic button.ribbon-large:not(.ribbon-overflow-control),
 .ribbon-classic .ribbon-large:not(.ribbon-overflow-control) > button,
 .ribbon-classic .ribbon-large:not(.ribbon-overflow-control) > menubutton > button {
-    padding: 2px 6px;
-    min-height: 62px;
+    padding: 3px 6px;
+    min-height: 64px;
     min-width: 46px;
 }
 .ribbon-classic button.ribbon-small:not(.ribbon-overflow-control),
@@ -57,6 +57,12 @@ button.ribbon-control,
 }
 .ribbon-group-title {
     font-size: 11px;
+    padding-top: 1px;
+    padding-bottom: 2px;
+}
+.ribbon-classic .ribbon-collapsed-group > button {
+    min-height: 64px;
+    padding: 3px 6px;
 }
 /* Command labels are in the regular weight, not the bold Adwaita
    gives button text, and a little smaller in the Classic layout. */
