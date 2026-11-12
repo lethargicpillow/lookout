@@ -32,7 +32,7 @@ use lookout_graph::DirectoryPerson;
 
 use crate::app_config::LdapDirectory;
 use crate::directory::DirectoryBackend;
-use crate::other_accounts::{KeyringStore, PROTOCOL_LDAP};
+use crate::other_accounts::{KeyringStore, PROTOCOL_IMAP, PROTOCOL_LDAP};
 
 /// How long the connect and each bind/search operation may take before the
 /// lookup is abandoned and the directory contributes no hits. The shared
@@ -61,6 +61,7 @@ pub(crate) struct LdapDirectoryBackend {
     directory: LdapDirectory,
     keyring: Arc<dyn KeyringStore>,
     search: Arc<dyn DirectorySearch>,
+    davmail: bool,
 }
 
 impl LdapDirectoryBackend {
@@ -71,7 +72,33 @@ impl LdapDirectoryBackend {
             directory: directory.clone(),
             keyring,
             search: Arc::new(LdapConnSearch),
+            davmail: false,
         }
+    }
+
+    /// The local DavMail bridge shares its mail account's IMAP secret.
+    /// Only the same fixed loopback profile recognized by the DAV bridge
+    /// can construct this backend; ordinary LDAP config cannot opt into
+    /// borrowing mail credentials.
+    pub(crate) fn davmail(account: &crate::app_config::OtherAccount, keyring: Arc<dyn KeyringStore>) -> Option<Self> {
+        crate::other_accounts::davmail_accounts(account)?;
+        let directory = LdapDirectory {
+            id: format!("davmail-gal:{}", account.id),
+            account_id: AccountId(account.id.clone()),
+            display_name: format!("{} — Global Address List", account.display_name),
+            host: "127.0.0.1".into(),
+            port: 1389,
+            tls: false,
+            bind_dn: account.imap_username.clone(),
+            base_dn: "ou=people".into(),
+            filter: String::new(),
+            mail_attr: "mail".into(),
+            name_attr: "cn".into(),
+            enabled: true,
+        };
+        let mut backend = Self::new(&directory, keyring);
+        backend.davmail = true;
+        Some(backend)
     }
 
     /// A provider over an explicit searcher, for tests driving a fake.
@@ -81,6 +108,7 @@ impl LdapDirectoryBackend {
             directory: directory.clone(),
             keyring,
             search,
+            davmail: false,
         }
     }
 
@@ -97,6 +125,9 @@ impl LdapDirectoryBackend {
     async fn bind_password(&self) -> Result<String, String> {
         if self.directory.bind_dn.trim().is_empty() {
             return Ok(String::new());
+        }
+        if self.davmail {
+            return self.keyring.load_password(&self.directory.account_id, PROTOCOL_IMAP).await;
         }
         self.keyring.load_password(&AccountId(self.directory.id.clone()), PROTOCOL_LDAP).await
     }
@@ -124,9 +155,15 @@ impl DirectoryBackend for LdapDirectoryBackend {
             bind_dn: self.directory.bind_dn.clone(),
             password,
             base_dn: self.directory.base_dn.clone(),
-            filter: build_filter(query, &self.directory.filter, mail_attr, name_attr),
+            filter: if self.davmail {
+                let query = filter_escape(query);
+                format!("(|(cn={query}*)(mail={query}*)(sn={query}*)(givenName={query}*))")
+            } else {
+                build_filter(query, &self.directory.filter, mail_attr, name_attr)
+            },
             attrs: search_attrs(mail_attr, name_attr),
             limit,
+            davmail: self.davmail,
         };
         self.search
             .search(&plan)
@@ -150,6 +187,7 @@ struct LdapQuery {
     filter: String,
     attrs: Vec<String>,
     limit: usize,
+    davmail: bool,
 }
 
 /// One raw entry as the searcher hands it over: attribute name → values.
@@ -212,12 +250,19 @@ async fn run_ldap_search(query: &LdapQuery) -> Result<Vec<LdapEntry>, ldap3::Lda
     }
     let attrs: Vec<&str> = query.attrs.iter().map(String::as_str).collect();
     let options = SearchOptions::new().sizelimit(clamp_limit(query.limit));
-    let (entries, _result) = ldap
+    let ldap3::SearchResult(entries, _result) = ldap
         .with_timeout(LDAP_TIMEOUT)
         .with_search_options(options)
         .search(&query.base_dn, Scope::Subtree, &query.filter, attrs)
-        .await?
-        .success()?;
+        .await?;
+    // DavMail reports LDAP sizeLimitExceeded (4) when the requested cap
+    // is reached, with valid entries already in the response. Keep those
+    // entries instead of turning a common search into an empty result.
+    let entries = if query.davmail && _result.rc == 4 {
+        entries
+    } else {
+        ldap3::SearchResult(entries, _result).success()?.0
+    };
     let _ = ldap.unbind().await;
     Ok(entries.into_iter().map(|entry| LdapEntry::new(SearchEntry::construct(entry).attrs)).collect())
 }

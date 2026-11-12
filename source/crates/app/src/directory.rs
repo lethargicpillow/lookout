@@ -64,6 +64,7 @@ pub(crate) const DIRECTORY_DEBOUNCE_MS: u64 = 250;
 /// Matches the recipient popover's own cap so a directory can't push stored
 /// contacts out of view.
 pub(crate) const DIRECTORY_LIMIT: usize = 8;
+const PEOPLE_DIRECTORY_LIMIT: usize = 100;
 
 /// The most prefixes kept in the prefix→results cache.
 pub(crate) const DIRECTORY_CACHE_CAP: usize = 32;
@@ -168,6 +169,7 @@ struct Pending {
 pub(crate) struct DirectorySource {
     backends: Vec<Arc<dyn DirectoryBackend>>,
     worker: Rc<Worker>,
+    limit: usize,
     cache: Rc<RefCell<PrefixCache>>,
     /// The latest keystroke queued for the debounce, replaced on every call so
     /// only the newest prefix is ever dispatched.
@@ -188,6 +190,7 @@ impl DirectorySource {
         DirectorySource {
             backends,
             worker,
+            limit: DIRECTORY_LIMIT,
             cache: Rc::new(RefCell::new(PrefixCache::default())),
             pending: Rc::new(RefCell::new(None)),
             timer: Rc::new(Cell::new(None)),
@@ -272,11 +275,12 @@ impl DirectorySource {
         let query = pending.query;
         let complete = pending.complete;
         let backends = self.backends.clone();
+        let limit = self.limit;
         let (tx, rx) = async_channel::bounded(1);
         {
             let query = query.clone();
             self.worker.spawn(async move {
-                let futures = backends.iter().map(|backend| backend.search(&query, DIRECTORY_LIMIT));
+                let futures = backends.iter().map(|backend| backend.search(&query, limit));
                 let per_backend: Vec<Vec<DirectoryPerson>> = futures_util::future::join_all(futures).await;
                 let _ = tx.send(per_backend).await;
             });
@@ -290,7 +294,7 @@ impl DirectorySource {
             if this.generation.get() != generation {
                 return;
             }
-            let hits = merge_directory_hits(per_backend, DIRECTORY_LIMIT);
+            let hits = merge_directory_hits(per_backend, limit);
             this.cache.borrow_mut().put(cache_key, hits.clone());
             complete(hits);
         });
@@ -334,12 +338,13 @@ fn assemble_directory_source(state: &Rc<RefCell<UiState>>, account: Option<Accou
     // Also the GOA accounts whose contacts Lookout syncs itself (each has a
     // contacts session, CardDAV or Graph), so the desktop backend skips EDS's
     // copy of those address books (EDS_TODO.md E1.3).
-    let (config, graph_accounts, synced_goa) = {
+    let (config, graph_accounts, synced_goa, manual_accounts) = {
         let st = state.borrow();
         let config = st.app_config.borrow().clone();
         let ids: Vec<AccountId> = st.accounts.iter().filter(|(_, handle)| handle.graph_pin.is_some()).map(|(id, _)| id.clone()).collect();
         let synced_goa = crate::eds_directory::synced_goa_accounts(&st);
-        (config, ids, synced_goa)
+        let manual = config.other_accounts.iter().filter(|a| st.account_enabled(&AccountId(a.id.clone()))).cloned().collect::<Vec<_>>();
+        (config, ids, synced_goa, manual)
     };
     let mut backends: Vec<Arc<dyn DirectoryBackend>> = Vec::new();
     for id in graph_accounts {
@@ -361,6 +366,20 @@ fn assemble_directory_source(state: &Rc<RefCell<UiState>>, account: Option<Accou
             backends.push(Arc::new(backend));
         }
     }
+    for manual in &manual_accounts {
+        let id = AccountId(manual.id.clone());
+        if account.as_ref().is_some_and(|scope| scope != &id) {
+            continue;
+        }
+        // An explicitly configured directory takes precedence for this
+        // account, including an explicitly disabled one.
+        if config.ldap_directories.iter().any(|directory| directory.account_id == id) {
+            continue;
+        }
+        if let Some(backend) = LdapDirectoryBackend::davmail(manual, keyring.clone()) {
+            backends.push(Arc::new(backend));
+        }
+    }
     // The desktop's address books (EDS_TODO.md E1.2) go last, so a person
     // another directory also lists keeps that directory's entry. They aren't
     // tied to an account, so the same backend serves both scopes; it connects
@@ -371,7 +390,9 @@ fn assemble_directory_source(state: &Rc<RefCell<UiState>>, account: Option<Accou
     if include_desktop {
         backends.push(Arc::new(EdsDirectoryBackend::desktop(synced_goa)));
     }
-    DirectorySource::new(backends, worker)
+    let mut source = DirectorySource::new(backends, worker);
+    if !include_desktop { source.limit = PEOPLE_DIRECTORY_LIMIT; }
+    source
 }
 
 /// The configured LDAP directories a suggestion surface in `account` scope
@@ -407,7 +428,12 @@ pub(crate) fn directory_configured_for_state(state: &UiState) -> bool {
         .filter(|(_, handle)| handle.graph_pin.is_some())
         .map(|(account_id, _)| account_id.clone())
         .collect();
-    directory_configured(&config, &graph_accounts)
+    directory_configured(&config, &graph_accounts) || config.other_accounts.iter().any(|account| {
+        let id = AccountId(account.id.clone());
+        state.account_enabled(&id)
+            && !config.ldap_directories.iter().any(|directory| directory.account_id == id)
+            && crate::other_accounts::davmail_accounts(account).is_some()
+    })
 }
 
 /// Maps a source's hits to the read-only picker suggestions of item 4.7.7.
