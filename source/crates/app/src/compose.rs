@@ -1506,6 +1506,38 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, F
     let font_family_args = ["sans-serif", "Arial", "Calibri", "Aptos", "Verdana", "Tahoma", "Times New Roman", "Liberation Sans", "Liberation Serif", "DejaVu Sans", "Noto Sans", "Courier New", "monospace"];
     let font_families = gtk::StringList::new(&font_family_args);
     let font_family = gtk::DropDown::builder().model(&font_families).selected(0).tooltip_text("Font family").build();
+    // A GtkDropDown otherwise measures every font name and propagates the
+    // widest one into the ribbon. Limit only the closed selector; the list
+    // itself still shows the complete names.
+    let font_factory = gtk::SignalListItemFactory::new();
+    font_factory.connect_setup(|_, item| {
+        let Some(item) = item.downcast_ref::<gtk::ListItem>() else { return; };
+        let label = gtk::Label::builder().xalign(0.0).width_chars(9).max_width_chars(12)
+            .ellipsize(gtk::pango::EllipsizeMode::End).build();
+        item.set_child(Some(&label));
+    });
+    font_factory.connect_bind(|_, item| {
+        let Some(item) = item.downcast_ref::<gtk::ListItem>() else { return; };
+        let Some(label) = item.child().and_downcast::<gtk::Label>() else { return; };
+        if let Some(font) = item.item().and_downcast::<gtk::StringObject>() {
+            label.set_label(&font.string());
+        }
+    });
+    let list_factory = gtk::SignalListItemFactory::new();
+    list_factory.connect_setup(|_, item| {
+        if let Some(item) = item.downcast_ref::<gtk::ListItem>() {
+            item.set_child(Some(&gtk::Label::builder().xalign(0.0).build()));
+        }
+    });
+    list_factory.connect_bind(|_, item| {
+        let Some(item) = item.downcast_ref::<gtk::ListItem>() else { return; };
+        let Some(label) = item.child().and_downcast::<gtk::Label>() else { return; };
+        if let Some(font) = item.item().and_downcast::<gtk::StringObject>() {
+            label.set_label(&font.string());
+        }
+    });
+    font_family.set_factory(Some(&font_factory));
+    font_family.set_list_factory(Some(&list_factory));
     {
         let web_view = web_view.clone();
         font_family.connect_selected_notify(move |dropdown| {
@@ -2501,7 +2533,7 @@ pub fn build_compose_view(
     let options_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
     let format = &format_controls;
     // Real clipboard commands for both HTML and plain-text editing.
-    // Keep them in a single three-row column, as in the classic ribbon.
+    // Outlook's Clipboard: a full-height Paste, Cut/Copy beside it.
     editor_band.group("Clipboard", |group| {
         for (icon, label, command) in [
             ("edit-paste-symbolic", "Paste", "Paste"),
@@ -2529,61 +2561,57 @@ pub fn build_compose_view(
                     }
                 }
             });
-            group.small_button(&button, icon, label);
+            if command == "Paste" {
+                group.button(&button, icon, label);
+            } else {
+                group.small_button(&button, icon, label);
+            }
         }
     });
     // Outlook's Basic Text is one compact formatting surface. Both rows
     // share the same height across font and paragraph commands.
     editor_band.group("Basic Text", |group| {
-        let block = gtk::Grid::builder().row_homogeneous(true).row_spacing(3)
-            .column_spacing(8).valign(gtk::Align::Fill)
+        // One grid, ten equal-width columns and two equal-height rows.
+        // No independent Font/Paragraph boxes or expansion by a long font
+        // name. The selectors occupy the same six cells as B/I/U/S/clear/color.
+        let block = gtk::Grid::builder()
+            .row_homogeneous(true).column_homogeneous(true)
+            .row_spacing(2).column_spacing(2)
+            .valign(gtk::Align::Fill).halign(gtk::Align::Start)
             .css_classes(["compose-format-block"]).build();
 
-        let selectors = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
-            .spacing(3).valign(gtk::Align::Fill).build();
-        format.font_family.set_size_request(128, -1);
-        format.font_family.set_hexpand(true);
+        format.font_family.set_size_request(-1, -1);
+        format.font_family.set_hexpand(false);
+        format.font_family.set_halign(gtk::Align::Fill);
         format.font_family.set_valign(gtk::Align::Fill);
         format.font_family.add_css_class("compose-format-select");
-        format.font_size.set_size_request(62, -1);
+        format.font_size.set_size_request(-1, -1);
+        format.font_size.set_halign(gtk::Align::Fill);
         format.font_size.set_valign(gtk::Align::Fill);
         format.font_size.add_css_class("compose-format-select");
-        selectors.append(&format.font_family);
-        selectors.append(&format.font_size);
+        block.attach(&format.font_family, 0, 0, 4, 1);
+        block.attach(&format.font_size, 4, 0, 2, 1);
 
-        let font_actions = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
-            .spacing(1).valign(gtk::Align::Fill).build();
-        for button in [&format.bold, &format.italic, &format.underline, &format.strikethrough, &format.clear_formatting] {
+        let place = |button: &gtk::Button, col: i32, row: i32| {
             button.add_css_class("compose-format-button");
+            button.set_halign(gtk::Align::Fill);
             button.set_valign(gtk::Align::Fill);
-            font_actions.append(button);
+            block.attach(button, col, row, 1, 1);
+        };
+        for (col, button) in [&format.bold, &format.italic, &format.underline, &format.strikethrough, &format.clear_formatting].into_iter().enumerate() {
+            place(button, col as i32, 1);
         }
-        format.color.set_size_request(34, -1);
+        format.color.set_size_request(-1, -1);
+        format.color.set_halign(gtk::Align::Fill);
         format.color.set_valign(gtk::Align::Fill);
         format.color.add_css_class("compose-format-color");
-        font_actions.append(&format.color);
-
-        let paragraph_top = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
-            .spacing(1).valign(gtk::Align::Fill).build();
-        let paragraph_bottom = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
-            .spacing(1).valign(gtk::Align::Fill).build();
-        for (row, buttons) in [
-            (&paragraph_top, [&format.bullets, &format.numbering, &format.outdent, &format.indent]),
-            (&paragraph_bottom, [&format.align_left, &format.align_center, &format.align_right, &format.justify]),
-        ] {
-            for button in buttons {
-                button.add_css_class("compose-format-button");
-                button.set_valign(gtk::Align::Fill);
-                row.append(button);
-            }
+        block.attach(&format.color, 5, 1, 1, 1);
+        for (col, button) in [&format.bullets, &format.numbering, &format.outdent, &format.indent].into_iter().enumerate() {
+            place(button, 6 + col as i32, 0);
         }
-        block.attach(&selectors, 0, 0, 1, 1);
-        block.attach(&font_actions, 0, 1, 1, 1);
-        let divider = gtk::Separator::new(gtk::Orientation::Vertical);
-        divider.add_css_class("compose-format-divider");
-        block.attach(&divider, 1, 0, 1, 2);
-        block.attach(&paragraph_top, 2, 0, 1, 1);
-        block.attach(&paragraph_bottom, 2, 1, 1, 1);
+        for (col, button) in [&format.align_left, &format.align_center, &format.align_right, &format.justify].into_iter().enumerate() {
+            place(button, 6 + col as i32, 1);
+        }
         group.widget(&block);
     });
     editor_band.group("Names", |group| {
@@ -2917,7 +2945,7 @@ pub fn build_compose_view(
     from_dropdown.add_css_class("compose-from-select");
     address_form.prepend(&from_line);
     show_from.bind_property("active", &from_line, "visible").sync_create().build();
-    let send_content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).halign(gtk::Align::Center).build();
+    let send_content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).halign(gtk::Align::Center).valign(gtk::Align::Center).build();
     let send_icon = gtk::Image::from_icon_name("mail-send-symbolic");
     send_icon.set_pixel_size(26);
     send_content.append(&send_icon);

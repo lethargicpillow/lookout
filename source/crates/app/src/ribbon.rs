@@ -142,7 +142,6 @@ type RelayoutListener = Rc<dyn Fn()>;
 pub(crate) struct RibbonStyle {
     mode: Rc<Cell<RibbonMode>>,
     bands: Rc<RefCell<Vec<BandRegistration>>>,
-    command_heights: gtk::SizeGroup,
     /// Callbacks run whenever the style changes, so the overflow controller
     /// can re-measure with the new control geometry.
     relayout_listeners: Rc<RefCell<Vec<RelayoutListener>>>,
@@ -162,7 +161,6 @@ impl RibbonStyle {
         RibbonStyle {
             mode: Rc::new(Cell::new(mode)),
             bands: Rc::new(RefCell::new(Vec::new())),
-            command_heights: gtk::SizeGroup::new(if mode == RibbonMode::Classic { gtk::SizeGroupMode::Vertical } else { gtk::SizeGroupMode::None }),
             relayout_listeners: Rc::new(RefCell::new(Vec::new())),
         }
     }
@@ -181,7 +179,6 @@ impl RibbonStyle {
     /// (a composer that has closed) are dropped from the registry.
     pub(crate) fn set_mode(&self, mode: RibbonMode) {
         self.mode.set(mode);
-        self.command_heights.set_mode(if mode == RibbonMode::Classic { gtk::SizeGroupMode::Vertical } else { gtk::SizeGroupMode::None });
         self.bands.borrow_mut().retain(|band| {
             let Some(root) = band.root.upgrade() else {
                 return false;
@@ -291,7 +288,6 @@ impl RibbonBand {
         group_box.update_property(&[gtk::accessible::Property::Label(name)]);
         let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(2).vexpand(true).valign(gtk::Align::Fill).build();
         row.add_css_class("ribbon-group-row");
-        self.style.command_heights.add_widget(&row);
         group_box.append(&row);
         // A collapsed group keeps the original command row in a popover;
         // no cloned commands, no lost toggle state or signal handlers.
@@ -327,7 +323,6 @@ impl RibbonBand {
         compact_menu.set_child(Some(&compact_content));
         compact_menu.set_tooltip_text(Some(name));
         compact_menu.add_css_class("ribbon-collapsed-group");
-        self.style.command_heights.add_widget(&compact_menu);
         let popover = gtk::Popover::new();
         compact_menu.set_popover(Some(&popover));
         group_box.append(&compact_menu);
@@ -367,7 +362,6 @@ impl RibbonBand {
         let container = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(1).valign(gtk::Align::Fill).build();
         let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(2).valign(gtk::Align::Fill).vexpand(true).build();
         row.add_css_class("ribbon-group-row");
-        self.style.command_heights.add_widget(&row);
         container.append(&row);
         let footer = gtk::Label::builder().height_request(18).css_classes(["ribbon-group-title"]).visible(self.style.mode() == RibbonMode::Classic).build();
         container.append(&footer);
@@ -722,7 +716,7 @@ fn place_group(state: &BandState, group: &BandGroup, mode: RibbonMode) {
         let Some(widget) = control.widget.upgrade() else {
             continue;
         };
-        if mode == RibbonMode::Classic && control.size == RibbonSize::Small {
+        if mode == RibbonMode::Classic && control.size == RibbonSize::Small && control.content.upgrade().is_some() {
             match slots.last_mut() {
                 Some(Slot::Column(column)) if column.len() < COLUMN_LEN => column.push(widget),
                 _ => slots.push(Slot::Column(vec![widget])),
@@ -767,16 +761,23 @@ fn place_group(state: &BandState, group: &BandGroup, mode: RibbonMode) {
                 row.append(&widget);
             }
             Slot::Column(widgets) => {
-                // The same command-height envelope as a large button.
-                // Two or three small commands share it equally; a lone
-                // custom panel (e.g. Basic Text) gets the full allocation.
+                // All columns use the same three-row lattice. An incomplete
+                // column must NOT stretch its two rows to half the height:
+                // that shifts Meeting away from Reply and Add Sender away
+                // from Reply All. Empty cells occupy the unused bottom rows.
                 let column = gtk::Box::builder().orientation(gtk::Orientation::Vertical)
                     .spacing(0).homogeneous(true).valign(gtk::Align::Fill).vexpand(false).build();
                 column.add_css_class("ribbon-small-column");
+                let count = widgets.len();
                 for widget in widgets {
                     widget.set_halign(gtk::Align::Fill);
                     widget.set_valign(gtk::Align::Fill);
                     column.append(&widget);
+                }
+                for _ in count..COLUMN_LEN {
+                    let spacer = gtk::Box::builder().height_request(24).can_target(false).build();
+                    spacer.add_css_class("ribbon-command-spacer");
+                    column.append(&spacer);
                 }
                 row.append(&column);
             }
@@ -793,7 +794,12 @@ fn row_matches(row: &gtk::Box, slots: &[Slot]) -> bool {
         };
         let fits = match slot {
             Slot::Alone(widget) => current == *widget,
-            Slot::Column(widgets) => current.has_css_class("ribbon-small-column") && children(&current) == *widgets,
+            Slot::Column(widgets) => {
+                let cells = children(&current);
+                current.has_css_class("ribbon-small-column")
+                    && cells.len() == COLUMN_LEN
+                    && cells.into_iter().filter(|w| !w.has_css_class("ribbon-command-spacer")).collect::<Vec<_>>() == *widgets
+            },
         };
         if !fits {
             return false;
@@ -1241,7 +1247,8 @@ impl OverflowInner {
             widget.unparent();
             // A Classic column it was the last control of would otherwise
             // stay behind as an empty gap in the row.
-            if parent.has_css_class("ribbon-small-column") && parent.first_child().is_none() {
+            if parent.has_css_class("ribbon-small-column")
+                && children(&parent).iter().all(|w| w.has_css_class("ribbon-command-spacer")) {
                 parent.unparent();
             }
         }
@@ -1528,8 +1535,8 @@ mod tests {
         let trailing = right.root().first_child().and_downcast::<gtk::Box>().unwrap();
         let left_row = group.first_child().unwrap();
         let right_row = trailing.first_child().unwrap();
-        assert_eq!(left_row.measure(gtk::Orientation::Vertical, -1).0,
-                   right_row.measure(gtk::Orientation::Vertical, -1).0);
+        assert!(left_row.has_css_class("ribbon-group-row"));
+        assert!(right_row.has_css_class("ribbon-group-row"));
         assert!(trailing.last_child().unwrap().has_css_class("ribbon-group-title"));
         style.set_mode(RibbonMode::Simplified);
         assert!(!trailing.last_child().unwrap().is_visible());
@@ -1575,6 +1582,46 @@ mod tests {
         assert!(!toolbar.compute_expand(gtk::Orientation::Vertical));
         assert_eq!(button.valign(), gtk::Align::Center);
         assert_eq!(trailing.valign(), gtk::Align::Center);
+    }
+
+    #[test]
+    fn classic_respond_allocates_matching_command_rows() {
+        if !crate::gtk_test::gtk_ready() {
+            eprintln!("GTK display unavailable; allocation test skipped");
+            return;
+        }
+        crate::style::install();
+        let style = RibbonStyle::new(RibbonMode::Classic);
+        let band = RibbonBand::new(&style, &[]);
+        let reply = gtk::Button::new();
+        let reply_all = gtk::Button::new();
+        let forward = adw::SplitButton::new();
+        let meeting = gtk::Button::new();
+        let sender = gtk::Button::new();
+        band.group("Respond", |group| {
+            group.small_button(&reply, "mail-reply-sender-symbolic", "Reply");
+            group.small_button(&reply_all, "mail-reply-all-symbolic", "Reply All");
+            group.small_split(&forward, "mail-forward-symbolic", "Forward");
+            group.small_button(&meeting, "appointment-new-symbolic", "Meeting");
+            group.small_button(&sender, "contact-new-symbolic", "Add Sender");
+        });
+        // Allocate the real GTK tree, not just its requested minimums.
+        let root = band.root();
+        let width = root.measure(gtk::Orientation::Horizontal, -1).1;
+        let height = root.measure(gtk::Orientation::Vertical, width).1;
+        root.allocate(width, height, -1, None);
+        let bounds = |button: &gtk::Button| button.compute_bounds(root).expect("command bounds");
+        let a = bounds(&reply);
+        let b = bounds(&reply_all);
+        let c = bounds(&meeting);
+        let d = bounds(&sender);
+        assert!(a.height() > 0.0);
+        assert!((a.y() - c.y()).abs() <= 1.0, "Reply and Meeting must share their top edge: {a:?} {c:?}");
+        assert!((b.y() - d.y()).abs() <= 1.0, "Reply All and Add Sender must share their top edge: {b:?} {d:?}");
+        assert!((a.height() - c.height()).abs() <= 1.0, "command heights must match");
+        let f = forward.compute_bounds(root).expect("forward bounds");
+        assert!((f.y() - b.y() - b.height()).abs() <= 1.0, "third row must follow second");
+        eprintln!("Respond allocations: Reply={a:?}, ReplyAll={b:?}, Meeting={c:?}, AddSender={d:?}, Forward={f:?}");
     }
 
     #[test]
@@ -1627,6 +1674,10 @@ mod tests {
         assert_ne!(second, first);
         assert_eq!(second.parent().as_ref(), Some(&row_widget));
         assert_eq!(children(&row_widget).len(), 3);
+        assert_eq!(children(&first).len(), 3);
+        assert_eq!(children(&second).len(), 3);
+        assert!(children(&second)[1].has_css_class("ribbon-command-spacer"));
+        assert!(children(&second)[2].has_css_class("ribbon-command-spacer"));
         assert!(label_of(&small[0]).is_visible());
 
         // Placing again changes nothing.
