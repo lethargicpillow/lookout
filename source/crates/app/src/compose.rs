@@ -68,7 +68,7 @@ pub struct PopOutHandle {
     pub cancel_button: gtk::Button,
     pub close_button: gtk::Button,
     pub dock_button: gtk::Button,
-    pub send_button: adw::SplitButton,
+    pub send_button: gtk::Button,
     pub from_dropdown: gtk::DropDown,
     pub read_receipt_toggle: gtk::ToggleButton,
     /// The delivery-receipt toggle (C-07), which rides with the read-receipt
@@ -1857,14 +1857,14 @@ pub fn build_compose_view(
         row.set_suggestion_source(suggestions.clone());
     }
 
-    // All address fields remain visible. Each field has its own address
-    // book button, so GAL results can be added to To, Cc or Bcc directly.
+    // To and Cc are always present. Bcc and From are optional, like
+    // Outlook; each recipient button opens the corresponding address book.
     let address_labels = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
     for (row, label) in [(&to_row, "To"), (&cc_row, "Cc"), (&bcc_row, "Bcc")] {
         row.widget().add_css_class("compose-recipient");
         let button = gtk::Button::builder()
-            .label(label)
-            .width_request(72)
+            .label(format!("{label}…"))
+            .width_request(56)
             .valign(gtk::Align::Start)
             .tooltip_text(format!("Select {label} recipients from address book"))
             .css_classes(["compose-picker-button"])
@@ -1878,7 +1878,7 @@ pub fn build_compose_view(
             open(button.clone().upcast(), Rc::new(move |picked: Vec<Suggestion>| row.append_suggestions(&picked)));
         });
     }
-    let subject_row = gtk::Entry::builder().hexpand(true).placeholder_text("Subject").css_classes(["compose-address-input", "compose-subject-input"]).build();
+    let subject_row = gtk::Entry::builder().hexpand(true).css_classes(["compose-address-input", "compose-subject-input"]).build();
     if let Some(subject) = &prefill.subject {
         subject_row.set_text(subject);
     }
@@ -1945,18 +1945,25 @@ pub fn build_compose_view(
         }
     }
 
-    // A single address grid, shared with Send, rather than nested cards.
-    let fields_group = gtk::Grid::builder().row_spacing(5).column_spacing(12).hexpand(true).vexpand(false).valign(gtk::Align::Start).css_classes(["compose-fields"]).build();
+    // One compact address form, with Send beside its full height. Keep
+    // optional rows out of the layout until requested or already populated.
+    let fields_group = gtk::Grid::builder().row_spacing(3).column_spacing(8).hexpand(true).vexpand(false).valign(gtk::Align::Start).css_classes(["compose-fields"]).build();
+    let address_form = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(3).hexpand(true).build();
     for row in [&to_row, &cc_row, &bcc_row] { row.widget().set_hexpand(true); }
-    fields_group.attach(to_row.widget(), 1, 1, 1, 1);
-    fields_group.attach(cc_row.widget(), 1, 2, 1, 1);
-    fields_group.attach(bcc_row.widget(), 1, 3, 1, 1);
+    address_form.append(to_row.widget());
+    address_form.append(cc_row.widget());
+    address_form.append(bcc_row.widget());
+    let show_bcc = gtk::ToggleButton::builder().active(prefill.bcc.as_deref().is_some_and(|v| !v.trim().is_empty())).build();
+    show_bcc.bind_property("active", bcc_row.widget(), "visible").sync_create().build();
+    let show_from = gtk::ToggleButton::builder().active(identities.borrow().len() > 1 || from_dropdown.selected() != 0).build();
+    let schedule_button = gtk::MenuButton::builder().tooltip_text("Schedule send").build();
+    fields_group.attach(&address_form, 1, 0, 1, 1);
     let subject_line = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["compose-subject-line"]).build();
-    let subject_label = gtk::Label::builder().label("Subject").xalign(0.0).width_request(72).build();
+    let subject_label = gtk::Label::builder().label("Subject").xalign(0.0).width_request(56).build();
     address_labels.add_widget(&subject_label);
     subject_line.append(&subject_label);
     subject_line.append(&subject_row);
-    fields_group.attach(&subject_line, 1, 4, 1, 1);
+    address_form.append(&subject_line);
 
     // --- Attachments: a canonical in-session list, rendered as removable
     // chips below the fields, same repopulate-from-truth shape
@@ -2526,6 +2533,16 @@ pub fn build_compose_view(
         }
         group.widget(&block);
     });
+    editor_band.group("Names", |group| {
+        let address_book = gtk::Button::new();
+        let open = open_contact_picker.clone();
+        let to = to_row.clone();
+        address_book.connect_clicked(move |button| {
+            let to = to.clone();
+            open(button.clone().upcast(), Rc::new(move |picked: Vec<Suggestion>| to.append_suggestions(&picked)));
+        });
+        group.button(&address_book, "address-book-symbolic", "Address Book");
+    });
     editor_band.group("Include", |group| {
         group.button(&attach_button, "mail-attachment-symbolic", "Attach Files");
         group.menu(&signature_button, "signature-1", "Signature");
@@ -2537,6 +2554,13 @@ pub fn build_compose_view(
         group.small_button(&format.image, "insert-image-symbolic", "Picture");
         group.small_menu(&format.emoji, "face-smile-symbolic", "Emoji");
         group.small_button(&format.horizontal_rule, "insert-hr-symbolic", "Horizontal Line");
+    });
+    options_band.group("Show Fields", |group| {
+        group.small_toggle(&show_from, "mail-send-symbolic", "From");
+        group.small_toggle(&show_bcc, "mail-message-new-symbolic", "Bcc");
+    });
+    options_band.group("Delivery", |group| {
+        group.menu(&schedule_button, "alarm-symbolic", "Schedule Send");
     });
     options_band.group("Tracking", |group| {
         group.small_toggle(&read_receipt_toggle, "mark-location-symbolic", "Read Receipt");
@@ -2752,13 +2776,8 @@ pub fn build_compose_view(
     cancel_button.add_css_class("destructive-action");
     cancel_button.set_tooltip_text(Some("Discard"));
     cancel_button.update_property(&[gtk::accessible::Property::Label("Discard")]);
-    // Send is a split button, as in Outlook: the main part sends now, the
-    // arrow opens the "Schedule send" menu (item 1.14), wired below.
-    let send_button = adw::SplitButton::builder()
-        .label("Send")
-        .css_classes(["suggested-action"])
-        .dropdown_tooltip("Schedule send")
-        .build();
+    // A single Outlook-style Send button. Scheduling remains in Options.
+    let send_button = gtk::Button::builder().tooltip_text("Send message").build();
     // Not shown while embedded - it's redundant next to the compose fields
     // right below it - but kept in `top_row` (invisible) as the anchor
     // `reorder_child_after` puts the status label back next to on
@@ -2829,7 +2848,7 @@ pub fn build_compose_view(
         .margin_end(6)
         .build();
     let from_line = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
-    let from_label = gtk::Label::builder().label("From").width_request(72).xalign(0.0).build();
+    let from_label = gtk::Label::builder().label("From").width_request(56).xalign(0.0).build();
     address_labels.add_widget(&from_label);
     from_line.append(&from_label);
     from_line.append(&from_dropdown);
@@ -2837,19 +2856,19 @@ pub fn build_compose_view(
     from_line.set_hexpand(true);
     from_dropdown.set_hexpand(true);
     from_dropdown.add_css_class("compose-from-select");
-    fields_group.attach(&from_line, 1, 0, 1, 1);
+    address_form.prepend(&from_line);
+    show_from.bind_property("active", &from_line, "visible").sync_create().build();
     let send_content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).halign(gtk::Align::Center).build();
     let send_icon = gtk::Image::from_icon_name("mail-send-symbolic");
     send_icon.set_pixel_size(26);
     send_content.append(&send_icon);
     send_content.append(&gtk::Label::new(Some("Send")));
     send_button.set_child(Some(&send_content));
-    send_button.set_size_request(92, 76);
-    send_button.set_valign(gtk::Align::Start);
+    send_button.set_size_request(64, 72);
+    send_button.set_valign(gtk::Align::Fill);
     send_button.add_css_class("compose-send");
-    // Keep Send in the leading column, starting at From. It has a stable
-    // size even when a recipient field grows to show several chip rows.
-    fields_group.attach(&send_button, 0, 0, 1, 3);
+    // Send spans the entire compact address form, including Subject.
+    fields_group.attach(&send_button, 0, 0, 1, 1);
     top_row.append(&header_spacer);
     top_row.append(&title_label);
     top_row.append(&status_label);
@@ -2871,10 +2890,12 @@ pub fn build_compose_view(
     content.add_css_class("compose-workspace");
     content.append(&editor_toolbar);
     content.append(&fields_group);
-    attachment_flow.set_margin_start(12);
-    attachment_flow.set_margin_end(12);
+    attachment_flow.set_margin_start(8);
+    attachment_flow.set_margin_end(8);
     content.append(&attachment_flow);
-    content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    body_stack.set_margin_start(8);
+    body_stack.set_margin_end(8);
+    body_stack.set_margin_bottom(8);
     content.append(&body_stack);
     content.append(&top_row);
 
@@ -3149,7 +3170,7 @@ pub fn build_compose_view(
             let send_composed = send_composed.clone();
             send_button.connect_clicked(move |_| send_composed(None));
         }
-        send_button.set_popover(Some(&build_schedule_popover(Rc::new(move |at| send_composed(Some(at))))));
+        schedule_button.set_popover(Some(&build_schedule_popover(Rc::new(move |at| send_composed(Some(at))))));
     }
 
     // --- Pop-out button wiring: hand the composer (still alive) to the

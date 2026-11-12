@@ -232,36 +232,21 @@ impl RecipientEntry {
         Self::build(title, false)
     }
 
-    /// Composer variant: a compact, full-width text input alongside its
-    /// label and picker; committed chips wrap below only when present.
+    /// Composer variant: chips and the editable text occupy one inline
+    /// flow, wrapping only when the address list runs out of horizontal space.
     pub fn new_compose(title: &str) -> Self {
         let this = Self::build(title, false);
         let flow = this.flow.as_ref().expect("chip mode");
-        let wrapper = flow.first_child().and_downcast::<gtk::FlowBoxChild>().expect("entry wrapper");
-        wrapper.set_child(None::<&gtk::Widget>);
-        flow.remove(&wrapper);
-        if let Some(label) = this.header.first_child().and_downcast::<gtk::Label>() {
-            label.set_hexpand(false);
-            label.set_width_chars(4);
-            label.remove_css_class("dim-label");
-            label.remove_css_class("caption");
-        }
-        this.entry.set_width_request(0);
-        this.entry.set_placeholder_text(Some("Type a name or email"));
-        this.entry.add_css_class("compose-address-input");
-        // The picker occupies the leading column. The input and its chips
-        // share a single expanding surface, so chips never spill under To/Cc.
         this.root.remove(flow);
-        let input = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(3)
-            .hexpand(true)
-            .css_classes(["compose-address-surface"])
-            .build();
-        input.append(&this.entry);
-        input.append(flow);
-        this.header.append(&input);
-        flow.set_visible(false);
+        flow.set_hexpand(true);
+        flow.set_halign(gtk::Align::Fill);
+        flow.set_row_spacing(2);
+        flow.set_column_spacing(3);
+        flow.add_css_class("compose-address-surface");
+        this.entry.set_width_request(100);
+        this.entry.set_placeholder_text(None);
+        this.entry.add_css_class("compose-address-input");
+        this.header.append(flow);
         this
     }
 
@@ -701,11 +686,6 @@ impl RecipientEntry {
         // An expanded list contributes its member chips right after its own
         // list chip.
         let chips = self.tokens.borrow().clone();
-        // The composer places its entry outside the chip flow, in the
-        // shared address surface. The calendar keeps its entry in the flow.
-        if self.entry.has_css_class("compose-address-input") {
-            flow.set_visible(!chips.is_empty());
-        }
         let mut position = 0i32;
         for (index, chip) in chips.iter().enumerate() {
             match chip {
@@ -1149,23 +1129,20 @@ mod tests {
 
     #[test]
     fn compose_input_and_chips_share_the_expanding_address_surface() {
-        if !crate::gtk_test::gtk_ready() {
-            return;
-        }
+        if !crate::gtk_test::gtk_ready() { return; }
         let field = RecipientEntry::new_compose("");
         let flow = field.flow.as_ref().unwrap();
-        let surface = field.entry.parent().unwrap();
-        assert!(surface.has_css_class("compose-address-surface"));
-        assert!(surface.hexpand());
-        assert_eq!(flow.parent().unwrap(), surface);
-        assert_eq!(surface.parent().unwrap(), field.header.clone().upcast::<gtk::Widget>());
-        assert!(!flow.is_visible());
-
+        assert!(flow.has_css_class("compose-address-surface"));
+        assert!(flow.hexpand());
+        assert_eq!(flow.parent().unwrap(), field.header.clone().upcast::<gtk::Widget>());
+        let entry_wrapper = field.entry.parent().unwrap();
+        assert_eq!(entry_wrapper.parent().unwrap(), flow.clone().upcast::<gtk::Widget>());
+        assert_eq!(flow.last_child().unwrap(), entry_wrapper);
         field.set_from_text("ada@x.com, bob@y.com");
-        assert!(flow.is_visible());
+        assert_eq!(flow.last_child().unwrap(), entry_wrapper);
         assert_eq!(field.addresses(), vec!["ada@x.com", "bob@y.com"]);
         field.set_from_text("");
-        assert!(!flow.is_visible());
+        assert_eq!(flow.first_child().unwrap(), entry_wrapper);
         assert!(field.addresses().is_empty());
     }
 
