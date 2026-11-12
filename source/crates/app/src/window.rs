@@ -2795,8 +2795,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // state it searches, and parented to the header later.
     let search_entry = gtk::SearchEntry::builder()
         .placeholder_text("Search mail")
-        .width_request(140)
-        .hexpand(true)
+        .width_request(200)
+        .hexpand(false)
         .tooltip_text("Search mail (Ctrl+F)")
         .css_classes(["header-search-entry"])
         .build();
@@ -4142,7 +4142,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .tooltip_text("Refine search")
         .css_classes(["flat"])
         .build();
-    let search_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
+    let search_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).halign(gtk::Align::Center).hexpand(false).build();
     search_box.append(&scope_stack);
     search_box.append(&search_entry);
     search_box.append(&search_refine_button);
@@ -5116,6 +5116,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let help_toolbar = help_band.root().clone();
 
     let view_toolbar_stack = gtk::Stack::new();
+    view_toolbar_stack.set_hhomogeneous(false);
+    view_toolbar_stack.set_vhomogeneous(false);
     view_toolbar_stack.add_named(&command_toolbar, Some("mail-home"));
     view_toolbar_stack.add_named(&send_receive_toolbar, Some("mail-send-receive"));
     view_toolbar_stack.add_named(&folder_toolbar, Some("mail-folder"));
@@ -5354,8 +5356,29 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     mail_calendar_overview_card.set_margin_bottom(2);
     mail_calendar_overview_card.add_css_class("folder-pane");
     mail_calendar_overview_card.set_vexpand(false);
-    folder_card.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    folder_card.append(&mail_calendar_overview_card);
+    // A real splitter lets the user choose how much vertical space the
+    // folder tree and calendar occupy. Both halves can scroll independently.
+    folder_card.remove(&folder_scroller);
+    let overview_scroller = gtk::ScrolledWindow::builder()
+        .child(&mail_calendar_overview_card)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .min_content_height(100)
+        .build();
+    mail_calendar_overview_card.bind_property("visible", &overview_scroller, "visible").sync_create().build();
+    let folder_calendar_paned = gtk::Paned::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .start_child(&folder_scroller)
+        .end_child(&overview_scroller)
+        .resize_start_child(true)
+        .resize_end_child(false)
+        .shrink_start_child(true)
+        .shrink_end_child(true)
+        .position(460)
+        .vexpand(true)
+        .build();
+    folder_calendar_paned.add_css_class("folder-calendar-split");
+    folder_card.append(&folder_calendar_paned);
     // True while the window is too narrow to show the whole overview pane:
     // the pane is auto-hidden then instead of letting the paned clip it, and
     // stays hidden until a resize makes it fit again (the toggle handler and
@@ -6229,6 +6252,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // in window geometry. Otherwise GtkOverlay can allocate a child wider
     // than the window, clipping the ribbon and even window header controls.
     window_overlay.set_measure_overlay(&toast_overlay, true);
+    window_overlay.set_clip_overlay(&toast_overlay, true);
+    // The application, rather than its wallpaper, defines the usable size.
+    // Avoid a permanent minimum from the hidden ribbon pages or a fixed
+    // search box; the content can now shrink before the window is clamped.
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -6237,6 +6264,20 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .default_height(settings.get_int(crate::settings::WINDOW_HEIGHT))
         .content(&window_overlay)
         .build();
+    window.set_resizable(true);
+    {
+        let scope_stack = scope_stack.clone();
+        let search_entry = search_entry.clone();
+        let last = Cell::new(-1);
+        window.add_tick_callback(move |window, _| {
+            let width = window.width();
+            if last.replace(width) != width {
+                search_entry.set_width_request(if width < 1050 { 140 } else { 200 });
+                scope_stack.set_visible(width >= 850);
+            }
+            glib::ControlFlow::Continue
+        });
+    }
     // Restored once here, at construction - the window object then lives for
     // the app's lifetime, so this never needs to run again (tray show/hide
     // just toggles visibility on the same window).

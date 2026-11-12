@@ -791,11 +791,12 @@ impl RibbonOverflow {
             });
         }
         let inner = Rc::downgrade(&self.inner);
-        let last_width = Cell::new(-1);
+        let last_width = Cell::new((-1, -1));
         bar.add_tick_callback(move |bar, _| {
             let Some(inner) = inner.upgrade() else { return glib::ControlFlow::Break; };
             let width = bar.width();
-            if last_width.replace(width) != width {
+            let surface_width = bar.root().and_downcast::<gtk::Window>().and_then(|window| window.surface()).map(|surface| surface.width()).unwrap_or(width);
+            if last_width.replace((width, surface_width)) != (width, surface_width) {
                 inner.refresh();
             }
             glib::ControlFlow::Continue
@@ -827,7 +828,14 @@ impl OverflowInner {
         let Some(stack) = self.stack.borrow().upgrade() else {
             return;
         };
-        self.refit_to(bar.width(), &stack);
+        // A child's allocation can temporarily exceed its toplevel (e.g.
+        // while a paned is clamping on Wayland). Fit to the visible budget,
+        // not to that oversized allocation. The next frame rechecks both.
+        let width = bar.width();
+        let surface_width = bar.root().and_downcast::<gtk::Window>().and_then(|window| window.surface()).map(|surface| surface.width()).unwrap_or(width);
+        let offset = bar.root().and_downcast::<gtk::Window>().and_then(|window| bar.compute_bounds(&window)).map(|bounds| bounds.x().max(0.0) as i32).unwrap_or(0);
+        let visible_width = width.min((surface_width - offset - 8).max(1));
+        self.refit_to(visible_width, &stack);
     }
 
     /// Fit the active page into `width` pixels. Separate from [`Self::refit`]
