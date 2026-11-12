@@ -105,8 +105,8 @@ pub fn build() -> MessageHeader {
     crate::privacy::mark(&sender_name_label);
     crate::privacy::mark(&sender_email_label);
     let sender_box = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(4)
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
         .hexpand(true)
         .valign(gtk::Align::Center)
         .build();
@@ -153,13 +153,17 @@ pub fn build() -> MessageHeader {
     let sender_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
     sender_row.append(&avatar_label);
     sender_row.append(&sender_box);
-    sender_row.append(&theme_button);
-    sender_row.append(&reply_button);
-    sender_row.append(&reply_all_button);
-    sender_row.append(&forward_button);
-    sender_row.append(&gtk::Separator::new(gtk::Orientation::Vertical));
     sender_row.append(&contact_button);
-    sender_row.append(&header_more_button);
+    let commands = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(4).css_classes(["message-command-row"]).build();
+    for button in [&reply_button, &reply_all_button, &forward_button] {
+        button.remove_css_class("flat");
+        button.add_css_class("message-command");
+        commands.append(button);
+    }
+    commands.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+    commands.append(&theme_button);
+    // Do not show a dead More button in every opened message.
+    header_more_button.set_visible(false);
 
     let to_label = gtk::Label::builder()
         .xalign(0.0)
@@ -182,6 +186,8 @@ pub fn build() -> MessageHeader {
         .margin_start(12)
         .margin_end(12)
         .build();
+    widget.append(&commands);
+    widget.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     widget.append(&sender_row);
     widget.append(&meta_row);
 

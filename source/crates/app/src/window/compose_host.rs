@@ -583,7 +583,10 @@ pub(crate) fn show_composer_in_reading_pane_full(
     // picker, via `directory_lookup` below) search (item 4.7.6): scoped to the
     // account being sent from, so only that account's directories answer.
     let directory = crate::directory::directory_source(state, account_id.clone(), worker.clone());
-    let directory_lookup = directory.suggestion_lookup();
+    // The full address book is a separate search surface. Do not share
+    // autocomplete's debounce/generation or its eight-result limit.
+    let picker_directory = crate::directory::people_directory_source(state, worker.clone());
+    let directory_lookup = picker_directory.suggestion_lookup();
     let suggestions: crate::recipient_entry::SuggestionSource = Rc::new(move |prefix: &str, complete: Rc<dyn Fn(Vec<crate::recipient_entry::Suggestion>)>| {
         let carddav = carddav_provider.search_contacts(prefix, 8);
         // Contact lists (P-05) live on the same account snapshots the picker

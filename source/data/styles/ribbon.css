@@ -74,3 +74,7 @@ button.ribbon-control,
     padding: 5px 8px;
     min-height: 24px;
 }
+
+/* Outlook-style command surfaces: quiet at rest, unmistakable on hover. */
+.ribbon-control:not(.ribbon-overflow-control):hover { background-color: alpha(@view_fg_color, 0.12); }
+.ribbon-control:not(.ribbon-overflow-control):checked { background-color: alpha(@accent_bg_color, 0.30); }

@@ -1008,7 +1008,7 @@ struct AutosaveCtx {
     to_row: RecipientEntry,
     cc_row: RecipientEntry,
     bcc_row: RecipientEntry,
-    subject_row: adw::EntryRow,
+    subject_row: gtk::Entry,
     read_receipt_toggle: gtk::ToggleButton,
     delivery_receipt_toggle: gtk::ToggleButton,
     high_importance_toggle: gtk::ToggleButton,
@@ -1833,10 +1833,10 @@ pub fn build_compose_view(
     for (row, label) in [(&to_row, "To"), (&cc_row, "Cc"), (&bcc_row, "Bcc")] {
         row.widget().add_css_class("compose-recipient");
         let button = gtk::Button::builder()
-            .label(if label == "To" { "Address Book…" } else { "Choose…" })
-            .width_request(116)
+            .label("Address Book…")
+            .width_request(124)
             .tooltip_text(format!("Select {label} recipients from address book"))
-            .css_classes(["flat"])
+            .css_classes(["compose-picker-button"])
             .build();
         row.add_header_suffix(&button);
         let row = row.clone();
@@ -1846,7 +1846,7 @@ pub fn build_compose_view(
             open(button.clone().upcast(), Rc::new(move |picked: Vec<Suggestion>| row.append_suggestions(&picked)));
         });
     }
-    let subject_row = adw::EntryRow::builder().title("Subject").build();
+    let subject_row = gtk::Entry::builder().hexpand(true).placeholder_text("Subject").css_classes(["compose-address-input"]).build();
     if let Some(subject) = &prefill.subject {
         subject_row.set_text(subject);
     }
@@ -1913,13 +1913,15 @@ pub fn build_compose_view(
         }
     }
 
-    let fields_group = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).build();
+    let fields_group = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).css_classes(["compose-fields"]).build();
     fields_group.append(to_row.widget());
     fields_group.append(cc_row.widget());
     fields_group.append(bcc_row.widget());
-    let subject_list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).css_classes(["boxed-list", "compose-subject"]).build();
-    subject_list.append(&subject_row);
-    fields_group.append(&subject_list);
+    let subject_line = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["compose-subject-line"]).build();
+    let subject_label = gtk::Label::builder().label("Subject").xalign(0.0).width_chars(7).build();
+    subject_line.append(&subject_label);
+    subject_line.append(&subject_row);
+    fields_group.append(&subject_line);
 
     // --- Attachments: a canonical in-session list, rendered as removable
     // chips below the fields, same repopulate-from-truth shape
@@ -2754,12 +2756,13 @@ pub fn build_compose_view(
 
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(12)
-        .margin_top(12)
-        .margin_bottom(12)
-        .margin_start(12)
-        .margin_end(12)
+        .spacing(8)
+        .margin_top(8)
+        .margin_bottom(8)
+        .margin_start(8)
+        .margin_end(8)
         .build();
+    content.add_css_class("compose-workspace");
     content.append(&top_row);
     content.append(&editor_toolbar);
     content.append(&fields_group);

@@ -9,7 +9,7 @@
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -149,7 +149,7 @@ pub fn show_contact_picker(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>, di
     items.extend(lists.into_iter().map(Item::List));
 
     let dialog = {
-        let mut builder = gtk::Window::builder().modal(true).title("Add Recipients").default_width(420).default_height(480);
+        let mut builder = gtk::Window::builder().modal(true).title("Address Book").default_width(760).default_height(560);
         if let Some(win) = anchor.root().and_downcast::<gtk::Window>() {
             builder = builder.transient_for(&win);
         }
@@ -157,7 +157,7 @@ pub fn show_contact_picker(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>, di
     };
 
     let search = gtk::SearchEntry::builder()
-        .placeholder_text("Search contacts")
+        .placeholder_text("Search name or email (at least 3 characters)")
         .margin_start(12)
         .margin_end(12)
         .margin_top(12)
@@ -174,7 +174,7 @@ pub fn show_contact_picker(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>, di
 
     // Keyed by the item's stable key rather than list position, so a check
     // survives the list being rebuilt (filtered) out from under it.
-    let selected: Rc<RefCell<HashSet<String>>> = Rc::new(RefCell::new(HashSet::new()));
+    let selected: Rc<RefCell<HashMap<String, Item>>> = Rc::new(RefCell::new(HashMap::new()));
 
     // The directory hits currently shown, filled in asynchronously by the
     // lookup below (item 4.7.7). Rebuilt row-by-row like `items`, but read-only
@@ -196,12 +196,14 @@ pub fn show_contact_picker(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>, di
             // Owned clones, so the directory list isn't borrowed across the
             // rebuild (its `RefCell` may be written by an in-flight lookup).
             let matches: Vec<Item> = items.iter().filter(|item| item.matches(&filter)).cloned().collect();
-            let directory_matches: Vec<Item> = directory_items.borrow().iter().filter(|item| item.matches(&filter)).cloned().collect();
+            // Directory results have already been matched by the server (which may
+            // search aliases or other attributes not in the displayed name).
+            let directory_matches: Vec<Item> = directory_items.borrow().clone();
 
             if matches.is_empty() && directory_matches.is_empty() {
                 let empty = gtk::Label::builder()
                     .label(if items.is_empty() && directory_items.borrow().is_empty() {
-                        "No contacts yet"
+                        "Search the corporate directory by name or email"
                     } else {
                         "No contacts found"
                     })
@@ -222,7 +224,7 @@ pub fn show_contact_picker(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>, di
                 append_picker_row(&list, candidate, &selected);
             }
             if !directory_matches.is_empty() {
-                append_section_header(&list, "Directory");
+                append_section_header(&list, "Global Address List");
                 for candidate in &directory_matches {
                     append_picker_row(&list, candidate, &selected);
                 }
@@ -283,18 +285,10 @@ pub fn show_contact_picker(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>, di
     }
     {
         let dialog = dialog.clone();
-        let items = items.clone();
-        let directory_items = directory_items.clone();
         add_button.connect_clicked(move |_| {
-            let directory_items = directory_items.borrow();
-            let picked: Vec<Suggestion> = items
-                .iter()
-                .chain(directory_items.iter())
-                .filter(|item| selected.borrow().contains(&item.key()))
-                .cloned()
-                .map(Item::into_suggestion)
-                .collect();
-            drop(directory_items);
+            let mut picked_items: Vec<Item> = selected.borrow().values().cloned().collect();
+            picked_items.sort_by_cached_key(|item| item.label().to_lowercase());
+            let picked: Vec<Suggestion> = picked_items.into_iter().map(Item::into_suggestion).collect();
             dialog.close();
             if !picked.is_empty() {
                 on_add(picked);
@@ -314,16 +308,19 @@ pub fn show_contact_picker(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>, di
     action_row.append(&add_button);
 
     let root = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
+    let heading = gtk::Label::builder().label("Address Book — Contacts and Global Address List").xalign(0.0).margin_start(12).margin_top(12).css_classes(["heading"]).build();
+    root.append(&heading);
     root.append(&search);
     root.append(&scroller);
     root.append(&action_row);
     dialog.set_child(Some(&root));
     dialog.present();
+    search.grab_focus();
 }
 
 /// Appends one pickable row (checkbox + label + optional subtitle) to the
 /// picker's list, wired to the shared `selected` set by the item's stable key.
-fn append_picker_row(list: &gtk::ListBox, candidate: &Item, selected: &Rc<RefCell<HashSet<String>>>) {
+fn append_picker_row(list: &gtk::ListBox, candidate: &Item, selected: &Rc<RefCell<HashMap<String, Item>>>) {
     let row = gtk::ListBoxRow::new();
     let row_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -336,13 +333,14 @@ fn append_picker_row(list: &gtk::ListBox, candidate: &Item, selected: &Rc<RefCel
 
     let checkbox = gtk::CheckButton::builder().valign(gtk::Align::Center).build();
     let key = candidate.key();
-    checkbox.set_active(selected.borrow().contains(&key));
+    checkbox.set_active(selected.borrow().contains_key(&key));
     {
         let selected = selected.clone();
         let key = key.clone();
+        let candidate = candidate.clone();
         checkbox.connect_toggled(move |btn| {
             if btn.is_active() {
-                selected.borrow_mut().insert(key.clone());
+                selected.borrow_mut().insert(key.clone(), candidate.clone());
             } else {
                 selected.borrow_mut().remove(&key);
             }
@@ -373,6 +371,11 @@ fn append_picker_row(list: &gtk::ListBox, candidate: &Item, selected: &Rc<RefCel
     row_box.append(&checkbox);
     row_box.append(&text_box);
     row.set_child(Some(&row_box));
+    // Clicking the name is equivalent to clicking its checkbox.
+    let checkbox_for_row = checkbox.clone();
+    let click = gtk::GestureClick::new();
+    click.connect_released(move |_, _, _, _| checkbox_for_row.set_active(!checkbox_for_row.is_active()));
+    text_box.add_controller(click);
     list.append(&row);
 }
 
