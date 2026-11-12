@@ -447,13 +447,16 @@ pub(crate) fn show_composer_in_reading_pane_full(
             // A normal title bar contains only the window title and window controls.
             // All message commands stay in the composer, including while docked.
             let docking = Rc::new(Cell::new(false));
-            let dock = gtk::Button::with_label("Dock in reading pane");
-            {
-                let win = win.clone();
+            let dock = handle.dock_button.clone();
+            dock.set_visible(true);
+            let dock_handler = {
+                let weak_win = win.downgrade();
                 let docking = docking.clone();
-                dock.connect_clicked(move |_| { docking.set(true); win.close(); });
-            }
-            handle.top_row.append(&dock);
+                dock.connect_clicked(move |_| {
+                    if let Some(win) = weak_win.upgrade() { docking.set(true); win.close(); }
+                })
+            };
+            let dock_handler = RefCell::new(Some(dock_handler));
             let content_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
             content_box.append(&header);
             content_box.append(&handle.widget);
@@ -479,7 +482,8 @@ pub(crate) fn show_composer_in_reading_pane_full(
                         if let Some(parent) = handle.widget.parent().and_then(|parent| parent.downcast::<gtk::Box>().ok()) {
                             parent.remove(&handle.widget);
                         }
-                        handle.top_row.remove(&dock);
+                        dock.set_visible(false);
+                        if let Some(id) = dock_handler.borrow_mut().take() { dock.disconnect(id); }
                         if let Some(existing) = reading_stack_for_close.child_by_name("compose") {
                             reading_stack_for_close.remove(&existing);
                         }

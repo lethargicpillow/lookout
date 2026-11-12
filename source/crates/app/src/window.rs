@@ -3202,7 +3202,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // toolbar's (see below). Lives inside the "message" page below, so it's
     // visible only while an actual message is shown, not for the empty
     // placeholder or the in-place composer.
-    let message_header = crate::message_header::build();
+    let message_header = crate::message_header::build_for_reading_pane();
 
     // The reading pane crossfades between three top-level pages: a single
     // "message" page that groups the message header with the body - so both
@@ -3303,7 +3303,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // everything that isn't one.
     message_page.append(&crate::window::build_delivery_report_card());
     message_page.append(&content_stack);
-    message_page.append(&message_header.action_bar);
     // The List-Unsubscribe banner, between the header and the body: revealed
     // by `render_body` when the message's headers offer an unsubscribe
     // action (RFC 2369 / one-click RFC 8058), hidden otherwise and once the
@@ -12142,7 +12141,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     for (button, mode, title) in [
         (&reply_button, crate::compose::ReplyMode::Reply, "Reply"),
         (&message_header.reply_button, crate::compose::ReplyMode::Reply, "Reply"),
-        (&message_header.bottom_reply_button, crate::compose::ReplyMode::Reply, "Reply"),
         (&reply_all_button, crate::compose::ReplyMode::ReplyAll, "Reply All"),
         (&message_header.reply_all_button, crate::compose::ReplyMode::ReplyAll, "Reply All"),
     ] {
@@ -12183,7 +12181,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
     // The reading-pane header and bottom-bar Forward buttons.
-    for button in [&message_header.forward_button, &message_header.bottom_forward_button] {
+    for button in [&message_header.forward_button] {
         let message_list = message_list.clone();
         let state = state.clone();
         let worker = worker.clone();

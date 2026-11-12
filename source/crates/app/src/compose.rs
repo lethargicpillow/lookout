@@ -67,6 +67,7 @@ pub struct PopOutHandle {
     pub toolbar_anchor: gtk::Widget,
     pub cancel_button: gtk::Button,
     pub close_button: gtk::Button,
+    pub dock_button: gtk::Button,
     pub send_button: adw::SplitButton,
     pub from_dropdown: gtk::DropDown,
     pub read_receipt_toggle: gtk::ToggleButton,
@@ -1436,7 +1437,7 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, F
     }
 
     let color_dialog = gtk::ColorDialog::new();
-    let color_button = gtk::ColorDialogButton::builder().dialog(&color_dialog).tooltip_text("Text color").build();
+    let color_button = gtk::ColorDialogButton::builder().dialog(&color_dialog).tooltip_text("Text color").rgba(&gtk::gdk::RGBA::BLACK).build();
     {
         let web_view = web_view.clone();
         color_button.connect_rgba_notify(move |button| {
@@ -2490,25 +2491,37 @@ pub fn build_compose_view(
     let options_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
     let format = &format_controls;
     editor_band.group("Font", |group| {
-        group.plain();
-        group.widget(&format.font_family);
-        group.widget(&format.font_size);
-        group.widget(&format.color);
-        group.small_button(&format.bold, "format-text-bold-symbolic", "Bold");
-        group.small_button(&format.italic, "format-text-italic-symbolic", "Italic");
-        group.small_button(&format.underline, "format-text-underline-symbolic", "Underline");
-        group.small_button(&format.strikethrough, "format-text-strikethrough-symbolic", "Strikethrough");
-        group.small_button(&format.clear_formatting, "edit-clear-all-symbolic", "Clear Formatting");
+        let block = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(3).css_classes(["compose-format-block"]).build();
+        let selectors = gtk::Box::new(gtk::Orientation::Horizontal, 3);
+        format.font_family.set_size_request(120, -1);
+        format.font_size.set_size_request(65, -1);
+        selectors.append(&format.font_family);
+        selectors.append(&format.font_size);
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 1);
+        for button in [&format.bold, &format.italic, &format.underline, &format.strikethrough, &format.clear_formatting] {
+            button.add_css_class("compose-format-button");
+            actions.append(button);
+        }
+        format.color.set_size_request(34, -1);
+        actions.append(&format.color);
+        block.append(&selectors);
+        block.append(&actions);
+        group.widget(&block);
     });
     editor_band.group("Paragraph", |group| {
-        group.small_button(&format.bullets, "list-bullet-symbolic", "Bullets");
-        group.small_button(&format.numbering, "list-number-symbolic", "Numbering");
-        group.small_button(&format.outdent, "format-indent-less-symbolic", "Decrease Indent");
-        group.small_button(&format.indent, "format-indent-more-symbolic", "Increase Indent");
-        group.small_button(&format.align_left, "format-justify-left-symbolic", "Align Left");
-        group.small_button(&format.align_center, "format-justify-center-symbolic", "Center");
-        group.small_button(&format.align_right, "format-justify-right-symbolic", "Align Right");
-        group.small_button(&format.justify, "format-justify-fill-symbolic", "Justify");
+        let block = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(3).css_classes(["compose-format-block"]).build();
+        for buttons in [
+            [&format.bullets, &format.numbering, &format.outdent, &format.indent],
+            [&format.align_left, &format.align_center, &format.align_right, &format.justify],
+        ] {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 1);
+            for button in buttons {
+                button.add_css_class("compose-format-button");
+                row.append(button);
+            }
+            block.append(&row);
+        }
+        group.widget(&block);
     });
     editor_band.group("Include", |group| {
         group.button(&attach_button, "mail-attachment-symbolic", "Attach Files");
@@ -2540,7 +2553,6 @@ pub fn build_compose_view(
     });
     editor_band.group("Draft", |group| {
         group.button(&save_draft_button, "document-save-symbolic", "Save Draft");
-        group.button(&close_button, "window-close-symbolic", "Close");
     });
     // The composer owns its overflow controller, including when popped out.
     let editor_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).hexpand(true).build();
@@ -2788,6 +2800,19 @@ pub fn build_compose_view(
     rich_toggle.bind_property("active", &light_view_button, "sensitive").sync_create().build();
     let pop_out_button = gtk::Button::from_icon_name(crate::window::themed_icon_name(&["popout1", "window-new-symbolic", "view-restore-symbolic"]));
     pop_out_button.set_tooltip_text(Some("Pop out compose window"));
+    pop_out_button.set_visible(on_pop_out.is_some());
+    let dock_button = gtk::Button::with_label("Dock");
+    dock_button.set_tooltip_text(Some("Dock in reading pane"));
+    dock_button.set_visible(false);
+    editor_band.group("Message", |group| {
+        group.button(&cancel_button, "user-trash-symbolic", "Discard");
+    });
+    options_band.group("Window", |group| {
+        group.small_toggle(&light_view_button, "display-brightness-symbolic", "Light / Dark");
+        group.small_button(&pop_out_button, "window-new-symbolic", "Pop Out");
+        group.small_button(&dock_button, "view-restore-symbolic", "Dock");
+        group.small_button(&close_button, "window-close-symbolic", "Close");
+    });
 
     let top_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -2804,6 +2829,12 @@ pub fn build_compose_view(
     from_line.append(&from_dropdown);
     from_line.append(&identity_hint_icon);
     fields_group.prepend(&from_line);
+    let send_content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).halign(gtk::Align::Center).build();
+    let send_icon = gtk::Image::from_icon_name("mail-send-symbolic");
+    send_icon.set_pixel_size(26);
+    send_content.append(&send_icon);
+    send_content.append(&gtk::Label::new(Some("Send")));
+    send_button.set_child(Some(&send_content));
     send_button.set_size_request(90, 76);
     send_button.set_valign(gtk::Align::Start);
     let address_block = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
@@ -2813,13 +2844,14 @@ pub fn build_compose_view(
     top_row.append(&header_spacer);
     top_row.append(&title_label);
     top_row.append(&status_label);
-    light_view_button.set_label("Light / Dark");
-    top_row.append(&light_view_button);
-    if on_pop_out.is_some() {
-        top_row.append(&pop_out_button);
+    // The status strip is present only while it has something to report.
+    top_row.set_visible(!status_label.label().is_empty());
+    {
+        let weak_row = top_row.downgrade();
+        status_label.connect_notify_local(Some("label"), move |label, _| {
+            if let Some(row) = weak_row.upgrade() { row.set_visible(!label.label().is_empty()); }
+        });
     }
-    cancel_button.set_label("Discard");
-    top_row.append(&cancel_button);
 
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -3117,6 +3149,7 @@ pub fn build_compose_view(
     // that as a displacement and kill the autosave. All of this runs
     // synchronously on the main loop, so the autosave tick can never observe
     // the transient unroot.
+    let on_pop_out_is_available = on_pop_out.is_some();
     if let Some(on_pop_out) = on_pop_out {
         let moving = moving.clone();
         let popped_out = popped_out.clone();
@@ -3127,6 +3160,7 @@ pub fn build_compose_view(
         let status_label = status_label.clone();
         let cancel_button = cancel_button.clone();
         let close_button = close_button.clone();
+        let dock_button = dock_button.clone();
         let send_button = send_button.clone();
         let from_dropdown = from_dropdown.clone();
         let read_receipt_toggle = read_receipt_toggle.clone();
@@ -3145,6 +3179,7 @@ pub fn build_compose_view(
                 toolbar_anchor: top_row.clone().into(),
                 cancel_button: cancel_button.clone(),
                 close_button: close_button.clone(),
+                dock_button: dock_button.clone(),
                 send_button: send_button.clone(),
                 from_dropdown: from_dropdown.clone(),
                 read_receipt_toggle: read_receipt_toggle.clone(),
@@ -3183,7 +3218,7 @@ pub fn build_compose_view(
         let moving = moving.clone();
         let popped_out = popped_out.clone();
         let pop_out_button = pop_out_button.clone();
-        let top_row = top_row.clone();
+        let can_pop_out = on_pop_out_is_available;
         content.connect_root_notify(move |widget| {
             if widget.root().is_none() {
                 if !moving.get() {
@@ -3196,9 +3231,7 @@ pub fn build_compose_view(
                 // by the window layer), and makes the pop-out button a
                 // no-op - so the row is hidden; it comes back with the
                 // whole composer on pop-back-in.
-                let shown = !popped_out.get();
-                pop_out_button.set_visible(shown);
-                top_row.set_visible(true);
+                pop_out_button.set_visible(can_pop_out && !popped_out.get());
             }
         });
     }

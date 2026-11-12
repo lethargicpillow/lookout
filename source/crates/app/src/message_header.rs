@@ -27,7 +27,6 @@ pub struct MessageHeader {
     /// hidden otherwise. Wired in `window.rs`.
     pub back_button: gtk::Button,
     pub widget: gtk::Box,
-    pub action_bar: gtk::Box,
     subject_label: gtk::Label,
     /// The sender avatar/name/address labels. `pub(crate)` so `window.rs` can
     /// attach the profile-card trigger (Phase 4.2 / UX-67) to the avatar and
@@ -45,8 +44,6 @@ pub struct MessageHeader {
     /// a prefilled create dialog - wired up in `window.rs`, which owns the
     /// contact state the lookup needs.
     pub contact_button: gtk::Button,
-    pub bottom_reply_button: gtk::Button,
-    pub bottom_forward_button: gtk::Button,
     /// The "Switch message theme" toggle: when active, the message body's
     /// own background colour is removed - and its colours inverted - so the
     /// content reads against the app theme's background instead. A per-email
@@ -72,6 +69,15 @@ fn placeholder_button(icon: &str, tooltip: &str) -> gtk::Button {
 }
 
 pub fn build() -> MessageHeader {
+    build_with_commands(true)
+}
+
+/// The main window already has Reply / Reply All / Forward on its ribbon.
+pub fn build_for_reading_pane() -> MessageHeader {
+    build_with_commands(false)
+}
+
+fn build_with_commands(show_commands: bool) -> MessageHeader {
     let subject_label = gtk::Label::builder().xalign(0.0).wrap(true).css_classes(["message-header-subject"]).build();
     let subject_bar = gtk::Box::builder().orientation(gtk::Orientation::Vertical).css_classes(["message-subject-bar"]).build();
     subject_bar.set_widget_name("subject-bar");
@@ -160,8 +166,12 @@ pub fn build() -> MessageHeader {
         button.add_css_class("message-command");
         commands.append(button);
     }
-    commands.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-    commands.append(&theme_button);
+    if show_commands {
+        commands.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+        commands.append(&theme_button);
+    } else {
+        sender_row.append(&theme_button);
+    }
     // Do not show a dead More button in every opened message.
     header_more_button.set_visible(false);
 
@@ -186,30 +196,17 @@ pub fn build() -> MessageHeader {
         .margin_start(12)
         .margin_end(12)
         .build();
-    widget.append(&commands);
-    widget.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    if show_commands {
+        widget.append(&commands);
+        widget.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    }
     widget.append(&sender_row);
     widget.append(&meta_row);
-
-    let bottom_reply_button = action_button("mail-reply-sender-symbolic", "Reply");
-    bottom_reply_button.set_tooltip_text(Some("Reply"));
-    let bottom_forward_button = action_button("mail-forward-symbolic", "Forward");
-    bottom_forward_button.set_tooltip_text(Some("Forward"));
-
-    let action_bar = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
-        .halign(gtk::Align::Start)
-        .css_classes(["message-action-bar"])
-        .build();
-    action_bar.append(&bottom_reply_button);
-    action_bar.append(&bottom_forward_button);
 
     MessageHeader {
         subject_bar,
         back_button,
         widget,
-        action_bar,
         subject_label,
         avatar_label,
         sender_name_label,
@@ -220,8 +217,6 @@ pub fn build() -> MessageHeader {
         reply_all_button,
         forward_button,
         contact_button,
-        bottom_reply_button,
-        bottom_forward_button,
         theme_button,
     }
 }

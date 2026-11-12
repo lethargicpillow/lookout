@@ -80,3 +80,11 @@
 
 .compose-ribbon-tabs { margin-bottom: 2px; }
 .compose-ribbon-tabs button { padding: 5px 14px; }
+
+/* Office-style compact formatting grid, without a label beside each glyph. */
+.compose-format-block { padding: 2px 4px; }
+.compose-format-block .compose-format-button { min-width: 26px; min-height: 26px; padding: 3px; border-radius: 3px; }
+.compose-format-block .compose-format-button:hover { background-color: alpha(@view_fg_color, 0.15); }
+.compose-ribbon-tabs { background: transparent; }
+.compose-ribbon-tabs button { border-radius: 0; background: transparent; border-bottom: 2px solid transparent; }
+.compose-ribbon-tabs button:checked { background: transparent; border-bottom-color: @accent_bg_color; color: @accent_color; }

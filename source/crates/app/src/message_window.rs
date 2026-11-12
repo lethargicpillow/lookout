@@ -101,10 +101,8 @@ pub(crate) fn open_message_window(parent: &adw::ApplicationWindow, state: &Rc<Re
     let window = adw::Window::builder().default_width(900).default_height(700).title(&subject).build();
     let header_bar = adw::HeaderBar::new();
     header_bar.set_title_widget(Some(&adw::WindowTitle::new(&subject, &sender)));
+    // Use the title bar's normal window controls; no duplicate Close.
     let close_button = gtk::Button::from_icon_name("window-close-symbolic");
-    close_button.set_css_classes(&["flat"]);
-    close_button.set_tooltip_text(Some("Close"));
-    header_bar.pack_end(&close_button);
 
     let header = crate::message_header::build();
 
@@ -285,7 +283,6 @@ pub(crate) fn open_message_window(parent: &adw::ApplicationWindow, state: &Rc<Re
     content.append(&header.subject_bar);
     content.append(&header.widget);
     content.append(&page_stack);
-    content.append(&header.action_bar);
     let toast_overlay = adw::ToastOverlay::new();
     toast_overlay.set_child(Some(&content));
     window.set_content(Some(&toast_overlay));
@@ -379,11 +376,10 @@ pub(crate) fn open_message_window(parent: &adw::ApplicationWindow, state: &Rc<Re
     for (button, mode, title) in [
         (&header.reply_button, crate::compose::ReplyMode::Reply, "Reply"),
         (&header.reply_all_button, crate::compose::ReplyMode::ReplyAll, "Reply All"),
-        (&header.bottom_reply_button, crate::compose::ReplyMode::Reply, "Reply"),
     ] {
         wire_reply_button(button, mode, title, &entry, state, worker, main_reading_stack);
     }
-    for button in [&header.forward_button, &header.bottom_forward_button] {
+    for button in [&header.forward_button] {
         wire_forward_button(button, &entry, state, worker, main_reading_stack);
     }
     {
