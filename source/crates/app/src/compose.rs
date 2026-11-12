@@ -2511,8 +2511,10 @@ pub fn build_compose_view(
             .spacing(3).valign(gtk::Align::Fill).build();
         format.font_family.set_size_request(128, -1);
         format.font_family.set_hexpand(true);
+        format.font_family.set_valign(gtk::Align::Fill);
         format.font_family.add_css_class("compose-format-select");
         format.font_size.set_size_request(62, -1);
+        format.font_size.set_valign(gtk::Align::Fill);
         format.font_size.add_css_class("compose-format-select");
         selectors.append(&format.font_family);
         selectors.append(&format.font_size);
@@ -2525,6 +2527,7 @@ pub fn build_compose_view(
             font_actions.append(button);
         }
         format.color.set_size_request(34, -1);
+        format.color.set_valign(gtk::Align::Fill);
         format.color.add_css_class("compose-format-color");
         font_actions.append(&format.color);
 
@@ -2622,7 +2625,9 @@ pub fn build_compose_view(
     ribbon_row.append(&editor_scroller);
     let more = gtk::MenuButton::builder().icon_name("view-more-symbolic").tooltip_text("More commands").build();
     let more_band = crate::ribbon::RibbonBand::new(&ribbon_style, &[]);
-    more_band.standalone().menu(&more, "view-more-symbolic", "More");
+    let trailing = more_band.standalone();
+    trailing.theme_switch();
+    trailing.menu(&more, "view-more-symbolic", "More");
     ribbon_row.append(more_band.root());
     let overflow_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).margin_top(6).margin_bottom(6).margin_start(6).margin_end(6).build();
     let extras = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -2850,15 +2855,6 @@ pub fn build_compose_view(
         group.small_button(&cancel_button, "user-trash-symbolic", "Discard");
     });
     options_band.group("Window", |group| {
-        let app_theme_button = gtk::Button::new();
-        // The floating composer is a bare adw::Window, not an ApplicationWindow.
-        // Activate the app action explicitly in both hosting modes.
-        app_theme_button.connect_clicked(|_| {
-            if let Some(app) = gio::Application::default() {
-                app.activate_action("toggle-theme", None);
-            }
-        });
-        group.small_button(&app_theme_button, "display-brightness-symbolic", "Light / Dark");
         group.small_toggle(&light_view_button, "view-reveal-symbolic", "Page Background");
         group.small_button(&pop_out_button, "window-new-symbolic", "Pop Out");
         group.small_button(&dock_button, "view-restore-symbolic", "Dock");

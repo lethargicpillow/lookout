@@ -42,6 +42,12 @@
 .compose-ribbon-tabs button:hover { background-color: alpha(@window_fg_color, 0.07); }
 .compose-ribbon-commands { padding: 2px 6px; }
 .compose-format-block { padding: 2px 4px; }
+.ribbon-classic .compose-format-block {
+    min-height: 68px;
+}
+.ribbon-classic .compose-format-block .compose-format-button {
+    margin: 0;
+}
 .compose-format-divider { background-color: @lookout-ribbon-divider; margin: 3px 1px; }
 .compose-format-select > button,
 .compose-format-color > button {

@@ -554,9 +554,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let folder_card = card_section(&folder_scroller);
     folder_card.add_css_class("folder-pane");
     folder_card.add_css_class("mail-navigation-pane");
-    folder_card.add_css_class("card-flush-end");
     folder_card.add_css_class(crate::settings::spacing_class(&settings.get_string(crate::settings::LAYOUT_SPACING)));
-    folder_card.set_margin_end(0);
     // Floor on the folder pane's width, so the separator can't be dragged
     // left until the folder names are a sliver. Set on the card rather than
     // on `folder_scroller`'s child because `Gtk.ScrolledWindow` absorbs its
@@ -2856,15 +2854,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let message_card = card_section(&message_box);
     message_card.set_hexpand(true);
     message_card.add_css_class("mail-message-pane");
-    message_card.add_css_class("card-flush-start");
-    message_card.set_margin_start(0);
-    // Halves the gap to the reading pane: that gap is this margin plus the
-    // Paned separator (12px, see `data/styles/shell.css`) plus the reading
-    // card's own start margin, so dropping both card margins to 0 takes it
-    // from 24px to 12px. Zeroing the margins rather than narrowing the
-    // separator keeps the whole gap draggable - the separator is
-    // transparent, so the two look identical but only it grabs the pointer.
-    message_card.set_margin_end(0);
 
     // --- Sync button -> re-sync whatever the list is showing. ---
     {
@@ -3791,8 +3780,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     reading_pane_box.append(&reading_stack);
 
     let reading_card = card_section(&reading_pane_box);
-    // See `message_card` above - the other half of the halved gap.
-    reading_card.set_margin_start(0);
 
     // Keep the reading pane's card fully transparent while it's showing the
     // "no message selected" placeholder, so the window background image
@@ -3841,6 +3828,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .shrink_end_child(true)
         .position(368)
         .build();
+    messages_reading_paned.add_css_class("seamless-paned");
     // The message list's row style follows the split's position (the list
     // pane's width). `GtkPaned:position` is a real notifying property, unlike
     // a widget's `width`; a map-time idle catches the first allocation, and
@@ -3898,13 +3886,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // Apply the persisted visibility here; the View ribbon's "Reading pane"
     // dropdown only re-applies it when the user picks a new position.
     reading_card.set_visible(settings.get_bool(crate::settings::LAYOUT_READING_PANE));
-    // A bottom reading pane closes the half-gap to the message list on the
-    // vertical edge (the cards' facing top/bottom margins), the way the side
-    // layout already does on the horizontal edge.
-    if reading_pane_orientation == gtk::Orientation::Vertical {
-        reading_card.set_margin_top(0);
-        message_card.set_margin_bottom(0);
-    }
     let main_paned = gtk::Paned::builder()
         .orientation(gtk::Orientation::Horizontal)
         .start_child(&folder_card)
@@ -3928,6 +3909,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // it (nav_rail included).
     root_stack.set_hhomogeneous(false);
     root_stack.set_vhomogeneous(false);
+    // The workspace owns the outside gutter. Paned separators alone own
+    // the gaps inside it, so card margins cannot add a second gap.
+    const WORKSPACE_GUTTER: i32 = 6;
+    root_stack.set_margin_start(WORKSPACE_GUTTER);
+    root_stack.set_margin_end(WORKSPACE_GUTTER);
+    root_stack.set_margin_top(WORKSPACE_GUTTER);
+    root_stack.set_margin_bottom(WORKSPACE_GUTTER);
     root_stack.add_named(&status_page_as_widget, Some("empty"));
     root_stack.add_named(&main_paned_as_widget, Some("mail"));
     root_stack.set_visible_child_name("empty");
@@ -4101,6 +4089,24 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     contacts_paned.add_css_class("seamless-paned");
     root_stack.add_named(&contacts_status_page, Some("contacts-empty"));
     root_stack.add_named(&contacts_paned, Some("contacts"));
+    for pane in [
+        folder_card.upcast_ref::<gtk::Widget>(),
+        message_card.upcast_ref::<gtk::Widget>(),
+        reading_card.upcast_ref::<gtk::Widget>(),
+        calendar_sidebar_card.upcast_ref::<gtk::Widget>(),
+        calendar_main.root.upcast_ref::<gtk::Widget>(),
+        tasks_card.upcast_ref::<gtk::Widget>(),
+        lookout_card.upcast_ref::<gtk::Widget>(),
+        contacts_left_card.upcast_ref::<gtk::Widget>(),
+        contacts_right_card.upcast_ref::<gtk::Widget>(),
+        contacts_details_card.upcast_ref::<gtk::Widget>(),
+    ] {
+        pane.set_margin_start(0);
+        pane.set_margin_end(0);
+        pane.set_margin_top(0);
+        pane.set_margin_bottom(0);
+        pane.add_css_class("workspace-pane");
+    }
 
     // Built here (rather than down by the rest of the Config wiring below) so
     // every settings row exists before its handlers are attached.
@@ -4185,12 +4191,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let settings_button = gtk::Button::from_icon_name("preferences-system-symbolic");
     settings_button.set_css_classes(&["flat"]);
     settings_button.set_tooltip_text(Some("Settings"));
-    let theme_button = gtk::Button::from_icon_name("display-brightness-symbolic");
-    theme_button.set_css_classes(&["flat"]);
-    theme_button.set_action_name(Some("app.toggle-theme"));
-    theme_button.set_tooltip_text(Some("Switch app light / dark theme"));
     window_header.pack_end(&settings_button);
-    window_header.pack_end(&theme_button);
     window_header.pack_end(&header_privacy_toggle);
     // Work Offline's title-bar indicator (M-40): visible in every module
     // while the switch is on, so the paused state is never a Mail-only secret.
@@ -5328,7 +5329,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // the pane's real width - the `width_request` below is only a floor - so
     // narrowing the pane means narrowing the buttons.
     mail_calendar_overview.root.add_css_class("mini-calendar-compact");
-    let mail_overview_day_list = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(10).margin_top(8).build();
+    let mail_overview_day_list = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).margin_top(6).build();
     // Matches `build_sidebar()`'s own width_request - without an explicit
     // cap here, the mini-calendar's day-button grid requests its natural
     // (much wider) size instead of a compact peek-pane width.
@@ -5336,10 +5337,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .orientation(gtk::Orientation::Vertical)
         .spacing(4)
         .width_request(140)
-        .margin_top(2)
-        .margin_bottom(2)
-        .margin_start(2)
-        .margin_end(2)
+        .margin_top(WORKSPACE_GUTTER)
+        .margin_bottom(WORKSPACE_GUTTER)
+        .margin_start(WORKSPACE_GUTTER)
+        .margin_end(WORKSPACE_GUTTER)
         .build();
     mail_overview_box.append(&mail_calendar_overview.root);
     mail_overview_box.append(&mail_overview_day_list);
@@ -6110,7 +6111,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // at any width, so its natural width is always reserved by the overflow
     // fit (it is never wrapped in the shrinkable scroller below).
     let ribbon_more_band = crate::ribbon::RibbonBand::new(&ribbon_style, &[]);
-    ribbon_more_band.standalone().menu(&more_button, "view-more-symbolic", "More");
+    let trailing = ribbon_more_band.standalone();
+    trailing.theme_switch();
+    trailing.menu(&more_button, "view-more-symbolic", "More");
     let ribbon_more = ribbon_more_band.root().clone();
 
     let icon_toolbar_box = gtk::Box::builder()
@@ -6206,8 +6209,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .overflow(gtk::Overflow::Hidden)
         .margin_start(6)
         .margin_end(6)
-        .margin_top(6)
-        .margin_bottom(6)
+        .margin_top(WORKSPACE_GUTTER)
+        .margin_bottom(0)
         .build();
     toolbars_box.append(&menu_bar);
     toolbars_box.append(&icon_toolbar_box);
@@ -6786,7 +6789,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let reading_pane_action = reading_pane_action.clone();
         let reading_pane_button = reading_pane_button.clone();
         let messages_reading_paned = messages_reading_paned.clone();
-        let message_card = message_card.clone();
         let reading_card = reading_card.clone();
         let reading_pane_row = config_view.reading_pane_row.clone();
         let schedule_apply_pane_widths = schedule_apply_pane_widths.clone();
@@ -6794,15 +6796,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // Guards the ComboRow's `selected` notify while `apply` writes it, so
         // the row and the action can never drive each other in a loop.
         let suppress_row: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        // The margins a bottom reading pane zeroes to close the half-gap to
-        // the message list; captured so Right can restore them.
-        let reading_card_default_margin_top = reading_card.margin_top();
-        let message_card_default_margin_bottom = message_card.margin_bottom();
         let apply: ApplyReadingPane = {
             let reading_pane_action = reading_pane_action.clone();
             let reading_pane_button = reading_pane_button.clone();
             let messages_reading_paned = messages_reading_paned.clone();
-            let message_card = message_card.clone();
             let reading_card = reading_card.clone();
             let reading_pane_row = reading_pane_row.clone();
             let schedule_apply_pane_widths = schedule_apply_pane_widths.clone();
@@ -6837,16 +6834,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     crate::settings::ReadingPanePosition::Right => gtk::Orientation::Horizontal,
                 };
                 messages_reading_paned.set_orientation(orientation);
-                match position {
-                    crate::settings::ReadingPanePosition::Bottom => {
-                        reading_card.set_margin_top(0);
-                        message_card.set_margin_bottom(0);
-                    }
-                    crate::settings::ReadingPanePosition::Right => {
-                        reading_card.set_margin_top(reading_card_default_margin_top);
-                        message_card.set_margin_bottom(message_card_default_margin_bottom);
-                    }
-                }
                 // A first switch to an orientation with no remembered extent
                 // gets a sensible default; the scheduler below overrides it
                 // when a stored percentage exists (and re-measures the newly
@@ -8594,22 +8581,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             row.set_selected(crate::theme::theme_index(next));
         });
         app.add_action(&action);
-        let update_icon = |button: &gtk::Button, dark: bool| {
-            button.set_icon_name(if dark {
-                themed_icon_name(&["weather-clear-symbolic", "display-brightness-symbolic"])
-            } else {
-                themed_icon_name(&["weather-clear-night-symbolic", "night-light-symbolic", "display-brightness-symbolic"])
-            });
-            button.set_tooltip_text(Some(if dark { "Switch app to light theme" } else { "Switch app to dark theme" }));
-        };
-        let manager = adw::StyleManager::default();
-        update_icon(&theme_button, manager.is_dark());
-        let weak = theme_button.downgrade();
-        manager.connect_dark_notify(move |manager| {
-            if let Some(button) = weak.upgrade() {
-                update_icon(&button, manager.is_dark());
-            }
-        });
     }
 
     // View ▸ Layout ▸ Density and Config → Appearance → "Density" (UX-83)

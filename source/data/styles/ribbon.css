@@ -64,8 +64,8 @@ button.ribbon-control,
     font-size: 11.5px;
     color: @lookout-ribbon-caption;
     opacity: 1;
-    padding-top: 1px;
-    padding-bottom: 2px;
+    min-height: 18px;
+    padding: 0;
 }
 .ribbon-classic .ribbon-collapsed-group > button {
     min-height: 66px;
@@ -106,3 +106,17 @@ button.ribbon-control,
     padding-right: 2px;
 }
 .ribbon-classic .ribbon-small-column { min-height: 72px; }
+
+/* Standalone commands (Layout, Light/Dark, More) have no group caption.
+   Reserve that same 18px caption + 1px group spacing below their row,
+   so their command baseline matches the named groups in Classic mode. */
+.ribbon-classic.ribbon-standalone {
+    padding-bottom: 23px;
+}
+.ribbon-classic .ribbon-group-row,
+.ribbon-classic .ribbon-small-column {
+    min-height: 72px;
+}
+.ribbon-classic .ribbon-content {
+    margin: 0;
+}

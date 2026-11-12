@@ -24,7 +24,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use adw::prelude::*;
-use gtk::glib;
+use gtk::{gio, glib};
 
 /// Which ribbon layout is in force (`ribbon-style` in GSettings).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -319,7 +319,7 @@ impl RibbonBand {
         let popover = gtk::Popover::new();
         compact_menu.set_popover(Some(&popover));
         group_box.append(&compact_menu);
-        let title = gtk::Label::builder().label(name).css_classes(["ribbon-group-title", "dim-label"]).build();
+        let title = gtk::Label::builder().label(name).height_request(18).css_classes(["ribbon-group-title"]).build();
         title.set_visible(self.style.mode() == RibbonMode::Classic);
         group_box.append(&title);
         let divider = gtk::Separator::new(gtk::Orientation::Vertical);
@@ -351,7 +351,8 @@ impl RibbonBand {
     /// A bare run of controls with no divider (the trailing overflow button),
     /// dressed just like a named group's.
     pub(crate) fn standalone(&self) -> RibbonGroup {
-        let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(2).valign(gtk::Align::Start).build();
+        self.root.add_css_class("ribbon-standalone");
+        let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(2).valign(gtk::Align::Fill).vexpand(false).build();
         row.add_css_class("ribbon-group-row");
         self.root.append(&row);
         let group_index = {
@@ -392,6 +393,42 @@ pub(crate) struct RibbonGroup {
 }
 
 impl RibbonGroup {
+    /// Persistent app-wide theme command. Use the application action explicitly
+    /// because the floating composer is a bare adw::Window.
+    pub(crate) fn theme_switch(&self) {
+        let button = gtk::Button::new();
+        button.connect_clicked(|_| {
+            if let Some(app) = gio::Application::default() {
+                app.activate_action("toggle-theme", None);
+            }
+        });
+        let icon = self.button(&button, "display-brightness-symbolic", "Light / Dark");
+        let manager = adw::StyleManager::default();
+        let refresh = |image: &gtk::Image, button: &gtk::Button, dark: bool| {
+            let name = if dark {
+                crate::window::themed_icon_name(&["weather-clear-symbolic", "display-brightness-symbolic"])
+            } else {
+                crate::window::themed_icon_name(&["weather-clear-night-symbolic", "night-light-symbolic", "display-brightness-symbolic"])
+            };
+            image.set_icon_name(Some(name));
+            button.set_tooltip_text(Some(if dark { "Switch app to light theme" } else { "Switch app to dark theme" }));
+        };
+        refresh(&icon.image, &button, manager.is_dark());
+        let weak_image = icon.image.downgrade();
+        let weak_button = button.downgrade();
+        let handler = manager.connect_dark_notify(move |manager| {
+            if let (Some(image), Some(button)) = (weak_image.upgrade(), weak_button.upgrade()) {
+                refresh(&image, &button, manager.is_dark());
+            }
+        });
+        let handler = Cell::new(Some(handler));
+        button.connect_destroy(move |_| {
+            if let Some(handler) = handler.take() {
+                manager.disconnect(handler);
+            }
+        });
+    }
+
     /// Dress a plain button with `icon` and `label`, as a large control.
     pub(crate) fn button(&self, button: &gtk::Button, icon: &str, label: &str) -> RibbonIcon {
         self.dress_button(button, icon, label, RibbonSize::Large)
@@ -570,9 +607,12 @@ fn style_control(content: &gtk::Box, image: &gtk::Image, label: &gtk::Label, loo
     content.set_orientation(orientation);
     content.set_spacing(spacing);
     content.set_halign(halign);
-    content.set_valign(gtk::Align::Center);
+    // The large glyph has a fixed top slot; text starts below it, rather
+    // than centring an icon+label bundle of varying natural heights.
+    content.set_valign(if look == Look::Large { gtk::Align::Fill } else { gtk::Align::Center });
     image.set_halign(gtk::Align::Center);
     image.set_valign(gtk::Align::Center);
+    image.set_size_request(-1, if look == Look::Large { 30 } else { -1 });
     image.set_pixel_size(icon);
     // A large button's label may take two lines ("New / Message"), centred
     // under its icon; everywhere else it stays on one.
@@ -588,6 +628,7 @@ fn style_control(content: &gtk::Box, image: &gtk::Image, label: &gtk::Label, loo
     label.set_max_width_chars(if large { 14 } else { -1 });
     label.set_size_request(-1, if large { 30 } else { -1 });
     label.set_valign(if large { gtk::Align::Start } else { gtk::Align::Center });
+    label.set_yalign(if large { 0.0 } else { 0.5 });
     label.set_justify(if large { gtk::Justification::Center } else { gtk::Justification::Left });
     label.set_halign(if large { gtk::Align::Center } else { gtk::Align::Start });
 }
@@ -646,6 +687,16 @@ fn place_group(state: &BandState, group: &BandGroup, mode: RibbonMode) {
             }
         } else {
             slots.push(Slot::Alone(widget));
+        }
+    }
+    // Update alignment even when the slot tree is already correct (e.g.
+    // a group of only large controls when switching Classic/Simplified).
+    for slot in &slots {
+        match slot {
+            Slot::Alone(widget) => widget.set_valign(if mode == RibbonMode::Classic { gtk::Align::Fill } else { gtk::Align::Center }),
+            Slot::Column(widgets) => {
+                for widget in widgets { widget.set_valign(gtk::Align::Fill); }
+            }
         }
     }
     if row_matches(&row, &slots) {
@@ -1425,6 +1476,11 @@ mod tests {
         assert_eq!(row.valign(), gtk::Align::Fill);
         assert_eq!(button.valign(), gtk::Align::Fill);
         assert!(group.last_child().unwrap().has_css_class("ribbon-group-title"));
+        let standalone = RibbonBand::new(&style, &[]);
+        let trailing = gtk::Button::new();
+        standalone.standalone().button(&trailing, "view-grid-symbolic", "Layout");
+        assert!(standalone.root().has_css_class("ribbon-standalone"));
+        assert_eq!(trailing.valign(), gtk::Align::Fill);
         // A normal vertical window layout must give spare height to the
         // message/editor body, not to the ribbon, including its scroller.
         let stack = gtk::Stack::new();
@@ -1440,6 +1496,8 @@ mod tests {
         assert!(!toolbar.compute_expand(gtk::Orientation::Vertical));
         style.set_mode(RibbonMode::Simplified);
         assert!(!toolbar.compute_expand(gtk::Orientation::Vertical));
+        assert_eq!(button.valign(), gtk::Align::Center);
+        assert_eq!(trailing.valign(), gtk::Align::Center);
     }
 
     #[test]
