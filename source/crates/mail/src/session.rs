@@ -1964,6 +1964,12 @@ async fn connect_and_run(
     // account (item 2.5).
     let _ = events.send(AccountEvent::SieveAdvertised(sieve)).await;
 
+    // DavMail's default loopback IMAP endpoint needs a conservative body
+    // fetch path. Keep other IMAP accounts on the existing optimized path.
+    let davmail_compat = is_local_davmail_endpoint(&config.imap, has_idle);
+    if davmail_compat {
+        tracing::info!("DavMail compatibility: full MIME on demand, no background body fetch");
+    }
     let account_id = config.account_id.clone();
     let (mut folders, list_counts_supplied) = list_mailboxes(&mut session, &account_id, condstore, has_list_status).await?;
     // Fast first paint: the folder tree shows immediately and the INBOX sync
@@ -2006,6 +2012,7 @@ async fn connect_and_run(
         condstore,
         qresync,
         local_focus,
+        davmail_compat,
     )
     .await?;
 
@@ -2062,7 +2069,7 @@ async fn connect_and_run(
         .filter(|m| m.id != inbox_id && prefetch_failures.get(&m.id).copied().unwrap_or(0) < PREFETCH_FAILURE_LIMIT)
         .map(|m| m.id.clone())
         .collect();
-    let mut prefetch = if prefetch_mailboxes.is_empty() {
+    let mut prefetch = if davmail_compat || prefetch_mailboxes.is_empty() {
         None
     } else {
         tracing::info!(count = prefetch_mailboxes.len(), "starting background body prefetch");
@@ -2257,6 +2264,7 @@ async fn connect_and_run(
                         condstore,
                         qresync,
                         local_focus,
+                        davmail_compat,
                     )
                     .await?;
                     dirty_mailboxes.remove(&sent_id);
@@ -2282,6 +2290,7 @@ async fn connect_and_run(
                             condstore,
                             qresync,
                             local_focus,
+                            davmail_compat,
                         )
                         .await?;
                         dirty_mailboxes.remove(&current_mailbox_id);
@@ -2371,6 +2380,7 @@ async fn connect_and_run(
                                     condstore,
                                     qresync,
                                     local_focus,
+                                    davmail_compat,
                                 )
                                 .await?;
                                 session_selected = current_mailbox_id.clone();
@@ -2647,6 +2657,7 @@ async fn connect_and_run(
                     condstore,
                     qresync,
                     local_focus,
+                    davmail_compat,
                 )
                 .await?;
                 dirty_mailboxes.remove(&current_mailbox_id);
@@ -2657,10 +2668,10 @@ async fn connect_and_run(
                 // fresh SELECT catches UIDVALIDITY changes and updates the
                 // server's view before the flags/membership refresh.
                 if current_mailbox_id != inbox_id {
-                    sync_mailbox(&mut session, &account_id, "INBOX", &inbox_id, events, cache, &mut folders, interactive_commands, None, condstore, qresync, local_focus).await?;
+                    sync_mailbox(&mut session, &account_id, "INBOX", &inbox_id, events, cache, &mut folders, interactive_commands, None, condstore, qresync, local_focus, davmail_compat).await?;
                     dirty_mailboxes.remove(&inbox_id);
                 }
-                sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache, &mut folders, interactive_commands, None, condstore, qresync, local_focus).await?;
+                sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache, &mut folders, interactive_commands, None, condstore, qresync, local_focus, davmail_compat).await?;
                 dirty_mailboxes.remove(&current_mailbox_id);
                 session_selected = current_mailbox_id.clone();
                 next_poll = tokio::time::Instant::now() + NO_IDLE_POLL_INTERVAL;
@@ -2693,6 +2704,7 @@ async fn connect_and_run(
                         condstore,
                         qresync,
                         local_focus,
+                        davmail_compat,
                     )
                     .await?;
                     dirty_mailboxes.remove(&current_mailbox_id);
@@ -2768,6 +2780,7 @@ async fn connect_and_run(
                         condstore,
                         qresync,
                         local_focus,
+                        davmail_compat,
                     )
                     .await?;
                     session_selected = current_mailbox_id.clone();
@@ -2782,7 +2795,7 @@ async fn connect_and_run(
                     // silently strands its `PrefetchStarted` (no matching
                     // `PrefetchFinished` ever follows) and leaves the
                     // folder-pane spinner stuck on forever.
-                    queue_new_prefetch_mailboxes(&mut prefetch, &folders, &current_mailbox_id, prefetch_failures);
+                    if !davmail_compat { queue_new_prefetch_mailboxes(&mut prefetch, &folders, &current_mailbox_id, prefetch_failures); }
                 }
                 AccountCommand::SyncMailbox(mailbox_id) => {
                     // MailboxId is "<account_id>:<folder path>"; recover the folder path.
@@ -2850,6 +2863,7 @@ async fn connect_and_run(
                             condstore,
                             qresync,
                             local_focus,
+                            davmail_compat,
                         )
                         .await?;
                         session_selected = current_mailbox_id.clone();
@@ -2889,7 +2903,7 @@ async fn connect_and_run(
                     // a deliberate cache-miss sentinel: no row can match 0.
                     let uidvalidity = folders.iter().find(|m| m.id == mailbox).map(|m| m.uidvalidity).unwrap_or(UidValidity(0));
                     let started = std::time::Instant::now();
-                    let bodies = fetch_bodies_on_demand(cache, &mut session, &mailbox, uidvalidity, &uids).await?;
+                    let bodies = fetch_bodies_on_demand(cache, &mut session, &mailbox, uidvalidity, &uids, davmail_compat).await?;
                     tracing::debug!(
                         ?mailbox,
                         requested = uids.len(),
@@ -3201,6 +3215,7 @@ async fn connect_and_run(
                                 condstore,
                                 qresync,
                                 local_focus,
+                                davmail_compat,
                             )
                             .await?;
                             dirty_mailboxes.remove(&current_mailbox_id);
@@ -3364,6 +3379,7 @@ async fn connect_and_run(
                                 condstore,
                                 qresync,
                                 local_focus,
+                                davmail_compat,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -3438,6 +3454,7 @@ async fn connect_and_run(
                                 condstore,
                                 qresync,
                                 local_focus,
+                                davmail_compat,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -3517,6 +3534,7 @@ async fn connect_and_run(
                                 condstore,
                                 qresync,
                                 local_focus,
+                                davmail_compat,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -3630,6 +3648,7 @@ async fn connect_and_run(
                                 condstore,
                                 qresync,
                                 local_focus,
+                                davmail_compat,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -3696,6 +3715,7 @@ async fn connect_and_run(
                                 condstore,
                                 qresync,
                                 local_focus,
+                                davmail_compat,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -3758,6 +3778,7 @@ async fn connect_and_run(
                                 condstore,
                                 qresync,
                                 local_focus,
+                                davmail_compat,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -3819,6 +3840,7 @@ async fn connect_and_run(
                                 condstore,
                                 qresync,
                                 local_focus,
+                                davmail_compat,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -3873,6 +3895,7 @@ async fn connect_and_run(
                                 condstore,
                                 qresync,
                                 local_focus,
+                                davmail_compat,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -3916,7 +3939,7 @@ async fn connect_and_run(
                         &mut dirty_mailboxes,
                     )
                     .await?;
-                    queue_new_prefetch_mailboxes(&mut prefetch, &folders, &current_mailbox_id, prefetch_failures);
+                    if !davmail_compat { queue_new_prefetch_mailboxes(&mut prefetch, &folders, &current_mailbox_id, prefetch_failures); }
                 }
                 command @ (AccountCommand::RenameMailbox { .. } | AccountCommand::MoveMailbox { .. } | AccountCommand::DeleteMailbox { .. }) => {
                     let change = match plan_folder_change(&command, &account_id, &folders) {
@@ -4006,7 +4029,7 @@ async fn connect_and_run(
                         &mut dirty_mailboxes,
                     )
                     .await?;
-                    queue_new_prefetch_mailboxes(&mut prefetch, &folders, &current_mailbox_id, prefetch_failures);
+                    if !davmail_compat { queue_new_prefetch_mailboxes(&mut prefetch, &folders, &current_mailbox_id, prefetch_failures); }
                     sync_mailbox(
                         &mut session,
                         &account_id,
@@ -4020,6 +4043,7 @@ async fn connect_and_run(
                         condstore,
                         qresync,
                         local_focus,
+                        davmail_compat,
                     )
                     .await?;
                     session_selected = current_mailbox_id.clone();
@@ -4168,6 +4192,7 @@ async fn connect_and_run(
                         condstore,
                         qresync,
                         local_focus,
+                        davmail_compat,
                     )
                     .await?;
                     session_selected = current_mailbox_id.clone();
@@ -4248,6 +4273,7 @@ async fn connect_and_run(
                         condstore,
                         qresync,
                         local_focus,
+                        davmail_compat,
                     )
                     .await?;
                     session_selected = current_mailbox_id.clone();
@@ -4306,6 +4332,7 @@ async fn connect_and_run(
                                 condstore,
                                 qresync,
                                 local_focus,
+                                davmail_compat,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -4371,6 +4398,7 @@ async fn connect_and_run(
                                     condstore,
                                     qresync,
                                     local_focus,
+                                    davmail_compat,
                                 )
                                 .await?;
                                 session_selected = current_mailbox_id.clone();
@@ -4458,6 +4486,7 @@ async fn connect_and_run(
                                     condstore,
                                     qresync,
                                     local_focus,
+                                    davmail_compat,
                                 )
                                 .await?;
                                 session_selected = current_mailbox_id.clone();
@@ -4570,6 +4599,7 @@ async fn connect_and_run(
                                         condstore,
                                         qresync,
                                         local_focus,
+                                        davmail_compat,
                                     )
                                     .await?;
                                     session_selected = current_mailbox_id.clone();
@@ -4610,6 +4640,7 @@ async fn connect_and_run(
                                 condstore,
                                 qresync,
                                 local_focus,
+                                davmail_compat,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -4675,6 +4706,7 @@ async fn connect_and_run(
                                         condstore,
                                         qresync,
                                         local_focus,
+                                        davmail_compat,
                                     )
                                     .await?;
                                     session_selected = current_mailbox_id.clone();
@@ -4715,6 +4747,7 @@ async fn connect_and_run(
                                 condstore,
                                 qresync,
                                 local_focus,
+                                davmail_compat,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -4765,6 +4798,7 @@ async fn connect_and_run(
                                     condstore,
                                     qresync,
                                     local_focus,
+                                    davmail_compat,
                                 )
                                 .await?;
                                 session_selected = current_mailbox_id.clone();
@@ -5078,6 +5112,7 @@ async fn connect_and_run(
                             condstore,
                             qresync,
                             local_focus,
+                            davmail_compat,
                         )
                         .await?;
                         session_selected = current_mailbox_id.clone();
@@ -6487,6 +6522,13 @@ fn is_authentication_rejection(error: &async_imap::error::Error) -> bool {
     )
 }
 
+/// The default DavMail IMAP bridge is plain IMAP on loopback port 1143.
+/// Require the observed lack of IDLE as an additional compatibility signal.
+fn is_local_davmail_endpoint(endpoint: &crate::EndpointConfig, has_idle: bool) -> bool {
+    !has_idle && endpoint.port == 1143 && endpoint.security == Security::Plain
+        && matches!(endpoint.host.to_ascii_lowercase().as_str(), "localhost" | "127.0.0.1" | "::1")
+}
+
 async fn login(config: &AccountConfig, credential: Credential) -> Result<(Session<SessionStream>, ServerCapabilities)> {
     let security = config.imap.security;
     tracing::debug!("login: connecting to {}:{} ({security:?})", config.imap.host, config.imap.port);
@@ -7164,6 +7206,7 @@ async fn sync_mailbox(
     condstore: bool,
     qresync: bool,
     local_focus: &LocalFocusSettings,
+    davmail_compat: bool,
 ) -> Result<()> {
     let _ = events.send(AccountEvent::MailboxSyncStarted { mailbox: mailbox_id.clone() }).await;
     // Any change already reported to this connection is covered by the fetch
@@ -7469,7 +7512,7 @@ async fn sync_mailbox(
     // skipped entirely when any user command is queued (the click wins; the
     // message then fetches on demand). Best-effort like previews: a failure
     // leaves the message uncached, never breaks the sync.
-    if !new_uids.is_empty() && interactive_commands.is_empty() {
+    if !davmail_compat && !new_uids.is_empty() && interactive_commands.is_empty() {
         // Newest first - the top of the list is what the user opens.
         let mut candidates: Vec<(Uid, u32)> = messages.iter().filter(|m| new_uids.contains(&m.uid)).map(|m| (m.uid, m.size)).collect();
         candidates.sort_by_key(|(uid, _)| std::cmp::Reverse(uid.0));
@@ -7552,12 +7595,14 @@ async fn sync_mailbox(
     // previews arrive a beat later rather than holding up first paint. New
     // uids whose bodies were fetched above already carry a derived preview,
     // so they're skipped here.
+    if !davmail_compat {
     if let Err(e) = fetch_previews(session, mailbox_id, &messages, events, cache).await {
         // Never propagated: this function's caller tears the connection down
         // on `Err`, and a malformed message or a server that dislikes partial
         // fetches must not cost the user their IMAP session over a cosmetic
         // snippet.
         tracing::warn!("preview fetch for {mailbox_id} failed: {e}");
+    }
     }
 
     // The open folder's count fields, previously refreshed by a STATUS round
@@ -8109,6 +8154,7 @@ async fn fetch_bodies_on_demand(
     mailbox: &MailboxId,
     uidvalidity: UidValidity,
     uids: &[Uid],
+    davmail_compat: bool,
 ) -> Result<Vec<(Uid, EmailBody)>> {
     if uids.is_empty() {
         return Ok(Vec::new());
@@ -8127,6 +8173,17 @@ async fn fetch_bodies_on_demand(
     let remaining: Vec<Uid> = uids.iter().copied().filter(|uid| !cached.contains_key(uid)).collect();
     tracing::debug!(?mailbox, requested = ?uids, cached = ?cached.keys().collect::<Vec<_>>(), remaining = ?remaining, "fetch_bodies_on_demand: cache split");
     if remaining.is_empty() {
+        return Ok(results);
+    }
+
+    if davmail_compat {
+        // One full MIME response per UID, never a union of unrelated MIME
+        // part paths. Keep the normal UIDVALIDITY-keyed body/raw caches.
+        for uid in remaining {
+            if let Some(body) = fetch_body_cached(cache, session, mailbox, uid, uidvalidity, None, true).await? {
+                results.push((uid, body));
+            }
+        }
         return Ok(results);
     }
 
@@ -8163,7 +8220,7 @@ async fn fetch_bodies_on_demand(
     results.extend(structured_results);
 
     for uid in unstructured {
-        let body = fetch_body_cached(cache, session, mailbox, uid, uidvalidity, None).await?;
+        let body = fetch_body_cached(cache, session, mailbox, uid, uidvalidity, None, false).await?;
         tracing::debug!(?mailbox, uid = uid.0, got_body = body.is_some(), "fetch_bodies_on_demand: unstructured fallback result");
         if let Some(body) = body {
             results.push((uid, body));
@@ -8323,6 +8380,7 @@ async fn fetch_body_cached(
     uid: Uid,
     uidvalidity: UidValidity,
     known_structure: Option<&[BodyPart]>,
+    whole_mime_only: bool,
 ) -> Result<Option<EmailBody>> {
     if let Some(cached) = cache_op(cache, {
         let mailbox = mailbox.clone();
@@ -8344,7 +8402,7 @@ async fn fetch_body_cached(
     // the cached summary's (the open-folder path synced it). Messages whose
     // summaries predate BODYSTRUCTURE fetching - or servers that never
     // returned one - fall back to the whole-message fetch below.
-    let structure = match known_structure {
+    let structure = if whole_mime_only { None } else { match known_structure {
         Some(structure) => Some(structure.to_vec()),
         None => cache_op(cache, {
             let mailbox = mailbox.clone();
@@ -8354,7 +8412,7 @@ async fn fetch_body_cached(
         .and_then(|r| r.ok())
         .flatten()
         .and_then(|s| s.structure),
-    };
+    } };
     let body = match &structure {
         Some(parts) => match fetch_body_partial(session, uid, parts).await {
             // A partial fetch that fails - or yields nothing readable (a
@@ -8387,6 +8445,24 @@ async fn fetch_body_cached(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn davmail_compat_is_scoped_to_the_local_bridge() {
+        let mut endpoint = crate::EndpointConfig {
+            host: "127.0.0.1".into(),
+            port: 1143,
+            security: Security::Plain,
+            username: "test@example.com".into(),
+        };
+        assert!(is_local_davmail_endpoint(&endpoint, false));
+        assert!(!is_local_davmail_endpoint(&endpoint, true));
+        endpoint.host = "imap.example.com".into();
+        assert!(!is_local_davmail_endpoint(&endpoint, false));
+        endpoint.host = "localhost".into();
+        assert!(is_local_davmail_endpoint(&endpoint, false));
+        endpoint.port = 143;
+        assert!(!is_local_davmail_endpoint(&endpoint, false));
+    }
 
     #[tokio::test]
     async fn rejected_starttls_never_sends_credentials() {
