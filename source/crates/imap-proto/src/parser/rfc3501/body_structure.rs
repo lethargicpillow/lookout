@@ -99,6 +99,9 @@ fn body_ext_mpart(i: &[u8]) -> IResult<&[u8], BodyExtMPart<'_>> {
 
 fn body_encoding(i: &[u8]) -> IResult<&[u8], ContentEncoding<'_>> {
     alt((
+        // DavMail emits NIL when the MIME transfer encoding is absent.
+        // RFC 2045 defaults an absent Content-Transfer-Encoding to 7bit.
+        map(nil, |_| ContentEncoding::SevenBit),
         delimited(
             char('"'),
             alt((
@@ -390,6 +393,49 @@ mod tests {
                 extension: None,
             },
         )
+    }
+
+    /// DavMail can report an absent Content-Transfer-Encoding as NIL.
+    /// MIME defaults to 7bit when the header is absent (RFC 2045 §6.1).
+    #[test]
+    fn test_body_encoding_nil_defaults_to_seven_bit() {
+        assert_matches!(body_encoding(b"NIL "), Ok((b" ", ContentEncoding::SevenBit)));
+        assert_matches!(body_encoding(b"nil "), Ok((b" ", ContentEncoding::SevenBit)));
+    }
+
+    /// A malformed encoding field in one message must not abort the entire
+    /// FETCH stream. Reproduce the DavMail nested multipart shape without
+    /// any real message content or account data.
+    #[test]
+    fn test_fetch_response_with_nil_transfer_encoding_parses() {
+        let raw = b"* 1 FETCH (UID 42 BODYSTRUCTURE (((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"ISO-2022-JP\") NIL NIL NIL 1294 16)(\"TEXT\" \"HTML\" (\"CHARSET\" \"ISO-2022-JP\") NIL NIL NIL 11634 145) \"ALTERNATIVE\")(\"IMAGE\" \"PNG\" (\"NAME\" \"image.png\") NIL NIL \"BASE64\" 100) \"RELATED\") BODY[HEADER.FIELDS (IMPORTANCE)] {0}\r\n)\r\n";
+        let (remaining, response) = parse_response(raw).expect("DavMail FETCH with NIL encoding must parse");
+        assert!(remaining.is_empty());
+        let Response::Fetch(_, attrs) = response else {
+            panic!("expected a FETCH response, got {response:?}");
+        };
+        let structure = attrs.iter().find_map(|attr| match attr {
+            AttributeValue::BodyStructure(structure) => Some(structure),
+            _ => None,
+        }).expect("FETCH must contain a body structure");
+        let BodyStructure::Multipart { bodies, .. } = structure else {
+            panic!("expected related multipart");
+        };
+        assert_eq!(bodies.len(), 2);
+        let BodyStructure::Multipart { bodies: texts, .. } = &bodies[0] else {
+            panic!("expected alternative multipart");
+        };
+        assert_eq!(texts.len(), 2);
+        for text in texts {
+            let BodyStructure::Text { other, .. } = text else {
+                panic!("expected text part");
+            };
+            assert_eq!(other.transfer_encoding, ContentEncoding::SevenBit);
+        }
+        let BodyStructure::Basic { other, .. } = &bodies[1] else {
+            panic!("expected image part");
+        };
+        assert_eq!(other.transfer_encoding, ContentEncoding::Base64);
     }
 
     #[test]
