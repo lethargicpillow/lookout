@@ -291,7 +291,7 @@ impl RibbonBand {
         group_box.append(&row);
         // A collapsed group keeps the original command row in a popover;
         // no cloned commands, no lost toggle state or signal handlers.
-        let compact_menu = gtk::MenuButton::builder().visible(false).always_show_arrow(true).vexpand(true).valign(gtk::Align::Center).build();
+        let compact_menu = gtk::MenuButton::builder().visible(false).always_show_arrow(true).vexpand(true).valign(gtk::Align::Fill).build();
         let compact_content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).build();
         let icon_name = match name {
             "Font" | "Basic Text" => "format-text-bold-symbolic",
@@ -351,7 +351,7 @@ impl RibbonBand {
     /// A bare run of controls with no divider (the trailing overflow button),
     /// dressed just like a named group's.
     pub(crate) fn standalone(&self) -> RibbonGroup {
-        let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(2).valign(gtk::Align::Center).build();
+        let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(2).valign(gtk::Align::Start).build();
         row.add_css_class("ribbon-group-row");
         self.root.append(&row);
         let group_index = {
@@ -670,14 +670,19 @@ fn place_group(state: &BandState, group: &BandGroup, mode: RibbonMode) {
         match slot {
             Slot::Alone(widget) => {
                 widget.set_halign(gtk::Align::Fill);
-                widget.set_valign(gtk::Align::Center);
+                widget.set_valign(if mode == RibbonMode::Classic { gtk::Align::Fill } else { gtk::Align::Center });
                 row.append(&widget);
             }
             Slot::Column(widgets) => {
-                let column = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(0).valign(gtk::Align::Center).build();
+                // The same command-height envelope as a large button.
+                // Two or three small commands share it equally; a lone
+                // custom panel (e.g. Basic Text) gets the full allocation.
+                let column = gtk::Box::builder().orientation(gtk::Orientation::Vertical)
+                    .spacing(0).homogeneous(true).valign(gtk::Align::Fill).vexpand(false).build();
                 column.add_css_class("ribbon-small-column");
                 for widget in widgets {
                     widget.set_halign(gtk::Align::Fill);
+                    widget.set_valign(gtk::Align::Fill);
                     column.append(&widget);
                 }
                 row.append(&column);
@@ -1418,7 +1423,7 @@ mod tests {
         assert_eq!(band.root().valign(), gtk::Align::Fill);
         assert!(!band.root().compute_expand(gtk::Orientation::Vertical));
         assert_eq!(row.valign(), gtk::Align::Fill);
-        assert_eq!(button.valign(), gtk::Align::Center);
+        assert_eq!(button.valign(), gtk::Align::Fill);
         assert!(group.last_child().unwrap().has_css_class("ribbon-group-title"));
         // A normal vertical window layout must give spare height to the
         // message/editor body, not to the ribbon, including its scroller.
@@ -1476,6 +1481,11 @@ mod tests {
         assert_eq!(large.parent().as_ref(), Some(&row_widget));
         let first = small[0].parent().expect("a column");
         assert!(first.has_css_class("ribbon-small-column"));
+        let column = first.clone().downcast::<gtk::Box>().unwrap();
+        assert!(column.is_homogeneous());
+        assert_eq!(column.valign(), gtk::Align::Fill);
+        assert_eq!(large.valign(), gtk::Align::Fill);
+        assert_eq!(small[0].valign(), gtk::Align::Fill);
         assert_eq!(small[1].parent().as_ref(), Some(&first));
         assert_eq!(small[2].parent().as_ref(), Some(&first));
         let second = small[3].parent().expect("a second column");

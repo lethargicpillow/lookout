@@ -24,11 +24,11 @@
     padding: 4px 2px;
 }
 .ribbon-group {
-    margin: 0 2px;
+    margin: 0 3px;
 }
 .ribbon-divider {
-    margin: 5px 3px;
-    background-color: alpha(@window_fg_color, 0.12);
+    margin: 2px 4px;
+    background-color: @lookout-ribbon-divider;
 }
 button.ribbon-control,
 .ribbon-control > button,
@@ -50,7 +50,7 @@ button.ribbon-control,
 .ribbon-classic .ribbon-large:not(.ribbon-overflow-control) > button,
 .ribbon-classic .ribbon-large:not(.ribbon-overflow-control) > menubutton > button {
     padding: 3px 6px;
-    min-height: 64px;
+    min-height: 66px;
     min-width: 48px;
     border-radius: 4px;
 }
@@ -58,16 +58,17 @@ button.ribbon-control,
 .ribbon-classic .ribbon-small:not(.ribbon-overflow-control) > button,
 .ribbon-classic .ribbon-small:not(.ribbon-overflow-control) > menubutton > button {
     padding: 0 4px;
-    min-height: 22px;
+    min-height: 24px;
 }
 .ribbon-group-title {
-    font-size: 11px;
-    color: @lookout-muted;
+    font-size: 11.5px;
+    color: @lookout-ribbon-caption;
+    opacity: 1;
     padding-top: 1px;
     padding-bottom: 2px;
 }
 .ribbon-classic .ribbon-collapsed-group > button {
-    min-height: 64px;
+    min-height: 66px;
     padding: 3px 6px;
 }
 /* Command labels are in the regular weight, not the bold Adwaita
@@ -76,7 +77,7 @@ button.ribbon-control,
     font-weight: normal;
 }
 .ribbon-classic .ribbon-control:not(.ribbon-overflow-control) .ribbon-label {
-    font-size: 11.5px;
+    font-size: 12px;
 }
 /* Commands that overflowed from the ribbon into the More popover are
    menu rows, not the ribbon's compressed strip geometry. */
@@ -97,3 +98,11 @@ button.ribbon-control,
 .ribbon-icon.ribbon-tone-green { color: @lookout-icon-green; }
 .ribbon-icon.ribbon-tone-red { color: @lookout-icon-red; }
 .ribbon-icon.ribbon-tone-amber { color: @lookout-icon-amber; }
+
+/* A split command's arrow and main action share the row envelope. */
+.ribbon-classic .ribbon-control:not(.ribbon-overflow-control) > menubutton > button {
+    min-width: 12px;
+    padding-left: 2px;
+    padding-right: 2px;
+}
+.ribbon-classic .ribbon-small-column { min-height: 72px; }

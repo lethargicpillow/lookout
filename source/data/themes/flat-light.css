@@ -4,12 +4,12 @@
    they keep contrast on light backgrounds. */
 @define-color lookout-pane-bg @view_bg_color;
 @define-color lookout-toolbar-band @theme_bg_color;
-@define-color lookout-icon-toolbar-bg @theme_bg_color;
+@define-color lookout-icon-toolbar-bg #f1f2f4;
 @define-color lookout-header-search-bg @theme_base_color;
 @define-color lookout-section-header-bg alpha(@theme_bg_color, 0.9);
 @define-color lookout-column-header-bg alpha(@theme_bg_color, 0.85);
 @define-color lookout-subject @theme_fg_color;
-@define-color lookout-muted alpha(@theme_fg_color, 0.55);
+@define-color lookout-muted #565b64;
 @define-color lookout-column-header-fg alpha(@theme_fg_color, 0.55);
 @define-color lookout-row-separator alpha(@theme_fg_color, 0.1);
 @define-color lookout-subject-bar-bg alpha(@theme_fg_color, 0.04);
@@ -31,3 +31,6 @@
 @define-color lookout-icon-green #43835e;
 @define-color lookout-icon-red #ad4b51;
 @define-color lookout-icon-amber #967131;
+
+@define-color lookout-ribbon-divider #b9bec5;
+@define-color lookout-ribbon-caption #4d525a;

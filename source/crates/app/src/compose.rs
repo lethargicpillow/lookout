@@ -1945,8 +1945,8 @@ pub fn build_compose_view(
         }
     }
 
-    // One compact address form, with Send beside its full height. Keep
-    // optional rows out of the layout until requested or already populated.
+    // One address form, with Send beside the recipients and Subject
+    // on its own aligned row underneath. Optional fields stay hidden.
     let fields_group = gtk::Grid::builder().row_spacing(3).column_spacing(8).hexpand(true).vexpand(false).valign(gtk::Align::Start).css_classes(["compose-fields"]).build();
     let address_form = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(3).hexpand(true).build();
     for row in [&to_row, &cc_row, &bcc_row] { row.widget().set_hexpand(true); }
@@ -1963,7 +1963,7 @@ pub fn build_compose_view(
     address_labels.add_widget(&subject_label);
     subject_line.append(&subject_label);
     subject_line.append(&subject_row);
-    address_form.append(&subject_line);
+    fields_group.attach(&subject_line, 1, 1, 1, 1);
 
     // --- Attachments: a canonical in-session list, rendered as removable
     // chips below the fields, same repopulate-from-truth shape
@@ -2500,37 +2500,55 @@ pub fn build_compose_view(
     let insert_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
     let options_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
     let format = &format_controls;
-    editor_band.group("Font", |group| {
-        let block = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(3).css_classes(["compose-format-block"]).build();
-        let selectors = gtk::Box::new(gtk::Orientation::Horizontal, 3);
-        format.font_family.set_size_request(120, -1);
-        format.font_size.set_size_request(65, -1);
+    // Outlook's Basic Text is one compact formatting surface. Both rows
+    // share the same height across font and paragraph commands.
+    editor_band.group("Basic Text", |group| {
+        let block = gtk::Grid::builder().row_homogeneous(true).row_spacing(3)
+            .column_spacing(8).valign(gtk::Align::Fill)
+            .css_classes(["compose-format-block"]).build();
+
+        let selectors = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
+            .spacing(3).valign(gtk::Align::Fill).build();
+        format.font_family.set_size_request(128, -1);
+        format.font_family.set_hexpand(true);
+        format.font_family.add_css_class("compose-format-select");
+        format.font_size.set_size_request(62, -1);
+        format.font_size.add_css_class("compose-format-select");
         selectors.append(&format.font_family);
         selectors.append(&format.font_size);
-        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 1);
+
+        let font_actions = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
+            .spacing(1).valign(gtk::Align::Fill).build();
         for button in [&format.bold, &format.italic, &format.underline, &format.strikethrough, &format.clear_formatting] {
             button.add_css_class("compose-format-button");
-            actions.append(button);
+            button.set_valign(gtk::Align::Fill);
+            font_actions.append(button);
         }
         format.color.set_size_request(34, -1);
-        actions.append(&format.color);
-        block.append(&selectors);
-        block.append(&actions);
-        group.widget(&block);
-    });
-    editor_band.group("Paragraph", |group| {
-        let block = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(3).css_classes(["compose-format-block"]).build();
-        for buttons in [
-            [&format.bullets, &format.numbering, &format.outdent, &format.indent],
-            [&format.align_left, &format.align_center, &format.align_right, &format.justify],
+        format.color.add_css_class("compose-format-color");
+        font_actions.append(&format.color);
+
+        let paragraph_top = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
+            .spacing(1).valign(gtk::Align::Fill).build();
+        let paragraph_bottom = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
+            .spacing(1).valign(gtk::Align::Fill).build();
+        for (row, buttons) in [
+            (&paragraph_top, [&format.bullets, &format.numbering, &format.outdent, &format.indent]),
+            (&paragraph_bottom, [&format.align_left, &format.align_center, &format.align_right, &format.justify]),
         ] {
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 1);
             for button in buttons {
                 button.add_css_class("compose-format-button");
+                button.set_valign(gtk::Align::Fill);
                 row.append(button);
             }
-            block.append(&row);
         }
+        block.attach(&selectors, 0, 0, 1, 1);
+        block.attach(&font_actions, 0, 1, 1, 1);
+        let divider = gtk::Separator::new(gtk::Orientation::Vertical);
+        divider.add_css_class("compose-format-divider");
+        block.attach(&divider, 1, 0, 1, 2);
+        block.attach(&paragraph_top, 2, 0, 1, 1);
+        block.attach(&paragraph_bottom, 2, 1, 1, 1);
         group.widget(&block);
     });
     editor_band.group("Names", |group| {
@@ -2544,8 +2562,8 @@ pub fn build_compose_view(
         group.button(&address_book, crate::window::themed_icon_name(&["x-office-address-book-symbolic", "address-book-symbolic", "avatar-default-symbolic"]), "Address Book");
     });
     editor_band.group("Include", |group| {
-        group.button(&attach_button, "mail-attachment-symbolic", "Attach Files");
-        group.menu(&signature_button, "signature-1", "Signature");
+        group.small_button(&attach_button, "mail-attachment-symbolic", "Attach Files");
+        group.small_menu(&signature_button, "signature-1", "Signature");
     });
     insert_band.group("Insert", |group| {
         group.menu(&templates_button, "edit-copy-symbolic", "Templates");
@@ -2828,8 +2846,8 @@ pub fn build_compose_view(
     dock_button.set_tooltip_text(Some("Dock in reading pane"));
     dock_button.set_visible(false);
     editor_band.group("Draft", |group| {
-        group.button(&save_draft_button, "document-save-symbolic", "Save Draft");
-        group.button(&cancel_button, "user-trash-symbolic", "Discard");
+        group.small_button(&save_draft_button, "document-save-symbolic", "Save Draft");
+        group.small_button(&cancel_button, "user-trash-symbolic", "Discard");
     });
     options_band.group("Window", |group| {
         let app_theme_button = gtk::Button::new();
@@ -2873,10 +2891,10 @@ pub fn build_compose_view(
     send_content.append(&send_icon);
     send_content.append(&gtk::Label::new(Some("Send")));
     send_button.set_child(Some(&send_content));
-    send_button.set_size_request(64, 72);
-    send_button.set_valign(gtk::Align::Fill);
+    send_button.set_size_request(68, 68);
+    send_button.set_valign(gtk::Align::Start);
     send_button.add_css_class("compose-send");
-    // Send spans the entire compact address form, including Subject.
+    // Send aligns with the recipient rows, not the Subject row.
     fields_group.attach(&send_button, 0, 0, 1, 1);
     top_row.append(&header_spacer);
     top_row.append(&title_label);

@@ -108,3 +108,6 @@
 @define-color lookout-icon-green mix(@view_fg_color, #398b65, 0.72);
 @define-color lookout-icon-red mix(@view_fg_color, #c75e63, 0.72);
 @define-color lookout-icon-amber mix(@view_fg_color, #b58b45, 0.72);
+
+@define-color lookout-ribbon-divider alpha(@view_fg_color, 0.26);
+@define-color lookout-ribbon-caption alpha(@view_fg_color, 0.82);

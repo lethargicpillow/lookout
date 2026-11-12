@@ -42,8 +42,23 @@
 .compose-ribbon-tabs button:hover { background-color: alpha(@window_fg_color, 0.07); }
 .compose-ribbon-commands { padding: 2px 6px; }
 .compose-format-block { padding: 2px 4px; }
+.compose-format-divider { background-color: @lookout-ribbon-divider; margin: 3px 1px; }
+.compose-format-select > button,
+.compose-format-color > button {
+    min-height: 24px;
+    padding: 2px 5px;
+    background-color: @view_bg_color;
+    color: @view_fg_color;
+    border: 1px solid @lookout-ribbon-divider;
+    border-radius: 2px;
+    box-shadow: none;
+}
+.compose-format-select > button:hover,
+.compose-format-color > button:hover {
+    border-color: @accent_bg_color;
+}
 .compose-format-block .compose-format-button {
-    min-width: 24px; min-height: 24px; padding: 2px; border-radius: 0;
+    min-width: 27px; min-height: 26px; padding: 2px; border-radius: 3px;
 }
 .compose-format-block .compose-format-button:hover { background-color: alpha(@view_fg_color, 0.15); }
 .compose-fields { padding: 8px; background-color: @window_bg_color; }
@@ -52,7 +67,7 @@
     background-color: transparent;
     color: @view_fg_color;
     border: none;
-    border-bottom: 1px solid alpha(@view_fg_color, 0.19);
+    border-bottom: 1px solid @lookout-ribbon-divider;
     border-radius: 0;
     box-shadow: none;
 }
@@ -63,11 +78,11 @@
 }
 .compose-address-surface .compose-address-input {
     background: transparent; border: none; box-shadow: none;
-    padding: 1px 0; min-height: 22px;
+    padding: 1px 0; min-height: 26px;
 }
-.compose-subject-input { padding: 2px 5px; min-height: 22px; }
+.compose-subject-input { padding: 2px 5px; min-height: 26px; }
 .compose-picker-button, .compose-from-select > button, button.compose-send {
-    min-height: 22px; padding: 2px 6px; border-radius: 3px;
+    min-height: 26px; padding: 2px 6px; border-radius: 3px;
     background-color: alpha(@view_fg_color, 0.055);
     color: @view_fg_color;
     border: 1px solid alpha(@view_fg_color, 0.22);

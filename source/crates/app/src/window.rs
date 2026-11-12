@@ -4551,9 +4551,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         group.small_button(&sweep_button, "edit-clear-all-symbolic", "Sweep");
     });
     command_band.group("Respond", |group| {
-        group.button(&reply_button, "mail-reply-sender-symbolic", "Reply");
-        group.button(&reply_all_button, "mail-reply-all-symbolic", "Reply all");
-        group.split(&forward_button, "mail-forward-symbolic", "Forward");
+        group.small_button(&reply_button, "mail-reply-sender-symbolic", "Reply");
+        group.small_button(&reply_all_button, "mail-reply-all-symbolic", "Reply All");
+        group.small_split(&forward_button, "mail-forward-symbolic", "Forward");
         group.small_button(&meeting_button, "appointment-new-symbolic", "Meeting");
         group.small_button(&add_sender_button, "contact-new-symbolic", "Add Sender");
     });
