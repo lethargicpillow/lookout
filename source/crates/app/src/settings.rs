@@ -162,6 +162,33 @@ pub const MAIL_SPELL_CHECK_LANGUAGES: &str = "mail-spell-check-languages";
 /// original light form. A default for new messages only; the per-email
 /// toggle in the header still overrides the current message either way.
 pub const MAIL_MESSAGE_THEME_DARK: &str = "mail-message-theme-dark";
+
+// UI-thread page appearance shared by reading and editing surfaces.
+// Observers return false when their weak widget has been destroyed.
+thread_local! {
+    static PAGE_DARK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PAGE_OBSERVERS: std::cell::RefCell<Vec<Box<dyn Fn(bool) -> bool>>> = std::cell::RefCell::new(Vec::new());
+}
+
+pub(crate) fn page_dark() -> bool {
+    PAGE_DARK.with(|value| value.get())
+}
+
+pub(crate) fn set_page_dark(dark: bool) {
+    if PAGE_DARK.with(|value| value.replace(dark)) == dark { return; }
+    // Take the observers out while notifying: setting a toggle may emit
+    // its handler synchronously, and registering a new editor is permitted.
+    let mut observers = PAGE_OBSERVERS.with(|list| std::mem::take(&mut *list.borrow_mut()));
+    observers.retain(|apply| apply(dark));
+    PAGE_OBSERVERS.with(|list| list.borrow_mut().extend(observers));
+}
+
+pub(crate) fn observe_page_dark(apply: impl Fn(bool) -> bool + 'static) {
+    if apply(page_dark()) {
+        PAGE_OBSERVERS.with(|list| list.borrow_mut().push(Box::new(apply)));
+    }
+}
+
 /// Config → Mail → "Show sender images": whether message-list rows and the
 /// reading-pane header show a sender avatar (contact photo when available,
 /// else coloured initials).
