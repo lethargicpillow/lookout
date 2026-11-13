@@ -556,23 +556,17 @@ pub struct ConfigView {
     /// "Re-scan every" spin row (Config → Advanced), exposed so the caller
     /// can wire its value into the policy's `refresh_interval`.
     pub prefetch_refresh_row: adw::SpinRow,
-    mail_group: adw::PreferencesGroup,
+    // One independent libadwaita card per mail account.
+    mail_cards: gtk::Box,
     calendar_group: adw::PreferencesGroup,
     webcal_group: adw::PreferencesGroup,
-    mail_rows: RefCell<Vec<adw::ActionRow>>,
     calendar_rows: RefCell<Vec<adw::ActionRow>>,
     webcal_rows: RefCell<Vec<adw::ActionRow>>,
-    /// The per-account "Identities" rows, rebuilt alongside `mail_rows`.
-    identity_rows: RefCell<Vec<adw::ActionRow>>,
     /// "New Signature…" entry row (Config → Accounts → Signatures) - the
     /// entry point for the signature editor, wired by the caller.
     pub new_signature_row: adw::ActionRow,
     /// The list of saved signatures below the "New Signature…" button.
     signatures_group: adw::PreferencesGroup,
-    /// The per-account "Default for new messages" / "Default for replies &
-    /// forwards" dropdown rows in the Mail accounts section, rebuilt
-    /// alongside `mail_rows`/`identity_rows` (one pair per account).
-    signature_default_rows: RefCell<Vec<adw::ComboRow>>,
     /// The signature list rows rebuilt by `refresh_signatures`. The button
     /// row itself stays put; only these are cleared and re-added.
     signature_rows: RefCell<Vec<adw::ActionRow>>,
@@ -705,6 +699,11 @@ pub fn build() -> ConfigView {
     templates_group.add(&new_template_row);
 
     let mail_group = adw::PreferencesGroup::builder().title("Mail accounts").build();
+    // Non-row children of PreferencesGroup are placed outside its boxed
+    // list. Each nested group therefore owns its own rounded list/card.
+    let mail_cards = gtk::Box::builder().orientation(gtk::Orientation::Vertical)
+        .spacing(16).hexpand(true).build();
+    mail_group.add(&mail_cards);
 
     // The enable/disable list for GNOME Online Accounts accounts. Repopulated
     // by `refresh` with one switch row per discovered account.
@@ -1389,7 +1388,6 @@ pub fn build() -> ConfigView {
         new_signature_row,
         new_template_row,
         signatures_group,
-        signature_default_rows: RefCell::new(Vec::new()),
         signature_rows: RefCell::new(Vec::new()),
         templates_group,
         templates_rows: RefCell::new(Vec::new()),
@@ -1472,13 +1470,11 @@ pub fn build() -> ConfigView {
         prefetch_limit_row,
         prefetch_batch_row,
         prefetch_refresh_row,
-        mail_group,
+        mail_cards,
         calendar_group,
         webcal_group,
-        mail_rows: RefCell::new(Vec::new()),
         calendar_rows: RefCell::new(Vec::new()),
         webcal_rows: RefCell::new(Vec::new()),
-        identity_rows: RefCell::new(Vec::new()),
         mail_cache_group,
         calendar_cache_group,
         contacts_cache_group,
@@ -1561,14 +1557,8 @@ pub fn refresh(
         }
     }
 
-    for row in view.mail_rows.borrow_mut().drain(..) {
-        view.mail_group.remove(&row);
-    }
-    for row in view.identity_rows.borrow_mut().drain(..) {
-        view.mail_group.remove(&row);
-    }
-    for row in view.signature_default_rows.borrow_mut().drain(..) {
-        view.mail_group.remove(&row);
+    while let Some(card) = view.mail_cards.first_child() {
+        view.mail_cards.remove(&card);
     }
     for row in view.calendar_rows.borrow_mut().drain(..) {
         view.calendar_group.remove(&row);
@@ -1578,9 +1568,12 @@ pub fn refresh(
     }
 
     if mail.is_empty() {
-        push_row(&view.mail_group, &view.mail_rows, empty_row("No mail accounts connected"));
+        let card = adw::PreferencesGroup::new();
+        card.add(&empty_row("No mail accounts connected"));
+        view.mail_cards.append(&card);
     } else {
         for info in mail {
+            let card = adw::PreferencesGroup::new();
             // One line of connection detail: the Graph transport replaces
             // IMAP/SMTP outright, so its server fields would be misleading
             // while it's selected (item 5.7.6).
@@ -1601,15 +1594,13 @@ pub fn refresh(
                 let account_id = info.account_id.clone();
                 {
                     let edit_other = edit_other.clone();
-                    let row_widget = row.clone();
                     let account_id = account_id.clone();
-                    edit_button.connect_clicked(move |_| edit_other(row_widget.upcast_ref::<gtk::Widget>(), &account_id));
+                    edit_button.connect_clicked(move |button| edit_other(button.upcast_ref::<gtk::Widget>(), &account_id));
                 }
                 {
                     let remove_other = remove_other.clone();
-                    let row_widget = row.clone();
                     let account_id = account_id.clone();
-                    remove_button.connect_clicked(move |_| remove_other(row_widget.upcast_ref::<gtk::Widget>(), &account_id));
+                    remove_button.connect_clicked(move |button| remove_other(button.upcast_ref::<gtk::Widget>(), &account_id));
                 }
                 row.add_suffix(&edit_button);
                 row.add_suffix(&remove_button);
@@ -1618,12 +1609,11 @@ pub fn refresh(
                 let sync_button = gtk::Button::with_label("Sync pins and flags with Outlook");
                 sync_button.add_css_class("flat");
                 let enable_graph_pin = enable_graph_pin.clone();
-                let row_widget = row.clone();
                 let account_id = info.account_id.clone();
-                sync_button.connect_clicked(move |_| enable_graph_pin(row_widget.upcast_ref::<gtk::Widget>(), &account_id));
+                sync_button.connect_clicked(move |button| enable_graph_pin(button.upcast_ref::<gtk::Widget>(), &account_id));
                 row.add_suffix(&sync_button);
             }
-            push_row(&view.mail_group, &view.mail_rows, row);
+            card.add(&row);
             // Per-account transport opt-in (item 5.7.6). Experimental, so the
             // subtitle names the trade-off before the user turns it on.
             if info.graph_mail != GraphMailStatus::NotApplicable {
@@ -1639,7 +1629,7 @@ pub fn refresh(
                 let set_graph_mail = set_graph_mail.clone();
                 let account_id = info.account_id.clone();
                 graph_row.connect_active_notify(move |row| set_graph_mail(&account_id, row.is_active()));
-                push_row(&view.mail_group, &view.mail_rows, graph_row.upcast());
+                card.add(&graph_row);
             }
             let identities_subtitle = if info.identity_labels.is_empty() {
                 "Send as this account's own address".to_string()
@@ -1656,7 +1646,7 @@ pub fn refresh(
             let account_id = info.account_id.clone();
             let manage = manage_identities.clone();
             identity_row.connect_activated(move |row| manage(row.upcast_ref::<gtk::Widget>(), &account_id));
-            push_row(&view.mail_group, &view.identity_rows, identity_row);
+            card.add(&identity_row);
 
             // This account's default signatures, chosen from the global
             // signature list (Config → Accounts → Signatures). Rebuilt per
@@ -1672,8 +1662,7 @@ pub fn refresh(
                 SignatureDefault::New,
                 set_default_signature,
             );
-            view.mail_group.add(&new_default);
-            view.signature_default_rows.borrow_mut().push(new_default);
+            card.add(&new_default);
             let reply_default = signature_default_dropdown(
                 "Default for replies & forwards",
                 "Use this signature when replying to or forwarding from this account",
@@ -1683,8 +1672,8 @@ pub fn refresh(
                 SignatureDefault::Reply,
                 set_default_signature,
             );
-            view.mail_group.add(&reply_default);
-            view.signature_default_rows.borrow_mut().push(reply_default);
+            card.add(&reply_default);
+            view.mail_cards.append(&card);
         }
     }
 
