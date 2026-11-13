@@ -19,6 +19,7 @@ use crate::worker::Worker;
 use super::*;
 
 mod pdf_preview;
+mod office_preview;
 
 /// A safe save-suggested name for an attachment without one: falls back to a
 /// part-number-based placeholder (the raw wire could be anything, and a
@@ -227,13 +228,19 @@ pub(crate) struct AttachmentPreview {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PreviewKind { Image, Text, Pdf, Unsupported }
+enum PreviewKind { Image, Text, Pdf, Office(office_preview::OfficeKind), Unsupported }
 
 fn preview_kind(mime: &str, name: &str) -> PreviewKind {
     let mime = mime.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
     let ext = name.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase()).unwrap_or_default();
     if mime == "application/pdf" || (mime == "application/octet-stream" && ext == "pdf") {
         PreviewKind::Pdf
+    } else if mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        || (mime == "application/octet-stream" && ext == "docx") {
+        PreviewKind::Office(office_preview::OfficeKind::Docx)
+    } else if mime == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        || (mime == "application/octet-stream" && ext == "xlsx") {
+        PreviewKind::Office(office_preview::OfficeKind::Xlsx)
     } else if mime.starts_with("text/") || matches!(mime.as_str(), "application/json" | "application/xml" | "application/javascript")
         || matches!(ext.as_str(), "txt" | "md" | "log" | "csv" | "json" | "xml" | "html" | "htm" | "css" | "js" | "rs" | "py" | "ini" | "yaml" | "yml") {
         PreviewKind::Text
@@ -248,6 +255,8 @@ pub(crate) fn attachment_icon(part: &BodyPart) -> &'static str {
         PreviewKind::Image => "image-x-generic-symbolic",
         PreviewKind::Text => "text-x-generic-symbolic",
         PreviewKind::Pdf => "application-pdf-symbolic",
+        PreviewKind::Office(office_preview::OfficeKind::Docx) => "x-office-document-symbolic",
+        PreviewKind::Office(office_preview::OfficeKind::Xlsx) => "x-office-spreadsheet-symbolic",
         PreviewKind::Unsupported => "mail-attachment-symbolic",
     }
 }
@@ -407,6 +416,7 @@ pub(crate) fn attachment_preview_arrived(state: &Rc<RefCell<UiState>>, mailbox: 
             content.append(&scroller);
         }
         PreviewKind::Pdf => pdf_preview::show(&content, bytes),
+        PreviewKind::Office(kind) => office_preview::show(&content, bytes, kind),
         PreviewKind::Unsupported => preview_status(&content, "No built-in preview for this file type. Use Open, Open With or Save."),
     }
 }
@@ -456,6 +466,18 @@ mod preview_tests {
         assert_eq!(attachment_name_candidate("notes", 3), "notes (3)");
         assert_eq!(attachment_name_candidate(".env", 2), ".env (2)");
         assert_eq!(attachment_name_candidate("archive.tar.gz", 2), "archive.tar (2).gz");
+    }
+
+    #[test]
+    fn office_preview_recognizes_ooxml_and_not_macro_formats() {
+        use office_preview::OfficeKind;
+        assert_eq!(preview_kind("application/vnd.openxmlformats-officedocument.wordprocessingml.document", "document"), PreviewKind::Office(OfficeKind::Docx));
+        assert_eq!(preview_kind("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "sheet"), PreviewKind::Office(OfficeKind::Xlsx));
+        assert_eq!(preview_kind("application/octet-stream", "document.DOCX"), PreviewKind::Office(OfficeKind::Docx));
+        assert_eq!(preview_kind("application/octet-stream", "sheet.XLSX"), PreviewKind::Office(OfficeKind::Xlsx));
+        assert_eq!(preview_kind("application/vnd.ms-word.document.macroEnabled.12", "macro.docm"), PreviewKind::Unsupported);
+        assert_eq!(preview_kind("application/vnd.ms-excel.sheet.macroEnabled.12", "macro.xlsm"), PreviewKind::Unsupported);
+        assert_eq!(preview_kind("application/zip", "archive.docx"), PreviewKind::Unsupported);
     }
 
     #[test]
