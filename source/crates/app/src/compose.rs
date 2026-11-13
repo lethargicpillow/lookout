@@ -2542,17 +2542,21 @@ pub fn build_compose_view(
         let block = gtk::Grid::builder()
             .row_homogeneous(true).column_homogeneous(true)
             .row_spacing(2).column_spacing(2)
-            .valign(gtk::Align::Fill).halign(gtk::Align::Start)
+            // Fill the command area internally, without requesting spare
+            // vertical space from the ribbon or the editor window.
+            .vexpand(false).valign(gtk::Align::Fill).halign(gtk::Align::Start)
             .css_classes(["compose-format-block"]).build();
 
         format.font_family.set_size_request(-1, -1);
         format.font_family.set_hexpand(false);
         format.font_family.set_halign(gtk::Align::Fill);
         format.font_family.set_valign(gtk::Align::Fill);
+        format.font_family.set_vexpand(true);
         format.font_family.add_css_class("compose-format-select");
         format.font_size.set_size_request(-1, -1);
         format.font_size.set_halign(gtk::Align::Fill);
         format.font_size.set_valign(gtk::Align::Fill);
+        format.font_size.set_vexpand(true);
         format.font_size.add_css_class("compose-format-select");
         block.attach(&format.font_family, 0, 0, 4, 1);
         block.attach(&format.font_size, 4, 0, 2, 1);
@@ -2561,6 +2565,7 @@ pub fn build_compose_view(
             button.add_css_class("compose-format-button");
             button.set_halign(gtk::Align::Fill);
             button.set_valign(gtk::Align::Fill);
+            button.set_vexpand(true);
             block.attach(button, col, row, 1, 1);
         };
         for (col, button) in [&format.bold, &format.italic, &format.underline, &format.strikethrough, &format.clear_formatting].into_iter().enumerate() {
@@ -2569,6 +2574,7 @@ pub fn build_compose_view(
         format.color.set_size_request(-1, -1);
         format.color.set_halign(gtk::Align::Fill);
         format.color.set_valign(gtk::Align::Fill);
+        format.color.set_vexpand(true);
         format.color.add_css_class("compose-format-color");
         block.attach(&format.color, 5, 1, 1, 1);
         for (col, button) in [&format.bullets, &format.numbering, &format.outdent, &format.indent].into_iter().enumerate() {

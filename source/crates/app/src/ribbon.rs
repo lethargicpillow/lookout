@@ -620,7 +620,7 @@ fn build_content(icon: &str, label: &str) -> (gtk::Box, gtk::Image, gtk::Label) 
 fn style_control(content: &gtk::Box, image: &gtk::Image, label: &gtk::Label, look: Look) {
     let (orientation, spacing, icon, halign) = match look {
         Look::Simplified => (gtk::Orientation::Horizontal, 8, 20, gtk::Align::Fill),
-        Look::Large => (gtk::Orientation::Vertical, 3, 28, gtk::Align::Center),
+        Look::Large => (gtk::Orientation::Vertical, 3, 32, gtk::Align::Center),
         // A column's buttons share its width; keep each icon at its leading
         // edge so the column's icons line up, as a menu's entries do.
         Look::Small | Look::Overflow => (gtk::Orientation::Horizontal, 6, 16, gtk::Align::Start),
@@ -633,7 +633,7 @@ fn style_control(content: &gtk::Box, image: &gtk::Image, label: &gtk::Label, loo
     content.set_valign(if look == Look::Large { gtk::Align::Fill } else { gtk::Align::Center });
     image.set_halign(gtk::Align::Center);
     image.set_valign(gtk::Align::Center);
-    image.set_size_request(-1, if look == Look::Large { 30 } else { -1 });
+    image.set_size_request(-1, if look == Look::Large { 34 } else { -1 });
     image.set_pixel_size(icon);
     // A large button's label may take two lines ("New / Message"), centred
     // under its icon; everywhere else it stays on one.

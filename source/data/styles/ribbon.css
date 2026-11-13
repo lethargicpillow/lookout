@@ -44,7 +44,8 @@ button.ribbon-control,
    `button` the same way. Commands moved into More keep the menu-row
    geometry below, although the popover sits inside a Classic band. */
 .ribbon-classic .ribbon-group-row {
-    min-height: 72px;
+    /* Match the actual three 26px command allocations, including borders. */
+    min-height: 78px;
 }
 .ribbon-classic button.ribbon-large:not(.ribbon-overflow-control),
 .ribbon-classic .ribbon-large:not(.ribbon-overflow-control) > button,
@@ -110,9 +111,8 @@ button.ribbon-control,
 .ribbon-menu-arrow { margin-left: 2px; }
 
 /* Standalone commands now have a real footer, not a padding offset. */
-.ribbon-classic .ribbon-group-row,
 .ribbon-classic .ribbon-small-column {
-    min-height: 72px;
+    min-height: 78px;
 }
 .ribbon-classic .ribbon-content {
     margin: 0;
