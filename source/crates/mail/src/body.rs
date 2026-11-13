@@ -8,6 +8,35 @@ use std::collections::HashMap;
 
 use crate::send::Attachment;
 
+/// A CID image used by the HTML body is not a downloadable attachment,
+/// even if a sender (or Exchange) assigned it an attachment disposition.
+/// Keep its part and CID intact so the renderer can still fetch it.
+fn exclude_inline_images(parts: &mut [BodyPart], html: Option<&str>) -> bool {
+    let Some(html) = html else { return false; };
+    let mut references = Vec::new();
+    for (index, prefix) in html.as_bytes().windows(4).enumerate() {
+        if !prefix.eq_ignore_ascii_case(b"cid:") { continue; }
+        let after = &html[index + 4..];
+        let end = after.find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '>' | ')')).unwrap_or(after.len());
+        references.push(&after[..end]);
+    }
+    let mut changed = false;
+    for part in parts {
+        if part.is_attachment && part.content_type.starts_with("image/")
+            && part.cid.as_deref().is_some_and(|cid| references.iter().any(|reference| lookout_core::cid_matches(reference, cid)))
+        {
+            part.is_attachment = false;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Upgrade a previously cached body without dropping its text or MIME data.
+pub(crate) fn normalize_cached_attachments(body: &mut EmailBody) -> bool {
+    exclude_inline_images(&mut body.parts, body.html_body.as_deref())
+}
+
 /// Parses a raw RFC 5322 message (as returned by `UID FETCH ... BODY.PEEK[]`)
 /// into an [`EmailBody`]. This is the *fallback* body path, used when a
 /// message's summary carries no `BODYSTRUCTURE`-derived part structure (the
@@ -109,7 +138,7 @@ pub fn parse_body(uid: Uid, raw: &[u8]) -> Option<EmailBody> {
         })
         .collect();
 
-    let (parts, text_body, html_body, calendar_ics) = match tnef_payload {
+    let (mut parts, text_body, html_body, calendar_ics) = match tnef_payload {
         Some((Some(source_part), payload)) => match tnef::parse(&payload) {
             Ok(contents) => apply_tnef(&contents, &source_part, parts, text_body, html_body, has_real_html, calendar_ics),
             Err(_) => (parts, text_body, html_body, calendar_ics),
@@ -117,6 +146,7 @@ pub fn parse_body(uid: Uid, raw: &[u8]) -> Option<EmailBody> {
         _ => (parts, text_body, html_body, calendar_ics),
     };
 
+    exclude_inline_images(&mut parts, html_body.as_deref());
     let auth_results = lookout_core::auth_results_from_headers(&headers);
 
     Some(EmailBody {
@@ -553,7 +583,7 @@ pub fn assemble_body_from_parts(uid: Uid, headers: Vec<(String, String)>, all_pa
         .filter(|p| !p.is_text() && !p.is_calendar() && !p.is_delivery_status() && !p.is_rfc822_headers())
         .cloned()
         .collect();
-    let (parts, text_body, html_body, calendar_ics) = match tnef_payload {
+    let (mut parts, text_body, html_body, calendar_ics) = match tnef_payload {
         Some((source_part, payload)) => match tnef::parse(&payload) {
             Ok(contents) => apply_tnef(&contents, &source_part, parts, text_body, html_body, has_real_html, calendar_ics),
             Err(_) => (parts, text_body, html_body, calendar_ics),
@@ -561,6 +591,7 @@ pub fn assemble_body_from_parts(uid: Uid, headers: Vec<(String, String)>, all_pa
         None => (parts, text_body, html_body, calendar_ics),
     };
 
+    exclude_inline_images(&mut parts, html_body.as_deref());
     let auth_results = lookout_core::auth_results_from_headers(&headers);
 
     EmailBody {
@@ -1103,6 +1134,20 @@ mod tests {
     fn fixture(name: &str) -> Vec<u8> {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-fixtures/").to_string() + name;
         std::fs::read(&path).unwrap_or_else(|e| panic!("reading fixture {path}: {e}"))
+    }
+
+    #[test]
+    fn referenced_signature_image_is_not_a_file() {
+        let make_part = |cid: &str| BodyPart {
+            part_number: "2".into(), content_type: "image/png".into(), charset: None,
+            transfer_encoding: None, filename: Some("photo.png".into()),
+            cid: Some(cid.into()), size: 100, is_attachment: true,
+        };
+        let mut parts = vec![make_part("logo@exchange"), make_part("real-photo@exchange")];
+        assert!(exclude_inline_images(&mut parts, Some("<img src='CID:logo%40exchange'>")));
+        assert!(!parts[0].is_attachment);
+        assert!(parts[1].is_attachment);
+        assert!(!exclude_inline_images(&mut parts, Some("<img src='cid:logo@exchange'>")));
     }
 
     #[test]

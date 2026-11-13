@@ -16,7 +16,7 @@ use lookout_core::BodyPart;
 /// attached email is an attachment, not body text).
 pub fn parts_from_bodystructure(structure: &BodyStructure) -> Vec<BodyPart> {
     let mut parts = Vec::new();
-    walk(structure, &mut Vec::new(), &mut parts);
+    walk(structure, &mut Vec::new(), &mut parts, false);
     parts
 }
 
@@ -36,22 +36,23 @@ pub fn has_calendar_parts(parts: &[BodyPart]) -> bool {
     parts.iter().any(|p| p.is_calendar())
 }
 
-fn walk(structure: &BodyStructure, path: &mut Vec<u32>, out: &mut Vec<BodyPart>) {
+fn walk(structure: &BodyStructure, path: &mut Vec<u32>, out: &mut Vec<BodyPart>, related_resource: bool) {
     match structure {
-        BodyStructure::Multipart { bodies, .. } => {
+        BodyStructure::Multipart { common, bodies, .. } => {
+            let related = common.ty.subtype.eq_ignore_ascii_case("related");
             for (i, child) in bodies.iter().enumerate() {
                 path.push(i as u32 + 1);
-                walk(child, path, out);
+                walk(child, path, out, related_resource || (related && i > 0));
                 path.pop();
             }
         }
-        BodyStructure::Message { common, other, .. } => push_leaf(common, other, path, out, true),
-        BodyStructure::Basic { common, other, .. } => push_leaf(common, other, path, out, false),
-        BodyStructure::Text { common, other, .. } => push_leaf(common, other, path, out, false),
+        BodyStructure::Message { common, other, .. } => push_leaf(common, other, path, out, true, related_resource),
+        BodyStructure::Basic { common, other, .. } => push_leaf(common, other, path, out, false, related_resource),
+        BodyStructure::Text { common, other, .. } => push_leaf(common, other, path, out, false, related_resource),
     }
 }
 
-fn push_leaf<'a>(common: &'a BodyContentCommon<'a>, other: &'a BodyContentSinglePart<'a>, path: &mut Vec<u32>, out: &mut Vec<BodyPart>, embedded_message: bool) {
+fn push_leaf<'a>(common: &'a BodyContentCommon<'a>, other: &'a BodyContentSinglePart<'a>, path: &mut Vec<u32>, out: &mut Vec<BodyPart>, embedded_message: bool, related_resource: bool) {
     // A top-level single-part message is part `1` (RFC 3501: `BODY[1]` is
     // the whole part), while a leaf inside a multipart carries its parent
     // path as built by `walk`.
@@ -59,13 +60,13 @@ fn push_leaf<'a>(common: &'a BodyContentCommon<'a>, other: &'a BodyContentSingle
     if root {
         path.push(1);
     }
-    out.push(leaf(common, other, path, embedded_message));
+    out.push(leaf(common, other, path, embedded_message, related_resource));
     if root {
         path.pop();
     }
 }
 
-fn leaf(common: &BodyContentCommon, other: &BodyContentSinglePart, path: &[u32], embedded_message: bool) -> BodyPart {
+fn leaf(common: &BodyContentCommon, other: &BodyContentSinglePart, path: &[u32], embedded_message: bool, related_resource: bool) -> BodyPart {
     let ty = &common.ty.ty;
     let subtype = &common.ty.subtype;
 
@@ -100,7 +101,12 @@ fn leaf(common: &BodyContentCommon, other: &BodyContentSinglePart, path: &[u32],
     // attachment strip. An embedded `message/rfc822` is always an attachment.
     let is_text_leaf = ty.eq_ignore_ascii_case("text") && (subtype.eq_ignore_ascii_case("plain") || subtype.eq_ignore_ascii_case("html"));
     let disposition_is = |ty: &str| matches!(&common.disposition, Some(d) if d.ty.eq_ignore_ascii_case(ty));
-    let is_attachment = embedded_message || !is_text_leaf && (disposition_is("attachment") || filename.is_some() && !disposition_is("inline"));
+    // In multipart/related, a named CID image is a resource of the
+    // enclosing HTML, even if Exchange labels it as an attachment.
+    // Do not apply this rule to an unrelated image file in multipart/mixed.
+    let related_image = related_resource && ty.eq_ignore_ascii_case("image") && other.id.is_some();
+    let is_attachment = embedded_message || !is_text_leaf && !related_image
+        && (disposition_is("attachment") || filename.is_some() && !disposition_is("inline"));
 
     BodyPart {
         part_number: path.iter().map(u32::to_string).collect::<Vec<_>>().join("."),
@@ -308,6 +314,25 @@ mod tests {
         assert_eq!(parts[1].filename.as_deref(), Some("logo.png"));
         assert!(!parts[1].is_attachment);
         assert!(!has_attachments(&parts));
+    }
+
+    #[test]
+    fn related_cid_images_are_not_files_but_standalone_images_are() {
+        let image = || BodyStructure::Basic {
+            common: common("image", "png", Some(("attachment", Some(vec![("filename", "logo.png")]))), None),
+            other: single(Some("logo@exchange"), ContentEncoding::Base64, 1024),
+            extension: None,
+        };
+        for (subtype, expected) in [("related", false), ("mixed", true)] {
+            let bs = BodyStructure::Multipart {
+                common: common("multipart", subtype, None, None),
+                bodies: vec![text_plain(), image()],
+                extension: None,
+            };
+            let parts = parts_from_bodystructure(&bs);
+            assert_eq!(parts[1].is_attachment, expected);
+            assert_eq!(has_attachments(&parts), expected);
+        }
     }
 
     #[test]

@@ -485,6 +485,17 @@ fn reconcile_body_attachment_flag(conn: &rusqlite::Connection, mailbox: &Mailbox
     Ok(())
 }
 
+/// Repair cached MIME classification without evicting a body or raw message.
+fn repair_cached_body(conn: &rusqlite::Connection, mailbox: &MailboxId, uid: Uid, validity: UidValidity, body: &mut EmailBody) -> Result<()> {
+    if crate::body::normalize_cached_attachments(body) {
+        conn.execute(
+            "UPDATE bodies SET data = ?4 WHERE mailbox_id = ?1 AND uid = ?2 AND uidvalidity = ?3",
+            rusqlite::params![mailbox.0, uid.0, validity.0, serde_json::to_vec(body)?],
+        )?;
+    }
+    reconcile_body_attachment_flag(conn, mailbox, uid, validity, body)
+}
+
 /// Loads one cached summary by `(mailbox_id, uid)`, if present.
 fn load_summary_row(conn: &rusqlite::Connection, mailbox_id: &MailboxId, uid: Uid) -> Result<Option<EmailSummary>> {
     let mut stmt = conn.prepare_cached("SELECT data FROM messages WHERE mailbox_id = ?1 AND uid = ?2")?;
@@ -1515,9 +1526,9 @@ impl Cache {
         let mut rows = stmt.query_map(rusqlite::params![mailbox_id.0, uid.0, uidvalidity.0], |row| row.get::<_, Vec<u8>>(0))?;
         match rows.next() {
             Some(Ok(data)) => {
-                let body: Option<EmailBody> = serde_json::from_slice(&data).ok();
-                if let Some(body) = &body {
-                    reconcile_body_attachment_flag(&conn, mailbox_id, uid, uidvalidity, body)?;
+                let mut body: Option<EmailBody> = serde_json::from_slice(&data).ok();
+                if let Some(body) = &mut body {
+                    repair_cached_body(&conn, mailbox_id, uid, uidvalidity, body)?;
                 }
                 Ok(body)
             }
@@ -1613,7 +1624,8 @@ impl Cache {
         for &uid in uids {
             let mut rows = stmt.query_map(rusqlite::params![mailbox_id.0, uid.0, uidvalidity.0], |row| row.get::<_, Vec<u8>>(0))?;
             if let Some(Ok(data)) = rows.next() {
-                if let Ok(body) = serde_json::from_slice::<EmailBody>(&data) {
+                if let Ok(mut body) = serde_json::from_slice::<EmailBody>(&data) {
+                    repair_cached_body(&conn, mailbox_id, uid, uidvalidity, &mut body)?;
                     out.insert(uid, body);
                 }
             }
@@ -1798,6 +1810,44 @@ impl Cache {
     pub fn run_maintenance(&self) -> Result<()> {
         self.run_startup_cleanup()?;
         self.run_space_reclaim()
+    }
+
+    /// One-time, non-destructive repair for previously cached IMAP bodies.
+    /// Run on the session's blocking pool before its first folder sync, so
+    /// stale envelope badges are corrected without opening each message.
+    pub fn repair_cached_attachment_flags(&self) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS cache_repairs (name TEXT PRIMARY KEY)")?;
+        let done: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM cache_repairs WHERE name = 'inline-attachments-v1')",
+            [], |row| row.get(0),
+        )?;
+        if !done {
+            // Collect only keys, not all body bytes. The UIDVALIDITY join
+            // prevents correcting a message from a previous mailbox epoch.
+            let keys = {
+                let mut stmt = tx.prepare(
+                    "SELECT b.mailbox_id, b.uid, b.uidvalidity FROM bodies b
+                     JOIN messages m ON m.mailbox_id = b.mailbox_id AND m.uid = b.uid
+                       AND m.uidvalidity = b.uidvalidity"
+                )?;
+                let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?, row.get::<_, u32>(2)?)))?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            for (mailbox, uid, validity) in keys {
+                let data: Vec<u8> = tx.query_row(
+                    "SELECT data FROM bodies WHERE mailbox_id = ?1 AND uid = ?2 AND uidvalidity = ?3",
+                    rusqlite::params![mailbox, uid, validity], |row| row.get(0),
+                )?;
+                if let Ok(mut body) = serde_json::from_slice::<EmailBody>(&data) {
+                    repair_cached_body(&tx, &MailboxId(mailbox), Uid(uid), UidValidity(validity), &mut body)?;
+                }
+            }
+            tx.execute("INSERT INTO cache_repairs (name) VALUES ('inline-attachments-v1')", [])?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// The correctness half of [`Self::run_maintenance`]: the flat-file sweep

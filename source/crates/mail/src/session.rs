@@ -1572,7 +1572,10 @@ pub async fn run_account_session(
     // blocking pool without awaiting, so a large existing cache never delays
     // login (same reasoning as the search-index backfill above).
     let cleanup_cache = cache.clone();
-    match tokio::task::spawn_blocking(move || cleanup_cache.as_ref().as_ref().map(|c| c.run_startup_cleanup()).transpose()).await {
+    match tokio::task::spawn_blocking(move || cleanup_cache.as_ref().as_ref().map(|c| {
+        c.run_startup_cleanup()?;
+        c.repair_cached_attachment_flags()
+    }).transpose()).await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => tracing::warn!("failed to run cache cleanup: {e}"),
         Err(e) => tracing::warn!("cache cleanup task failed: {e}"),
