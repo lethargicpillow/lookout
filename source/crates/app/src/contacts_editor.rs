@@ -531,20 +531,19 @@ pub fn build_contact_form(seed: Option<&VCard>, books: Option<&[(String, String)
     if let Some(book_dropdown) = &book_dropdown {
         let book_row = adw::ActionRow::builder().title("Address book").build();
         book_row.add_suffix(book_dropdown);
-        content_box.append(&book_row);
+        let book_group = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).css_classes(["boxed-list"]).build();
+        book_group.append(&book_row);
+        content_box.append(&book_group);
     }
     content_box.append(&section_header("Photo"));
     content_box.append(&photo_row);
-    content_box.append(&name_row);
-    content_box.append(&given_row);
-    content_box.append(&family_row);
-    content_box.append(&org_row);
-    content_box.append(&department_row);
-    content_box.append(&office_row);
-    content_box.append(&title_row);
-    content_box.append(&file_as_row);
-    content_box.append(&birthday_row);
-    content_box.append(&anniversary_row);
+    // AdwEntryRow is a GtkListBoxRow: its parent must be a ListBox,
+    // including when the same form is used inside the inline editor.
+    let identity_group = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).css_classes(["boxed-list"]).build();
+    for row in [&name_row, &given_row, &family_row, &org_row, &department_row, &office_row, &title_row, &file_as_row, &birthday_row, &anniversary_row] {
+        identity_group.append(row);
+    }
+    content_box.append(&identity_group);
     content_box.append(&section_header("Emails"));
     content_box.append(&emails_box);
     content_box.append(&add_email);
@@ -564,8 +563,10 @@ pub fn build_contact_form(seed: Option<&VCard>, books: Option<&[(String, String)
     content_box.append(&customs_box);
     content_box.append(&add_custom);
     content_box.append(&section_header("Notes"));
-    content_box.append(&notes_entry);
-    content_box.append(&groups_row);
+    let notes_group = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).css_classes(["boxed-list"]).build();
+    notes_group.append(&notes_entry);
+    notes_group.append(&groups_row);
+    content_box.append(&notes_group);
 
     // --- Build the card from the form (clone of the seed card, only the
     // exposed fields rewritten). `None` on invalid input (no name, bad
