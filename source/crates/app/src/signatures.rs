@@ -125,7 +125,7 @@ pub(crate) fn show_manager(
             };
             for (title, value, kind) in [
                 ("New messages", current.new, crate::config_view::SignatureDefault::New),
-                ("Replies &amp; forwards", current.reply, crate::config_view::SignatureDefault::Reply),
+                ("Replies & forwards", current.reply, crate::config_view::SignatureDefault::Reply),
             ] {
                 let row = crate::config_view::signature_default_dropdown(title, "", &id.0, value, &signatures, kind, &set);
                 row.add_css_class("card");
