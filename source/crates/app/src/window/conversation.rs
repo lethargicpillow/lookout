@@ -167,7 +167,7 @@ pub(crate) fn open_conversation(ctx: &ConversationContext, id: ThreadId, listed:
     }
     leave_conversation(state);
     clear_single_message_state(state);
-    let dark = state.borrow().settings.get_bool(crate::settings::MAIL_MESSAGE_THEME_DARK);
+    let dark = crate::settings::page_dark();
     let subject = crate::message_list::newest_message(&listed)
         .and_then(|m| m.subject)
         .filter(|s| !s.trim().is_empty())
@@ -941,13 +941,23 @@ pub(crate) fn build_conversation_ui(ctx: &ConversationContext, reading_stack: &g
             if ui_for_theme.suppress_theme.get() {
                 return;
             }
+            crate::settings::set_page_dark(button.is_active());
             let keep = {
                 let mut st = ctx.state.borrow_mut();
                 let Some(pane) = st.rendered_conversation.as_mut() else { return };
+                if pane.dark == button.is_active() { return; }
                 pane.dark = button.is_active();
                 pane.cards.iter().filter(|c| c.expanded).map(|c| c.key()).collect()
             };
             rebuild_conversation_keeping_scroll(&ctx, &ui_for_theme, keep);
+        });
+    }
+    {
+        let weak = theme_button.downgrade();
+        crate::settings::observe_page_dark(move |dark| {
+            let Some(button) = weak.upgrade() else { return false };
+            button.set_active(dark);
+            true
         });
     }
     // Navigation: the document and its body frames load in place (they're
