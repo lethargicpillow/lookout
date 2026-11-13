@@ -42,6 +42,7 @@ pub fn show_editor_dialog(anchor: &gtk::Widget, app_config: Rc<RefCell<AppConfig
 
     let toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
     toolbar.append(&format_controls.strip());
+    toolbar.append(&crate::compose::page_background_button());
     let rich_scroller = gtk::ScrolledWindow::builder().child(&*web_view).hexpand(true).vexpand(true).build();
 
     let save_button = gtk::Button::with_label("Save");
