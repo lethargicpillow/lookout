@@ -110,6 +110,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // `UiState` exists. One-time imports of the pre-GSettings plain files
     // run before the first reads below.
     let settings = Rc::new(crate::settings::resolve());
+    crate::settings::set_page_dark(settings.get_bool(crate::settings::MAIL_MESSAGE_THEME_DARK));
     // Mirror the folder-name preference before the folder pane is built
     // (UX-03); the Config switch keeps the mirror in step afterwards.
     crate::settings::set_use_server_folder_names(settings.get_bool(crate::settings::MAIL_USE_SERVER_FOLDER_NAMES));
@@ -775,7 +776,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         rendered_from_mismatch: None,
         rendered_link_warnings: Vec::new(),
         load_once_images: false,
-        message_theme_override: false,
+        message_theme_override: crate::settings::page_dark(),
         trust_banner_dismissed: None,
         rendered_remote_scan: None,
         draft_saved_tx: None,
@@ -8900,16 +8901,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
-    // Config → Appearance → "Dark message theme": the default state for
-    // *newly-opened* messages only - the reading pane's per-message
-    // "Switch message theme" toggle still overrides the current message
-    // either way, so the change applies on the next navigation rather than
-    // re-rendering (and possibly yanking) the message on screen.
+    // The global page background is independent of the chrome theme.
     {
-        let state = state.clone();
-        config_view.message_theme_dark_row.connect_active_notify(move |row| {
-            state.borrow().settings.set_bool(crate::settings::MAIL_MESSAGE_THEME_DARK, row.is_active());
+        let row = config_view.message_theme_dark_row.clone();
+        let weak = row.downgrade();
+        crate::settings::observe_page_dark(move |dark| {
+            let Some(row) = weak.upgrade() else { return false };
+            row.set_active(dark);
+            true
         });
+        row.connect_active_notify(move |row| crate::settings::set_page_dark(row.is_active()));
     }
 
     // Config → Mail → "Load images from the web": flips the WebView's
@@ -12440,54 +12441,35 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
-    // --- "Switch message theme" toggle: arms/removes the background-stripping
-    // user stylesheet and re-renders the open message so the override applies
-    // to it, not just the next selection. A per-email override: every
-    // navigation reset sets `message_theme_override` to the Config →
-    // Appearance "Dark message theme" default (see `set_message_theme_armed`
-    // for the physical side), and `render_body` syncs this button from it,
-    // so the next message always opens in the configured default rather than
-    // inheriting the previous message's manual override. The idempotence
-    // guard up front makes the handler a no-op when state and button already
-    // agree - which is what happens when `render_body`'s sync flips the
-    // button after a navigation, so that sync-driven `toggled` can't trigger
-    // a redundant re-render (or a loop). Re-rendering is skipped while a
-    // composer is up, the same as the "Load images" toggle - see
-    // `rerender_current_message`. Stripping the email's backgrounds alone is
-    // not enough: the WebView's own page canvas paints white behind the (now
-    // transparent) document, so the toggle also flips the canvas colour -
-    // transparent while armed (letting the reading card's theme background
-    // show through), white otherwise, matching WebKit's default so
-    // un-backgrounded emails look exactly as they did before the toggle
-    // existed.
+    // All page-background switches drive the same persisted state.
     {
         let state = state.clone();
-        let reading_stack = reading_stack.clone();
-        let message_header = message_header.clone();
-        let message_list = message_list.clone();
         let web_view = web_view.clone();
         let user_content_manager = user_content_manager.clone();
         let theme_override_sheet = theme_override_sheet.clone();
-        message_header.theme_button.clone().connect_toggled(move |button| {
-            // The icon flips with the state - a moon while the override is
-            // off, a sun while it's on (the sun also trails the moon's
-            // candidate list as the no-moon fallback, see `message_header`).
-            // The tooltip names what clicking the button will do next, so it
-            // flips too - and both are set before the guard below so
-            // `render_body`'s sync-driven `set_active` (which also lands
-            // here) updates them.
-            button.set_icon_name(if button.is_active() {
-                crate::window::themed_icon_name(&["weather-clear-symbolic", "display-brightness-symbolic"])
-            } else {
-                crate::window::themed_icon_name(&["weather-clear-night-symbolic", "night-light-symbolic", "weather-clear-symbolic"])
-            });
-            button.set_tooltip_text(Some(if button.is_active() { "View in Light Mode" } else { "View in Dark Mode" }));
-            if button.is_active() == state.borrow().message_theme_override {
-                return;
+        let button = message_header.theme_button.clone();
+        button.connect_toggled(|button| crate::settings::set_page_dark(button.is_active()));
+        let weak_state = Rc::downgrade(&state);
+        let weak_button = button.downgrade();
+        let weak_web = web_view.downgrade();
+        crate::settings::observe_page_dark(move |dark| {
+            let (Some(state), Some(button), Some(web_view)) = (weak_state.upgrade(), weak_button.upgrade(), weak_web.upgrade()) else { return false };
+            {
+                let mut st = state.borrow_mut();
+                st.message_theme_override = dark;
+                if st.settings.get_bool(crate::settings::MAIL_MESSAGE_THEME_DARK) != dark {
+                    st.settings.set_bool(crate::settings::MAIL_MESSAGE_THEME_DARK, dark);
+                }
             }
-            set_message_theme_armed(button.is_active(), &web_view, &user_content_manager, &theme_override_sheet);
-            state.borrow_mut().message_theme_override = button.is_active();
-            rerender_current_message(&state, &reading_stack, &message_header, &message_list);
+            button.set_active(dark);
+            button.set_icon_name(if dark {
+                themed_icon_name(&["weather-clear-symbolic", "display-brightness-symbolic"])
+            } else {
+                themed_icon_name(&["weather-clear-night-symbolic", "night-light-symbolic", "weather-clear-symbolic"])
+            });
+            button.set_tooltip_text(Some(if dark { "View in Light Mode" } else { "View in Dark Mode" }));
+            set_message_theme_armed(dark, &web_view, &user_content_manager, &theme_override_sheet);
+            true
         });
     }
 
