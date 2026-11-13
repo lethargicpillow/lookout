@@ -11862,8 +11862,22 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             // The composer's "Manage Signatures…" hook opens the Accounts
             // category, where the global signature list lives.
             state.borrow_mut().manage_signatures = Some({
-                let open_settings = open_settings.clone();
-                Rc::new(move || open_settings("accounts"))
+                let state = state.clone();
+                let window = window.clone();
+                let refresh_hook = refresh_hook.clone();
+                Rc::new(move || {
+                    let (anchor, config, accounts, selected) = {
+                        let st = state.borrow();
+                        let anchor: gtk::Widget = st.compose_popout_window.as_ref()
+                            .map(|(_, win)| win.clone().upcast())
+                            .unwrap_or_else(|| window.clone().upcast());
+                        let accounts = st.accounts.iter().map(|(id, h)| (id.clone(), h.email.clone())).collect();
+                        let selected = st.current_mailbox.as_ref().and_then(mailbox_account_id);
+                        (anchor, st.app_config.clone(), accounts, selected)
+                    };
+                    let refresh = refresh_hook.borrow().clone();
+                    crate::signatures::show_manager(&anchor, config, accounts, selected, refresh);
+                })
             });
             // The ribbon's Send / Receive ▸ Account Settings opens the same.
             account_settings_button.connect_clicked({
