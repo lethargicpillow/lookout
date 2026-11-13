@@ -16,6 +16,184 @@ use lookout_core::Signature;
 
 use crate::app_config::AppConfig;
 
+/// Manage the saved signatures and the two per-account defaults in a
+/// single modal window, without leaving the active composer.
+pub(crate) fn show_manager(
+    anchor: &gtk::Widget,
+    app_config: Rc<RefCell<AppConfig>>,
+    mut accounts: Vec<(lookout_core::AccountId, String)>,
+    selected_account: Option<lookout_core::AccountId>,
+    on_changed: Rc<dyn Fn()>,
+) {
+    accounts.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.0.cmp(&b.0.0)));
+    let accounts = Rc::new(accounts);
+    let dialog = gtk::Window::builder().title("Signatures and Stationery").modal(true)
+        .default_width(780).default_height(520).build();
+    if let Some(win) = anchor.root().and_downcast::<gtk::Window>() {
+        dialog.set_transient_for(Some(&win));
+    }
+    let root = gtk::Box::builder().orientation(gtk::Orientation::Vertical)
+        .spacing(12).margin_top(16).margin_bottom(16).margin_start(16).margin_end(16).build();
+    let columns = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(16).vexpand(true).build();
+    let left = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(8).width_request(240).build();
+    let title = gtk::Label::builder().label("Select signature to edit").xalign(0.0).css_classes(["heading"]).build();
+    left.append(&title);
+    let list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::Single).css_classes(["boxed-list"]).build();
+    let scroller = gtk::ScrolledWindow::builder().child(&list).vexpand(true).min_content_height(160)
+        .hscrollbar_policy(gtk::PolicyType::Never).build();
+    left.append(&scroller);
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let new_button = gtk::Button::with_label("New…");
+    let edit_button = gtk::Button::with_label("Edit…");
+    let delete_button = gtk::Button::with_label("Delete");
+    delete_button.add_css_class("destructive-action");
+    actions.append(&new_button); actions.append(&edit_button); actions.append(&delete_button);
+    left.append(&actions);
+    columns.append(&left);
+
+    let right = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(8).hexpand(true).build();
+    let defaults_title = gtk::Label::builder().label("Choose default signature").xalign(0.0).css_classes(["heading"]).build();
+    right.append(&defaults_title);
+    let account_names: Vec<&str> = accounts.iter().map(|(_, name)| name.as_str()).collect();
+    let account = gtk::DropDown::from_strings(&account_names);
+    crate::privacy::mark_content(&account);
+    let account_line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    account_line.append(&gtk::Label::new(Some("E-mail account:")));
+    account.set_hexpand(true);
+    account_line.append(&account);
+    right.append(&account_line);
+    if let Some(index) = accounts.iter().position(|(id, _)| Some(id) == selected_account.as_ref()) {
+        account.set_selected(index as u32);
+    }
+    let defaults = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    right.append(&defaults);
+    let preview_title = gtk::Label::builder().label("Signature preview").xalign(0.0).css_classes(["heading"]).margin_top(12).build();
+    right.append(&preview_title);
+    let preview = gtk::TextView::builder().editable(false).cursor_visible(false).wrap_mode(gtk::WrapMode::WordChar)
+        .left_margin(8).right_margin(8).top_margin(8).bottom_margin(8).build();
+    crate::privacy::mark_content(&preview);
+    let preview_scroll = gtk::ScrolledWindow::builder().child(&preview).vexpand(true).min_content_height(120).build();
+    right.append(&preview_scroll);
+    columns.append(&right);
+    root.append(&columns);
+    let done = gtk::Button::with_label("Done");
+    done.add_css_class("suggested-action");
+    done.set_halign(gtk::Align::End);
+    root.append(&done);
+    dialog.set_child(Some(&root));
+
+    let ids: Rc<RefCell<Vec<uuid::Uuid>>> = Rc::new(RefCell::new(Vec::new()));
+    let selected_id: Rc<dyn Fn() -> Option<uuid::Uuid>> = {
+        let list = list.clone(); let ids = ids.clone();
+        Rc::new(move || list.selected_row().and_then(|r| ids.borrow().get(r.index() as usize).copied()))
+    };
+    let refresh_selection: Rc<dyn Fn()> = {
+        let selected_id = selected_id.clone(); let app_config = app_config.clone();
+        let preview = preview.clone(); let edit_button = edit_button.clone(); let delete_button = delete_button.clone();
+        Rc::new(move || {
+            let selected = selected_id().and_then(|id| app_config.borrow().signatures.iter().find(|s| s.id == id).cloned());
+            edit_button.set_sensitive(selected.is_some()); delete_button.set_sensitive(selected.is_some());
+            preview.buffer().set_text(selected.as_ref().map(|s| s.text.as_str()).unwrap_or(""));
+        })
+    };
+    let refresh_defaults: Rc<dyn Fn()> = {
+        let defaults = defaults.clone(); let account = account.clone(); let accounts = accounts.clone();
+        let app_config = app_config.clone(); let on_changed = on_changed.clone();
+        Rc::new(move || {
+            while let Some(child) = defaults.first_child() { defaults.remove(&child); }
+            let Some((id, _)) = accounts.get(account.selected() as usize) else {
+                defaults.append(&gtk::Label::new(Some("No mail account available")));
+                return;
+            };
+            let (signatures, current) = {
+                let cfg = app_config.borrow();
+                (cfg.signatures.clone(), cfg.signature_defaults.get(id).cloned().unwrap_or_default())
+            };
+            let set: crate::config_view::SetAccountSignatureDefault = {
+                let app_config = app_config.clone(); let on_changed = on_changed.clone();
+                Rc::new(move |account, kind, signature| {
+                    let mut cfg = app_config.borrow_mut();
+                    let entry = cfg.signature_defaults.entry(lookout_core::AccountId(account.to_owned())).or_default();
+                    match kind {
+                        crate::config_view::SignatureDefault::New => entry.new = signature,
+                        crate::config_view::SignatureDefault::Reply => entry.reply = signature,
+                    }
+                    crate::app_config::save(&cfg);
+                    drop(cfg);
+                    on_changed();
+                })
+            };
+            for (title, value, kind) in [
+                ("New messages", current.new, crate::config_view::SignatureDefault::New),
+                ("Replies &amp; forwards", current.reply, crate::config_view::SignatureDefault::Reply),
+            ] {
+                let row = crate::config_view::signature_default_dropdown(title, "", &id.0, value, &signatures, kind, &set);
+                row.add_css_class("card");
+                defaults.append(&row);
+            }
+        })
+    };
+    let refresh: Rc<dyn Fn()> = {
+        let list = list.clone(); let ids = ids.clone(); let app_config = app_config.clone();
+        let selected_id = selected_id.clone(); let refresh_selection = refresh_selection.clone(); let refresh_defaults = refresh_defaults.clone();
+        Rc::new(move || {
+            let previous = selected_id();
+            let signatures = app_config.borrow().signatures.clone();
+            while let Some(child) = list.first_child() { list.remove(&child); }
+            *ids.borrow_mut() = signatures.iter().map(|s| s.id).collect();
+            for signature in &signatures {
+                let label = gtk::Label::builder().label(&signature.name).xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End)
+                    .margin_top(6).margin_bottom(6).margin_start(8).margin_end(8).build();
+                crate::privacy::mark_content(&label);
+                list.append(&label);
+            }
+            let index = signatures.iter().position(|s| Some(s.id) == previous).unwrap_or(0);
+            if let Some(row) = list.row_at_index(index as i32) { list.select_row(Some(&row)); }
+            refresh_selection(); refresh_defaults();
+        })
+    };
+    {
+        let refresh_selection = refresh_selection.clone();
+        list.connect_row_selected(move |_, _| refresh_selection());
+        let refresh_defaults = refresh_defaults.clone();
+        account.connect_selected_notify(move |_| refresh_defaults());
+    }
+    let changed: Rc<dyn Fn()> = {
+        let refresh = refresh.clone(); let on_changed = on_changed.clone();
+        Rc::new(move || { refresh(); on_changed(); })
+    };
+    {
+        let app_config = app_config.clone(); let changed = changed.clone();
+        new_button.connect_clicked(move |button| show_editor_dialog(button.upcast_ref(), app_config.clone(), None, changed.clone()));
+    }
+    {
+        let app_config = app_config.clone(); let changed = changed.clone(); let selected_id = selected_id.clone();
+        edit_button.connect_clicked(move |button| {
+            let existing = selected_id().and_then(|id| app_config.borrow().signatures.iter().find(|s| s.id == id).cloned());
+            if let Some(existing) = existing { show_editor_dialog(button.upcast_ref(), app_config.clone(), Some(existing), changed.clone()); }
+        });
+    }
+    {
+        let edit_button = edit_button.clone();
+        list.connect_row_activated(move |_, _| edit_button.emit_clicked());
+    }
+    {
+        let app_config = app_config.clone(); let changed = changed.clone(); let selected_id = selected_id.clone();
+        delete_button.connect_clicked(move |_| {
+            let Some(id) = selected_id() else { return };
+            app_config.borrow_mut().remove_signature(&id);
+            crate::app_config::save(&app_config.borrow());
+            changed();
+        });
+    }
+    {
+        let dialog = dialog.clone();
+        done.connect_clicked(move |_| dialog.close());
+    }
+    refresh();
+    dialog.present();
+}
+
 /// Presents the modal signature editor, anchored to `anchor`'s window when
 /// one exists (tests have no window). `existing` prefills the editor (the
 /// edit path); `None` starts a blank signature (the add path). `on_changed`
