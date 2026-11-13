@@ -1477,7 +1477,7 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, F
     let font_factory = gtk::SignalListItemFactory::new();
     font_factory.connect_setup(|_, item| {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else { return; };
-        let label = gtk::Label::builder().xalign(0.0).width_chars(9).max_width_chars(12)
+        let label = gtk::Label::builder().xalign(0.0).width_chars(8).max_width_chars(10)
             .ellipsize(gtk::pango::EllipsizeMode::End).build();
         item.set_child(Some(&label));
     });
@@ -2208,14 +2208,13 @@ pub fn build_compose_view(
     // no signatures exist. The button lives at the end of the toolbar (the
     // formatting controls stay ahead of it) and carries the bundled
     // signature icon instead of a text label, matching the toolbar's other
-    // icon buttons.
-    let signature_image = crate::window::svg_image(
-        "/io/github/gavindi/Lookout/icons/signature-1.svg",
-        include_bytes!("../../../data/resources/icons/signature-1.svg"),
-        18,
-    );
+    // icon buttons. Use a symbolic icon, not the legacy white SVG:
+    // the same glyph must remain legible on light and dark surfaces.
+    let signature_icon = crate::window::themed_icon_name(&[
+        "document-edit-symbolic", "accessories-text-editor-symbolic", "text-editor-symbolic",
+    ]);
     let signature_button = gtk::MenuButton::builder()
-        .child(&signature_image)
+        .icon_name(signature_icon)
         .css_classes(["flat"])
         .tooltip_text("Insert a signature")
         .build();
@@ -2598,7 +2597,7 @@ pub fn build_compose_view(
     editor_band.group("Include", |group| {
         group.small_button(&attach_button, "mail-attachment-symbolic", "Attach Files");
         group.small_button(&format.link, "insert-link-symbolic", "Link");
-        group.small_menu(&signature_button, "signature-1", "Signature");
+        group.small_menu(&signature_button, signature_icon, "Signature");
     });
     insert_band.group("Insert", |group| {
         group.menu(&templates_button, "edit-copy-symbolic", "Templates");
