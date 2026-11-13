@@ -666,16 +666,22 @@ fn compose_format_split(button: &gtk::Button, choices: &[(&str, Rc<dyn Fn()>)], 
 fn compose_format_command(button: &gtk::Button) {
     button.add_css_class("compose-format-button");
     button.add_css_class("flat");
-    button.set_size_request(28, -1);
+    button.set_size_request(28, 30);
     button.set_halign(gtk::Align::Center);
     button.set_valign(gtk::Align::Center);
     button.set_hexpand(false);
     button.set_vexpand(false);
 }
 
-fn compose_format_divider(row: &gtk::Box) {
+fn compose_format_divider(row: &gtk::Box, distribute: bool) {
     let line = gtk::Separator::new(gtk::Orientation::Vertical);
     line.add_css_class("compose-format-divider");
+    // Keep the separator itself thin. Only its surrounding gap absorbs
+    // the small difference between the natural widths of the two rows.
+    line.set_halign(gtk::Align::Center);
+    line.set_valign(gtk::Align::Center);
+    line.set_height_request(24);
+    line.set_hexpand(distribute);
     row.append(&line);
 }
 
@@ -709,11 +715,11 @@ fn compose_basic_text_block(format: &FormatControls, web: &Rc<webkit::WebView>) 
         .vexpand(false).hexpand(false).valign(gtk::Align::Fill).halign(gtk::Align::Start)
         .css_classes(["compose-format-block"]).build();
     let row = || gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
-        .spacing(2).valign(gtk::Align::Center).halign(gtk::Align::Start).build();
+        .spacing(2).valign(gtk::Align::Center).halign(gtk::Align::Fill).build();
     let top = row();
     let bottom = row();
     for (selector, width) in [(&format.font_family, 112), (&format.font_size, 64)] {
-        selector.set_size_request(width, -1);
+        selector.set_size_request(width, 30);
         selector.set_hexpand(false);
         selector.set_halign(gtk::Align::Start);
         selector.set_valign(gtk::Align::Center);
@@ -726,7 +732,7 @@ fn compose_basic_text_block(format: &FormatControls, web: &Rc<webkit::WebView>) 
     };
     append(&top, &format.font_grow);
     append(&top, &format.font_shrink);
-    compose_format_divider(&top);
+    compose_format_divider(&top, false);
     for (button, ordered, styles) in [
         (&format.bullets, false, [("Solid bullet", "disc"), ("Circle", "circle"), ("Square", "square")]),
         (&format.numbering, true, [("1, 2, 3", "decimal"), ("a, b, c", "lower-alpha"), ("i, ii, iii", "lower-roman")]),
@@ -739,13 +745,13 @@ fn compose_basic_text_block(format: &FormatControls, web: &Rc<webkit::WebView>) 
         }).collect();
         top.append(&compose_format_split(button, &choices, None));
     }
-    compose_format_divider(&top);
+    compose_format_divider(&top, false);
     append(&top, &format.clear_formatting);
 
     for button in [&format.bold, &format.italic, &format.underline] {
         append(&bottom, button);
     }
-    compose_format_divider(&bottom);
+    compose_format_divider(&bottom, true);
     compose_format_command(&format.highlight);
     let highlight_choices: Vec<(&str, Rc<dyn Fn()>)> = [
         ("Yellow", "#ffff00"), ("Green", "#00ff00"), ("Cyan", "#00ffff"),
@@ -766,6 +772,7 @@ fn compose_basic_text_block(format: &FormatControls, web: &Rc<webkit::WebView>) 
     color.set_tooltip_text(Some("Text color"));
     let color_content = gtk::Box::builder().orientation(gtk::Orientation::Vertical)
         .spacing(0).halign(gtk::Align::Center).build();
+    color_content.set_valign(gtk::Align::Center);
     color_content.append(&gtk::Label::new(Some("A")));
     let swatch = gtk::DrawingArea::builder().content_width(14).content_height(3).build();
     let source = format.color.clone();
@@ -802,11 +809,11 @@ fn compose_basic_text_block(format: &FormatControls, web: &Rc<webkit::WebView>) 
     }).collect();
     format.color.set_tooltip_text(Some("More colors"));
     bottom.append(&compose_format_split(&color, &color_choices, Some(format.color.upcast_ref())));
-    compose_format_divider(&bottom);
+    compose_format_divider(&bottom, true);
     for button in [&format.align_left, &format.align_center, &format.align_right] {
         append(&bottom, button);
     }
-    compose_format_divider(&bottom);
+    compose_format_divider(&bottom, true);
     for button in [&format.outdent, &format.indent] {
         append(&bottom, button);
     }
@@ -3630,7 +3637,21 @@ mod tests {
         }
         assert_eq!(format.highlight.parent().unwrap().parent().as_ref(), Some(&bottom));
         assert!(format.color.parent().is_some());
+        assert_eq!(top.halign(), gtk::Align::Fill);
+        assert_eq!(bottom.halign(), gtk::Align::Fill);
         assert_eq!(top.next_sibling().as_ref(), Some(&bottom));
+        // The command glyphs and selectors share one height; only
+        // inter-group gaps expand to balance the lower row.
+        assert_eq!(format.font_family.height_request(), 30);
+        assert_eq!(format.bold.height_request(), 30);
+        let mut child = bottom.first_child();
+        while let Some(widget) = child {
+            if widget.is::<gtk::Separator>() {
+                assert!(widget.property::<bool>("hexpand"));
+                assert_eq!(widget.halign(), gtk::Align::Center);
+            }
+            child = widget.next_sibling();
+        }
     }
 
     #[test]
