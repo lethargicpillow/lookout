@@ -141,14 +141,22 @@ fn stop_conversion(unit: &str) {
 /// in the mail process. Actual parsing is confined to the limited sandbox.
 fn validate_container(bytes: &[u8], kind: OfficeKind) -> Result<(), String> {
     const OLE: &[u8] = &[0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
-    let invalid = || "The attachment is not a supported Office document, or is damaged or encrypted. Use Open or Save.".to_string();
+    let invalid = || "Office preview: invalid ZIP directory or entry name. Save the original file and check whether it opens.".to_string();
     let required = match kind {
         OfficeKind::Doc | OfficeKind::Xls => {
-            return if bytes.starts_with(OLE) { Ok(()) } else { Err(invalid()) };
+            return if bytes.starts_with(OLE) { Ok(()) } else {
+                Err("Office preview: DOC/XLS attachment is not an OLE compound document. It may use a different format or have been downloaded incorrectly. Use Save to check the original.".into())
+            };
         }
         OfficeKind::Docx => "word/document.xml",
         OfficeKind::Xlsx => "xl/workbook.xml",
     };
+    if bytes.starts_with(OLE) {
+        return Err("Office preview: DOCX/XLSX has an OLE container (possibly encrypted). Use Open or Save.".into());
+    }
+    if !bytes.starts_with(b"PK") {
+        return Err(format!("Office preview: {} attachment does not contain a ZIP package ({} bytes received). Use Save to check the original.", kind.extension().to_ascii_uppercase(), bytes.len()));
+    }
     let archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|_| invalid())?;
     // Very large central directories are not useful for a preview.
     if archive.len() > 10_000 { return Err(invalid()); }
@@ -162,7 +170,9 @@ fn validate_container(bytes: &[u8], kind: OfficeKind) -> Result<(), String> {
             return Err("Macro-enabled Office documents are not supported in preview. Use Open or Save.".into());
         }
     }
-    if has_manifest && has_document { Ok(()) } else { Err(invalid()) }
+    if has_manifest && has_document { Ok(()) } else {
+        Err(format!("Office preview: ZIP package is missing {}. Use Open or Save.", if !has_manifest { "[Content_Types].xml" } else { required }))
+    }
 }
 
 fn convert(bytes: &[u8], kind: OfficeKind, cancelled: &AtomicBool) -> Result<Vec<u8>, String> {

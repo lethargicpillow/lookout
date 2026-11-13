@@ -3102,7 +3102,13 @@ async fn connect_and_run(
                     // A failed part fetch must answer the UI with
                     // `PartFetchFailed` rather than kill the whole session via
                     // `?` - one bad section shouldn't cost the connection.
-                    let fetched = if davmail_compat && part.cid.is_some() && part.content_type.starts_with("image/") {
+                    // DavMail builds MIME on demand. A section number from
+                    // our parsed RFC5322 body is not necessarily the same
+                    // section on its IMAP server. Use the original raw
+                    // message for every ordinary attachment, not just CID
+                    // images, and bypass old section-derived byte caches.
+                    // Synthetic TNEF parts have their own decoding path.
+                    let fetched = if davmail_compat && lookout_core::tnef_attachment_ref(&part.part_number).is_none() {
                         match fetch_raw_message_cached(cache, &mut session, &mailbox, uid, uidvalidity).await {
                             Ok(Some(raw)) => Ok(crate::body::find_part_in_raw(&raw, &part)),
                             Ok(None) => Ok(None),

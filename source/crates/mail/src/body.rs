@@ -230,20 +230,36 @@ fn apply_tnef(
 /// when no part matches.
 pub fn find_part_in_raw(raw: &[u8], requested: &BodyPart) -> Option<Vec<u8>> {
     let message = MessageParser::default().parse(raw)?;
-    let found = message.attachments().find(|part| match requested.cid.as_deref() {
-        Some(cid) => part.content_id().is_some_and(|candidate| lookout_core::cid_matches(cid, candidate)),
-        None => match requested.filename.as_deref() {
-            Some(name) => part.attachment_name().is_some_and(|candidate| candidate.eq_ignore_ascii_case(name)),
-            None => part.content_type().is_some_and(|candidate| {
-                let candidate_type = match candidate.subtype() {
-                    Some(sub) => format!("{}/{}", candidate.ctype(), sub),
-                    None => candidate.ctype().to_string(),
-                };
-                candidate_type.eq_ignore_ascii_case(&requested.content_type)
-            }),
-        },
-    })?;
-    Some(found.contents().to_vec())
+    let paths = part_paths(&message);
+    let mut candidates = message.attachments.iter().filter_map(|id| {
+        let part = message.parts.get(*id as usize)?;
+        let matches = match requested.cid.as_deref() {
+            Some(cid) => part.content_id().is_some_and(|candidate| lookout_core::cid_matches(cid, candidate)),
+            None => match requested.filename.as_deref() {
+                Some(name) => part.attachment_name().is_some_and(|candidate| candidate.eq_ignore_ascii_case(name)),
+                None => part.content_type().is_some_and(|candidate| {
+                    let candidate_type = match candidate.subtype() {
+                        Some(sub) => format!("{}/{}", candidate.ctype(), sub),
+                        None => candidate.ctype().to_string(),
+                    };
+                    candidate_type.eq_ignore_ascii_case(&requested.content_type)
+                }),
+            },
+        };
+        matches.then_some((id, part))
+    });
+    // A message can have several attachments with the same filename. Prefer
+    // the exact path in the parsed MIME, not the first matching name.
+    let mut first = None;
+    let mut ambiguous = false;
+    for (id, part) in candidates.by_ref() {
+        if paths.get(id).is_some_and(|path| path == &requested.part_number) {
+            return Some(part.contents().to_vec());
+        }
+        if first.is_some() { ambiguous = true; } else { first = Some(part); }
+    }
+    // A stale section path may be recovered only with an unambiguous identity.
+    if ambiguous { None } else { first.map(|part| part.contents().to_vec()) }
 }
 
 /// Rewrites every `cid:` image reference in `html` to a `data:` URI carrying
@@ -1878,6 +1894,16 @@ mod tests {
         pdf.filename = Some("doc.pdf".to_string());
         let bytes = find_part_in_raw(&raw, &pdf).expect("named part re-found in the raw message");
         assert!(bytes.starts_with(b"%PDF-"), "decoded pdf bytes, got: {bytes:?}");
+    }
+
+    #[test]
+    fn raw_attachment_duplicate_names_use_exact_mime_path() {
+        let raw = b"From: a@example.com\r\nTo: b@example.com\r\nSubject: duplicates\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\nbody\r\n--x\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=same.bin\r\nContent-Transfer-Encoding: base64\r\n\r\nZmlyc3Q=\r\n--x\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=same.bin\r\nContent-Transfer-Encoding: base64\r\n\r\nc2Vjb25k\r\n--x--\r\n";
+        let mut part = text_part("3", "application/octet-stream", None, "base64");
+        part.filename = Some("same.bin".into());
+        assert_eq!(find_part_in_raw(raw, &part).as_deref(), Some(b"second".as_slice()));
+        part.part_number = "9".into();
+        assert!(find_part_in_raw(raw, &part).is_none());
     }
 
     /// A part that genuinely isn't in the message answers `None` - the
