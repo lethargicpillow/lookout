@@ -1985,7 +1985,7 @@ pub fn refresh_directory(view: &ConfigView, accounts: &[DirectoryAccountInfo], l
 /// wired to the caller's `set_default` hook. A stored default whose
 /// signature no longer exists (a hand-edited file) is healed to "None"
 /// through the same hook.
-fn signature_default_dropdown(
+pub(crate) fn signature_default_dropdown(
     title: &str,
     subtitle: &str,
     account_id: &str,
