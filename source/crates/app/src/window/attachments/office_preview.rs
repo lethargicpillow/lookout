@@ -155,6 +155,7 @@ fn validate_container(bytes: &[u8], kind: OfficeKind) -> Result<(), String> {
     let mut has_manifest = false;
     let mut has_document = false;
     for name in archive.file_names() {
+        let name = name.map_err(|_| invalid())?;
         if name == "[Content_Types].xml" { has_manifest = true; }
         if name == required { has_document = true; }
         if name.to_ascii_lowercase().ends_with("vbaproject.bin") {
