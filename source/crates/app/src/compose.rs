@@ -17,6 +17,34 @@ use webkit::prelude::*;
 use crate::recipient_entry::{RecipientEntry, Suggestion, SuggestionSource};
 use crate::util::escape_html;
 
+/// Keep ribbon popovers scoped to the current toplevel. Reconnect the
+/// focus observer on each map because the composer can be reparented.
+fn dismiss_menu_on_window_deactivation(popover: &gtk::Popover) {
+    popover.set_autohide(true);
+    let watch: Rc<RefCell<Option<(gtk::Window, glib::SignalHandlerId)>>> = Rc::new(RefCell::new(None));
+    {
+        let watch = watch.clone();
+        popover.connect_map(move |popover| {
+            if let Some((window, handler)) = watch.borrow_mut().take() {
+                window.disconnect(handler);
+            }
+            let Some(window) = popover.root().and_downcast::<gtk::Window>() else { return };
+            let weak = popover.downgrade();
+            let handler = window.connect_notify_local(Some("is-active"), move |window, _| {
+                if !window.is_active() {
+                    if let Some(popover) = weak.upgrade() { popover.popdown(); }
+                }
+            });
+            *watch.borrow_mut() = Some((window, handler));
+        });
+    }
+    popover.connect_unmap(move |_| {
+        if let Some((window, handler)) = watch.borrow_mut().take() {
+            window.disconnect(handler);
+        }
+    });
+}
+
 /// How long the composer waits after the last check before autosaving the
 /// draft again. The autosave runs on a fixed tick and compares the current
 /// fields against the last saved snapshot, so this is the worst-case gap
@@ -1791,7 +1819,7 @@ pub fn build_compose_view(
     title: &str,
     identities_source: Rc<dyn Fn() -> Vec<Identity>>,
     signatures_source: Rc<dyn Fn() -> Vec<Signature>>,
-    manage_signatures: Option<Rc<dyn Fn()>>,
+    manage_signatures: Option<Rc<dyn Fn(&gtk::Widget)>>,
     // The global "My Templates" list (item 2.10 / C-17) and the callback that
     // jumps to the template manager in Settings. The composer's template menu
     // reads the source live on every open, like the signature menu.
@@ -2222,6 +2250,7 @@ pub fn build_compose_view(
     // A visible drop-down arrow next to the icon, like other menu buttons.
     signature_button.set_always_show_arrow(true);
     let signature_popover = gtk::Popover::new();
+    dismiss_menu_on_window_deactivation(&signature_popover);
     let signature_list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::Single).build();
     let signature_scroller = gtk::ScrolledWindow::builder()
         .child(&signature_list)
@@ -2254,10 +2283,12 @@ pub fn build_compose_view(
     {
         let manage_signatures = manage_signatures.clone();
         let signature_popover = signature_popover.clone();
+        let anchor = signature_button.downgrade();
         manage_button.connect_clicked(move |_| {
             signature_popover.popdown();
-            if let Some(manage) = &manage_signatures {
-                manage();
+            if let (Some(manage), Some(anchor)) = (manage_signatures.clone(), anchor.upgrade()) {
+                // Release the popover grab before presenting another window.
+                glib::idle_add_local_once(move || manage(anchor.upcast_ref()));
             }
         });
     }
@@ -2368,6 +2399,7 @@ pub fn build_compose_view(
         .build();
     templates_button.set_always_show_arrow(true);
     let templates_popover = gtk::Popover::new();
+    dismiss_menu_on_window_deactivation(&templates_popover);
     let templates_list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::Single).build();
     let templates_scroller = gtk::ScrolledWindow::builder()
         .child(&templates_list).min_content_width(240).max_content_width(320)
