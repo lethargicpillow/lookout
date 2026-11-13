@@ -3,6 +3,7 @@
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
 mod app_config;
+mod account_setup;
 mod assistant;
 mod assistant_tools;
 mod automatic_replies_view;
