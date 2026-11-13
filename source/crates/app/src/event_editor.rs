@@ -795,7 +795,9 @@ pub fn show_event_editor(
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&top_bar);
     toolbar_view.set_content(Some(&editor_stack));
-    dialog.set_content(Some(&toolbar_view));
+    let card_host = gtk::Overlay::builder().child(&toolbar_view).build();
+    crate::profile_card::prepare_host(&card_host);
+    dialog.set_content(Some(&card_host));
 
     // --- Prefill text fields from the edited occurrence.
     if let Some(occ) = &existing {

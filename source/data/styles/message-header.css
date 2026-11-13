@@ -39,3 +39,12 @@
     padding: 5px 8px;
 }
 .message-command-row button:hover { background-color: alpha(@view_fg_color, 0.16); }
+
+/* Contact cards are normal overlay children of their owning window. */
+.profile-card-panel {
+    background-color: @popover_bg_color;
+    color: @popover_fg_color;
+    border: 1px solid @lookout-panel-border;
+    border-radius: 12px;
+    box-shadow: 0 2px 8px alpha(black, 0.3);
+}

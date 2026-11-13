@@ -1,4 +1,4 @@
-//! The profile card (Phase 4.2 / P-10, UX-67): a popover showing a person's
+//! The profile card (Phase 4.2 / P-10, UX-67): an in-window overlay showing a person's
 //! contact details, their recent mail, upcoming shared events and a small set
 //! of actions, opened by hovering or clicking a person reference - the
 //! reading-pane sender, a conversation card's sender, an event editor's
@@ -16,7 +16,7 @@
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -112,99 +112,268 @@ pub fn shared_upcoming_events(occurrences: &[EventOccurrence], address: &str, no
     upcoming
 }
 
-/// Attaches the profile-card trigger to `widget`: a click opens the card
-/// immediately, and hovering for [`HOVER_DELAY_MS`] opens it too. `resolve`
-/// is consulted lazily at event time (so recycled list rows and WebView
-/// callbacks always describe the right person), returning the address and the
-/// account the reference belongs to; `context` is consulted lazily too, so a
-/// trigger can be installed before the window's [`ProfileCardContext`] is
-/// ready (the message-list rows are built before the calendar state exists).
+/// How long the pointer can travel between a trigger and its card.
+const HOVER_CLOSE_DELAY_MS: u64 = 150;
+pub type HoverEnabled = Rc<dyn Fn() -> bool>;
+type CardSlot = Rc<RefCell<Option<gtk::Widget>>>;
+type TimerSlot = Rc<RefCell<Option<glib::SourceId>>>;
+
+/// At most one contact card at a time. The card is an ordinary child of
+/// the owning window's overlay: no GtkPopover, GdkPopup, native window,
+/// keyboard grab or independent stacking order.
+struct CardPlacement {
+    panel: glib::WeakRef<gtk::Widget>,
+    anchor: glib::WeakRef<gtk::Widget>,
+    point: Option<(f64, f64)>,
+}
+
+thread_local! {
+    static CARD_PLACEMENT: RefCell<Option<CardPlacement>> = const { RefCell::new(None) };
+}
+
+fn current_panel() -> Option<gtk::Widget> {
+    CARD_PLACEMENT.with(|slot| slot.borrow().as_ref().and_then(|card| card.panel.upgrade()))
+}
+
+fn close_panel(panel: &gtk::Widget) {
+    CARD_PLACEMENT.with(|slot| {
+        let matches = slot.borrow().as_ref().and_then(|card| card.panel.upgrade())
+            .is_some_and(|current| current == *panel);
+        if matches { slot.borrow_mut().take(); }
+    });
+    panel.set_visible(false);
+    if let Some(host) = panel.parent().and_downcast::<gtk::Overlay>() {
+        host.remove_overlay(panel);
+    }
+}
+
+fn close_current_card() {
+    if let Some(panel) = current_panel() { close_panel(&panel); }
+}
+
+pub(crate) fn dismiss_for_window(window: &gtk::Window) {
+    if let Some(panel) = current_panel() {
+        if crate::window_input::owner_window(&panel).as_ref() == Some(window) {
+            close_panel(&panel);
+        }
+    }
+}
+
+fn dismiss_slot(active: &CardSlot, timer: &TimerSlot) {
+    cancel_timer(timer);
+    let previous = active.borrow_mut().take();
+    if let Some(previous) = previous { close_panel(&previous); }
+}
+
+/// Installs a non-measuring, clipped card layer on a window's existing
+/// overlay. Other overlay children keep their existing allocation rules.
+pub(crate) fn prepare_host(host: &gtk::Overlay) {
+    if host.has_css_class("profile-card-host") { return; }
+    host.add_css_class("profile-card-host");
+    host.connect_get_child_position(|host, child| {
+        if !child.has_css_class("profile-card-panel") { return None; }
+        let (anchor, point) = CARD_PLACEMENT.with(|slot| {
+            let slot = slot.borrow();
+            let placement = slot.as_ref()?;
+            if placement.panel.upgrade().as_ref() != Some(child) { return None; }
+            Some((placement.anchor.upgrade()?, placement.point))
+        })?;
+        let bounds = anchor.compute_bounds(host)?;
+        let width = host.width().max(1);
+        let height = host.height().max(1);
+        let w = child.measure(gtk::Orientation::Horizontal, -1).1
+            .clamp(320, 520).min(width).max(1);
+        let h = child.measure(gtk::Orientation::Vertical, w).1
+            .clamp(1, 560).min(height).max(1);
+        let (x, top, bottom) = match point {
+            Some((x, y)) => {
+                let px = bounds.x() as f64 + x;
+                let py = bounds.y() as f64 + y;
+                (px as i32, py as i32, py as i32)
+            }
+            None => (bounds.x().floor() as i32, bounds.y().floor() as i32,
+                (bounds.y() + bounds.height()).ceil() as i32),
+        };
+        let x = x.clamp(0, width - w);
+        // No gap: the pointer can enter the card before the hover-close
+        // grace expires, even on a small display.
+        let y = if bottom + h <= height { bottom } else { top - h };
+        Some(gtk::gdk::Rectangle::new(x, y.clamp(0, height - h), w, h))
+    });
+
+    // Outside presses dismiss without claiming the event: clicking another
+    // message still selects it, and a press on a card action reaches it.
+    let clicks = gtk::GestureClick::new();
+    clicks.set_button(0);
+    clicks.set_propagation_phase(gtk::PropagationPhase::Capture);
+    clicks.connect_pressed(|gesture, _, x, y| {
+        let Some(host) = gesture.widget().and_downcast::<gtk::Overlay>() else { return };
+        let Some(panel) = current_panel() else { return };
+        if panel.parent().as_ref() != Some(host.upcast_ref::<gtk::Widget>()) { return; }
+        let inside = panel.compute_bounds(&host).is_some_and(|r|
+            x >= r.x() as f64 && y >= r.y() as f64
+            && x < (r.x() + r.width()) as f64 && y < (r.y() + r.height()) as f64);
+        if !inside { close_panel(&panel); }
+    });
+    host.add_controller(clicks);
+    host.connect_unmap(|host| {
+        if let Some(panel) = current_panel() {
+            if panel.parent().as_ref() == Some(host.upcast_ref::<gtk::Widget>()) {
+                close_panel(&panel);
+            }
+        }
+    });
+}
+
+fn find_host(anchor: &gtk::Widget) -> Option<gtk::Overlay> {
+    let mut current = Some(anchor.clone());
+    while let Some(widget) = current {
+        if widget.has_css_class("profile-card-host") {
+            return widget.downcast::<gtk::Overlay>().ok();
+        }
+        current = widget.parent();
+    }
+    None
+}
+
+/// A label can occupy the entire available column while only a small
+/// portion contains the sender's name. Test the visible Pango ink bounds,
+/// not the allocation. Avatar triggers intentionally use their full circle.
+fn trigger_contains(widget: &gtk::Widget, x: f64, y: f64) -> bool {
+    if x < 0.0 || y < 0.0 || x >= widget.width() as f64 || y >= widget.height() as f64 {
+        return false;
+    }
+    let Some(label) = widget.downcast_ref::<gtk::Label>() else { return true };
+    if label.has_css_class("avatar-circle") { return true; }
+    let (ink, _) = label.layout().pixel_extents();
+    let (ox, oy) = label.layout_offsets();
+    let left = (ox + ink.x() - 3) as f64;
+    let right = (ox + ink.x() + ink.width() + 3) as f64;
+    let top = (oy + ink.y() - 3) as f64;
+    let bottom = (oy + ink.y() + ink.height() + 3) as f64;
+    ink.width() > 0 && ink.height() > 0 && x >= left && x < right && y >= top && y < bottom
+}
+
+/// Track entry into the actual contact hit area even if the pointer was
+/// already inside the label's wider allocation.
+fn track_trigger(widget: &gtk::Widget, enter: Rc<dyn Fn()>, leave: Rc<dyn Fn()>) {
+    let inside = Rc::new(Cell::new(false));
+    let motion = gtk::EventControllerMotion::new();
+    let update: Rc<dyn Fn(f64, f64)> = {
+        let weak = widget.downgrade();
+        let inside = inside.clone();
+        let leave = leave.clone();
+        Rc::new(move |x, y| {
+            let hit = weak.upgrade().is_some_and(|widget| trigger_contains(&widget, x, y));
+            if inside.replace(hit) != hit {
+                if hit { enter(); } else { leave(); }
+            }
+        })
+    };
+    {
+        let update = update.clone();
+        motion.connect_enter(move |_, x, y| update(x, y));
+    }
+    motion.connect_motion(move |_, x, y| update(x, y));
+    motion.connect_leave(move |_| {
+        if inside.replace(false) { leave(); }
+    });
+    widget.add_controller(motion);
+}
+
+fn close_after_leave(active: &CardSlot, timer: &TimerSlot) {
+    if active.borrow().is_some() {
+        let active = active.clone();
+        let timer_for_close = timer.clone();
+        arm_timer(timer, std::time::Duration::from_millis(HOVER_CLOSE_DELAY_MS),
+            move || dismiss_slot(&active, &timer_for_close));
+    } else {
+        cancel_timer(timer);
+    }
+}
+
+fn attach_card_motion(panel: &gtk::Widget, active: &CardSlot, timer: &TimerSlot) {
+    let motion = gtk::EventControllerMotion::new();
+    {
+        let timer = timer.clone();
+        motion.connect_enter(move |_, _, _| cancel_timer(&timer));
+    }
+    {
+        let active = active.clone();
+        let timer = timer.clone();
+        motion.connect_leave(move |_| close_after_leave(&active, &timer));
+    }
+    panel.add_controller(motion);
+}
+
+/// Explicit contact references (header sender, attendee chip): a click or a
+/// short hover on the actual name/avatar opens the shared non-native card.
 pub fn attach_person_trigger<W: IsA<gtk::Widget>>(context: ContextProvider, widget: &W, claim_press: bool, resolve: PersonResolver) {
     let widget = widget.clone().upcast::<gtk::Widget>();
-    let active: Rc<RefCell<Option<gtk::Popover>>> = Rc::new(RefCell::new(None));
-    let timer: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
-
-    // Click opens straight away. On the reading-pane header the press is
-    // claimed (there's nothing beneath to select); on list rows it is left
-    // unclaimed so the row still selects and drags as usual.
+    let active: CardSlot = Rc::new(RefCell::new(None));
+    let timer: TimerSlot = Rc::new(RefCell::new(None));
     let click = gtk::GestureClick::new();
     click.set_button(gtk::gdk::BUTTON_PRIMARY);
     {
         let context = context.clone();
-        let widget = widget.clone();
+        let weak = widget.downgrade();
         let resolve = resolve.clone();
         let active = active.clone();
         let timer = timer.clone();
-        click.connect_pressed(move |gesture, _n, _x, _y| {
-            if claim_press {
-                gesture.set_state(gtk::EventSequenceState::Claimed);
-            }
+        click.connect_pressed(move |gesture, _, x, y| {
+            let Some(widget) = weak.upgrade() else { return };
+            if !trigger_contains(&widget, x, y) || !crate::window_input::accepts_input(&widget) { return; }
+            if claim_press { gesture.set_state(gtk::EventSequenceState::Claimed); }
             cancel_timer(&timer);
-            show_card(&context, &widget, &resolve, &active, true);
+            if let Some(panel) = show_card(&context, &widget, &resolve, &active) {
+                attach_card_motion(&panel, &active, &timer);
+            }
         });
     }
     widget.add_controller(click);
 
-    // Hover opens after a short rest; leaving cancels the pending open.
-    let motion = gtk::EventControllerMotion::new();
-    {
+    let enter: Rc<dyn Fn()> = {
         let context = context.clone();
-        let widget = widget.clone();
+        let weak = widget.downgrade();
         let resolve = resolve.clone();
         let active = active.clone();
         let timer = timer.clone();
-        motion.connect_enter(move |_, _x, _y| {
-            if active.borrow().is_some() {
-                return;
-            }
-            let context = context.clone();
-            let widget = widget.clone();
-            let resolve = resolve.clone();
-            let active = active.clone();
+        Rc::new(move || {
+            cancel_timer(&timer);
+            if active.borrow().is_some() { return; }
+            let (context, weak, resolve, active, timer_for_open) =
+                (context.clone(), weak.clone(), resolve.clone(), active.clone(), timer.clone());
             arm_timer(&timer, std::time::Duration::from_millis(HOVER_DELAY_MS), move || {
-                show_card(&context, &widget, &resolve, &active, true);
+                let Some(widget) = weak.upgrade() else { return };
+                if let Some(panel) = show_card(&context, &widget, &resolve, &active) {
+                    attach_card_motion(&panel, &active, &timer_for_open);
+                }
             });
-        });
-    }
-    {
+        })
+    };
+    let leave: Rc<dyn Fn()> = {
+        let active = active.clone();
         let timer = timer.clone();
-        motion.connect_leave(move |_| cancel_timer(&timer));
-    }
-    widget.add_controller(motion);
+        Rc::new(move || close_after_leave(&active, &timer))
+    };
+    track_trigger(&widget, enter, leave);
+    widget.connect_unmap(move |_| dismiss_slot(&active, &timer));
 }
 
-/// How long a hover card stays up after the pointer leaves its trigger, so
-/// the pointer can cross the gap onto the card and use its actions.
-const HOVER_CLOSE_DELAY_MS: u64 = 150;
-
-/// Whether a hover trigger may open the card right now.
-pub type HoverEnabled = Rc<dyn Fn() -> bool>;
-
-/// A hover-only profile card for one message-list row. Clicks are left
-/// entirely to the row (selecting, opening and dragging the message): no
-/// trigger claims a press, the card never takes an input grab (it isn't
-/// autohide), and any press on the row closes it. The pointer can move from
-/// the trigger onto the card; leaving both closes it after
-/// [`HOVER_CLOSE_DELAY_MS`].
-///
-/// One `PersonHover` serves every trigger in a row (avatar, sender name), so
-/// the row shows at most one card. `Clone` is cheap and shares that state.
+/// Hover-only contact card for a message row. The row keeps its own click
+/// and keyboard selection; the card is a sibling at the window level.
 #[derive(Clone)]
 pub struct PersonHover {
     context: ContextProvider,
     resolve: PersonResolver,
-    active: Rc<RefCell<Option<gtk::Popover>>>,
-    /// The pending open or close; only one is ever outstanding.
-    timer: Rc<RefCell<Option<glib::SourceId>>>,
+    active: CardSlot,
+    timer: TimerSlot,
 }
 
 impl PersonHover {
-    /// Creates the row's hover state and watches `row` for presses, which
-    /// close the card without being claimed or consumed.
     pub fn new<R: IsA<gtk::Widget>>(context: ContextProvider, row: &R, resolve: PersonResolver) -> Self {
-        let hover = PersonHover {
-            context,
-            resolve,
+        let hover = Self {
+            context, resolve,
             active: Rc::new(RefCell::new(None)),
             timer: Rc::new(RefCell::new(None)),
         };
@@ -213,15 +382,7 @@ impl PersonHover {
         {
             let hover = hover.clone();
             presses.connect_event(move |_, event| {
-                if event.event_type() == gtk::gdk::EventType::ButtonPress {
-                    // The card is a child of a trigger in this row, so a press
-                    // on one of its actions may pass through here too: leave
-                    // those to the action instead of closing the card.
-                    let on_card = hover.active.borrow().as_ref().is_some_and(|card| event.surface() == card.surface());
-                    if !on_card {
-                        hover.close();
-                    }
-                }
+                if event.event_type() == gtk::gdk::EventType::ButtonPress { hover.close(); }
                 glib::Propagation::Proceed
             });
         }
@@ -229,84 +390,45 @@ impl PersonHover {
         hover
     }
 
-    /// Makes `widget` a hover trigger: resting on it for [`HOVER_DELAY_MS`]
-    /// opens the card when `enabled` says so.
     pub fn add_trigger<W: IsA<gtk::Widget>>(&self, widget: &W, enabled: HoverEnabled) {
         let widget = widget.clone().upcast::<gtk::Widget>();
-        let motion = gtk::EventControllerMotion::new();
-        {
+        let enter: Rc<dyn Fn()> = {
             let hover = self.clone();
-            let widget = widget.clone();
-            motion.connect_enter(move |_, _x, _y| {
-                // Returning to a trigger cancels a pending close.
+            let weak = widget.downgrade();
+            Rc::new(move || {
                 cancel_timer(&hover.timer);
-                if hover.active.borrow().is_some() || !enabled() {
-                    return;
-                }
+                if hover.active.borrow().is_some() || !enabled() { return; }
                 let opener = hover.clone();
-                let widget = widget.clone();
-                arm_timer(&hover.timer, std::time::Duration::from_millis(HOVER_DELAY_MS), move || opener.open(&widget));
-            });
-        }
-        {
+                let weak = weak.clone();
+                arm_timer(&hover.timer, std::time::Duration::from_millis(HOVER_DELAY_MS), move || {
+                    if let Some(widget) = weak.upgrade() { opener.open(&widget); }
+                });
+            })
+        };
+        let leave: Rc<dyn Fn()> = {
             let hover = self.clone();
-            motion.connect_leave(move |_| hover.leave());
-        }
-        widget.add_controller(motion);
+            Rc::new(move || close_after_leave(&hover.active, &hover.timer))
+        };
+        track_trigger(&widget, enter, leave);
         let hover = self.clone();
         widget.connect_unmap(move |_| hover.close());
     }
 
-    /// Closes the card and drops any pending open or close. Called when the
-    /// row is pressed or rebound to another message.
-    pub fn close(&self) {
-        cancel_timer(&self.timer);
-        let previous = self.active.borrow_mut().take();
-        if let Some(previous) = previous {
-            previous.popdown();
-        }
-    }
+    pub fn close(&self) { dismiss_slot(&self.active, &self.timer); }
 
-    /// The open card, if any (tests).
     #[cfg(test)]
-    pub(crate) fn card(&self) -> Option<gtk::Popover> {
-        self.active.borrow().clone()
-    }
-
-    /// The pointer left a trigger or the card: close after a short grace
-    /// period if a card is up, otherwise just drop the pending open.
-    fn leave(&self) {
-        if self.active.borrow().is_some() {
-            let closer = self.clone();
-            arm_timer(&self.timer, std::time::Duration::from_millis(HOVER_CLOSE_DELAY_MS), move || closer.close());
-        } else {
-            cancel_timer(&self.timer);
-        }
-    }
+    pub(crate) fn card(&self) -> Option<gtk::Widget> { self.active.borrow().clone() }
 
     fn open(&self, widget: &gtk::Widget) {
-        show_card(&self.context, widget, &self.resolve, &self.active, false);
-        let card = self.active.borrow().clone();
-        if let Some(card) = card {
-            let motion = gtk::EventControllerMotion::new();
-            {
-                let timer = self.timer.clone();
-                motion.connect_enter(move |_, _x, _y| cancel_timer(&timer));
-            }
-            {
-                let hover = self.clone();
-                motion.connect_leave(move |_| hover.leave());
-            }
-            card.add_controller(motion);
+        if let Some(panel) = show_card(&self.context, widget, &self.resolve, &self.active) {
+            attach_card_motion(&panel, &self.active, &self.timer);
         }
     }
 }
 
-/// Arms the hover-open timer in `timer`, replacing any pending one. The
-/// callback clears the slot before running `f`: once a one-shot source has
-/// fired GLib has destroyed it, and a later `cancel_timer` removing that stale
-/// id would panic in the (non-unwindable) GTK signal trampoline.
-fn arm_timer(timer: &Rc<RefCell<Option<glib::SourceId>>>, delay: std::time::Duration, f: impl FnOnce() + 'static) {
+/// Clear the timer slot before calling its one-shot callback. A fired GLib
+/// source must not subsequently be removed with its stale SourceId.
+fn arm_timer(timer: &TimerSlot, delay: std::time::Duration, f: impl FnOnce() + 'static) {
     cancel_timer(timer);
     let slot = timer.clone();
     let src = glib::timeout_add_local_once(delay, move || {
@@ -316,53 +438,53 @@ fn arm_timer(timer: &Rc<RefCell<Option<glib::SourceId>>>, delay: std::time::Dura
     *timer.borrow_mut() = Some(src);
 }
 
-/// Cancels a pending hover-open timer, if any.
-fn cancel_timer(timer: &Rc<RefCell<Option<glib::SourceId>>>) {
-    if let Some(src) = timer.borrow_mut().take() {
-        src.remove();
-    }
+fn cancel_timer(timer: &TimerSlot) {
+    if let Some(src) = timer.borrow_mut().take() { src.remove(); }
 }
 
-/// Closes any open card and shows a fresh one anchored to `widget`. An
-/// `autohide` card takes an input grab and closes on an outside click; a
-/// hover card ([`PersonHover`]) doesn't, so it never eats a row's click.
-fn show_card(context: &ContextProvider, widget: &gtk::Widget, resolve: &PersonResolver, active: &Rc<RefCell<Option<gtk::Popover>>>, autohide: bool) {
-    // Drop the previous card first. Take it out before pulling it down:
-    // popdown emits `closed`, whose handler borrows the slot and unparents
-    // the card itself.
-    let previous = active.borrow_mut().take();
-    if let Some(previous) = previous {
-        previous.popdown();
-    }
-    let Some(ctx) = context() else { return };
-    let Some((address, account_id)) = resolve() else { return };
+fn show_card(context: &ContextProvider, widget: &gtk::Widget, resolve: &PersonResolver, active: &CardSlot) -> Option<gtk::Widget> {
+    if !crate::window_input::accepts_input(widget) || !widget.is_mapped() { return None; }
+    let ctx = context()?;
+    let (address, account_id) = resolve()?;
+    show_overlay_card(&ctx, widget, &address, account_id.as_ref(), None, active)
+}
 
-    let popover = gtk::Popover::builder().autohide(autohide).has_arrow(true).build();
-    let content = build_card(&ctx, &address, account_id.as_ref());
-    let scroller = gtk::ScrolledWindow::builder()
+fn show_overlay_card(ctx: &ProfileCardContext, anchor: &gtk::Widget, address: &EmailAddress,
+    account_id: Option<&AccountId>, point: Option<(f64, f64)>, active: &CardSlot) -> Option<gtk::Widget> {
+    if !crate::window_input::accepts_input(anchor) || !anchor.is_mapped() { return None; }
+    let host = find_host(anchor)?;
+    close_current_card();
+    let previous = active.borrow_mut().take();
+    if let Some(previous) = previous { close_panel(&previous); }
+    let content = build_card(ctx, address, account_id);
+    let panel: gtk::Widget = gtk::ScrolledWindow::builder()
         .child(&content)
         .propagate_natural_height(true)
         .propagate_natural_width(true)
         .max_content_height(560)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .build();
-    popover.set_child(Some(&scroller));
-    popover.set_parent(widget);
+        .max_content_width(520)
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .halign(gtk::Align::Start)
+        .valign(gtk::Align::Start)
+        .css_classes(["profile-card-panel"])
+        .build().upcast();
     {
         let active = active.clone();
-        popover.connect_closed(move |p| {
-            p.unparent();
+        panel.connect_unmap(move |panel| {
             let mut slot = active.borrow_mut();
-            // Compare the objects, not the Rust handles: `p` is a fresh
-            // wrapper, so a pointer comparison never matched and the slot
-            // stayed full, which stopped hover from ever reopening the card.
-            if slot.as_ref().is_some_and(|current| current == p) {
-                *slot = None;
-            }
+            if slot.as_ref() == Some(panel) { *slot = None; }
         });
     }
-    popover.popup();
-    *active.borrow_mut() = Some(popover);
+    CARD_PLACEMENT.with(|slot| *slot.borrow_mut() = Some(CardPlacement {
+        panel: panel.downgrade(), anchor: anchor.downgrade(), point,
+    }));
+    *active.borrow_mut() = Some(panel.clone());
+    host.add_overlay(&panel);
+    host.set_measure_overlay(&panel, false);
+    host.set_clip_overlay(&panel, true);
+    panel.set_visible(true);
+    host.queue_allocate();
+    Some(panel)
 }
 
 /// Builds the card's contents for one person.
@@ -480,7 +602,7 @@ fn build_actions(ctx: &ProfileCardContext, address: &EmailAddress, has_contact: 
         let actions = ctx.actions.clone();
         let address = address.clone();
         let account_id = account_id.clone();
-        send.connect_clicked(move |_| (actions.send_email)(&address, account_id.clone()));
+        send.connect_clicked(move |_| { close_current_card(); (actions.send_email)(&address, account_id.clone()); });
     }
     row.append(&send);
 
@@ -488,7 +610,7 @@ fn build_actions(ctx: &ProfileCardContext, address: &EmailAddress, has_contact: 
     {
         let actions = ctx.actions.clone();
         let address = address.clone();
-        schedule.connect_clicked(move |_| (actions.schedule_meeting)(&address));
+        schedule.connect_clicked(move |_| { close_current_card(); (actions.schedule_meeting)(&address); });
     }
     row.append(&schedule);
 
@@ -497,7 +619,7 @@ fn build_actions(ctx: &ProfileCardContext, address: &EmailAddress, has_contact: 
         {
             let actions = ctx.actions.clone();
             let address = address.clone();
-            edit.connect_clicked(move |_| (actions.edit_contact)(&address));
+            edit.connect_clicked(move |_| { close_current_card(); (actions.edit_contact)(&address); });
         }
         row.append(&edit);
     } else {
@@ -505,7 +627,7 @@ fn build_actions(ctx: &ProfileCardContext, address: &EmailAddress, has_contact: 
         {
             let actions = ctx.actions.clone();
             let address = address.clone();
-            add.connect_clicked(move |_| (actions.add_contact)(&address));
+            add.connect_clicked(move |_| { close_current_card(); (actions.add_contact)(&address); });
         }
         row.append(&add);
     }
@@ -582,8 +704,8 @@ fn message_row(actions: &ProfileCardActions, message: &EmailSummary) -> gtk::Wid
     crate::privacy::mark_content(&button);
     let actions = actions.clone();
     let message = message.clone();
-    button.connect_clicked(move |_| (actions.open_message)(&message));
-    // Close the popover after the message opens.
+    button.connect_clicked(move |_| { close_current_card(); (actions.open_message)(&message); });
+    // The card closes before switching to the selected message.
     button.upcast()
 }
 
@@ -611,7 +733,7 @@ fn event_row(ctx: &ProfileCardContext, occ: &EventOccurrence) -> gtk::Widget {
     crate::privacy::mark_content(&button);
     let actions = ctx.actions.clone();
     let occ = occ.clone();
-    button.connect_clicked(move |_| (actions.open_event)(&occ));
+    button.connect_clicked(move |_| { close_current_card(); (actions.open_event)(&occ); });
     button.upcast()
 }
 
@@ -656,37 +778,13 @@ fn avatar_widget(size: i32) -> (gtk::Overlay, gtk::Label, gtk::Picture) {
     (overlay, label, picture)
 }
 
-/// Shows the card anchored at a point inside `anchor` (window-relative
-/// `(x, y)`) - the conversation WebView's route, where a person reference
-/// posts its click coordinates rather than being a GTK widget of its own.
-/// The open card is parked in a thread-local so it survives until the next
-/// call (GTK's `set_parent` does not take ownership).
+/// The conversation WebView sends coordinates for the sender reference.
+/// Use the same window-local overlay as GTK contact labels, never a
+/// detached popover anchored to a separate WebKit native surface.
 pub fn show_person_card_at(context: ContextProvider, anchor: &impl IsA<gtk::Widget>, address: &EmailAddress, account_id: Option<AccountId>, x: f64, y: f64) {
-    thread_local! {
-        static DETACHED_CARD: RefCell<Option<gtk::Popover>> = const { RefCell::new(None) };
-    }
-    DETACHED_CARD.with(|slot| {
-        let previous = slot.borrow_mut().take();
-        if let Some(previous) = previous {
-            previous.popdown();
-            previous.unparent();
-        }
-    });
     let Some(ctx) = context() else { return };
-    let popover = gtk::Popover::builder().autohide(true).has_arrow(true).build();
-    let content = build_card(&ctx, address, account_id.as_ref());
-    let scroller = gtk::ScrolledWindow::builder()
-        .child(&content)
-        .propagate_natural_height(true)
-        .propagate_natural_width(true)
-        .max_content_height(560)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .build();
-    popover.set_child(Some(&scroller));
-    popover.set_parent(&anchor.clone().upcast::<gtk::Widget>());
-    popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-    popover.popup();
-    DETACHED_CARD.with(|slot| *slot.borrow_mut() = Some(popover));
+    let active = Rc::new(RefCell::new(None));
+    let _ = show_overlay_card(&ctx, anchor.as_ref(), address, account_id.as_ref(), Some((x, y)), &active);
 }
 
 #[cfg(test)]

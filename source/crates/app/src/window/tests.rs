@@ -3377,10 +3377,15 @@ fn message_row_hover_card_is_non_modal_and_closes_and_reopens() {
     let avatar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     avatar.set_size_request(32, 32);
     let sender = gtk::Label::new(Some("Alice"));
+    sender.set_xalign(0.0);
+    sender.set_hexpand(true);
+    sender.set_size_request(240, -1);
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     row.append(&avatar);
     row.append(&sender);
-    let window = gtk::Window::builder().child(&row).build();
+    let host = gtk::Overlay::builder().child(&row).build();
+    crate::profile_card::prepare_host(&host);
+    let window = gtk::Window::builder().default_width(600).default_height(360).child(&host).build();
     let hover = crate::profile_card::PersonHover::new(
         Rc::new(move || Some(context.clone())),
         &row,
@@ -3397,7 +3402,15 @@ fn message_row_hover_card_is_non_modal_and_closes_and_reopens() {
             .find_map(|i| controllers.item(i)?.downcast::<gtk::EventControllerMotion>().ok())
             .unwrap()
     };
-    let enter = |motion: &gtk::EventControllerMotion| motion.emit_by_name::<()>("enter", &[&0.0_f64, &0.0_f64]);
+    let enter = |motion: &gtk::EventControllerMotion| {
+        let widget = motion.widget().unwrap();
+        let (x, y) = if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+            let (ink, _) = label.layout().pixel_extents();
+            let (ox, oy) = label.layout_offsets();
+            ((ox + ink.x() + ink.width() / 2) as f64, (oy + ink.y() + ink.height() / 2) as f64)
+        } else { (widget.width() as f64 / 2.0, widget.height() as f64 / 2.0) };
+        motion.emit_by_name::<()>("enter", &[&x, &y]);
+    };
     let leave = |motion: &gtk::EventControllerMotion| motion.emit_by_name::<()>("leave", &[]);
     let wait = |ms| glib::MainContext::default().block_on(glib::timeout_future(std::time::Duration::from_millis(ms)));
     window.present();
@@ -3428,7 +3441,8 @@ fn message_row_hover_card_is_non_modal_and_closes_and_reopens() {
     wait(450);
     let card = hover.card().expect("resting on the avatar opens the card");
     assert!(card.is_visible());
-    assert!(!card.is_autohide(), "hover must not grab input from the message list");
+    assert!(!card.is::<gtk::Popover>(), "the card must not create a native popup");
+    assert_eq!(card.parent().as_ref(), Some(host.upcast_ref::<gtk::Widget>()));
 
     // Returning to the avatar cancels a pending dismissal.
     leave(&avatar_motion);
@@ -3438,7 +3452,7 @@ fn message_row_hover_card_is_non_modal_and_closes_and_reopens() {
 
     // Crossing onto the card keeps its actions reachable; leaving it closes.
     leave(&avatar_motion);
-    let card_motion = motion_for(card.upcast_ref());
+    let card_motion = motion_for(&card);
     enter(&card_motion);
     wait(250);
     assert!(card.is_visible());
@@ -3462,10 +3476,22 @@ fn message_row_hover_card_is_non_modal_and_closes_and_reopens() {
     // With no avatar (sender images off, Select mode) the name takes over.
     avatar.set_visible(false);
     wait(50);
-    enter(&sender_motion);
+    let blank_x = (sender.width() - 2) as f64;
+    let blank_y = sender.height() as f64 / 2.0;
+    sender_motion.emit_by_name::<()>("enter", &[&blank_x, &blank_y]);
     wait(450);
-    let card = hover.card().expect("the name opens the card when no avatar shows");
-    assert!(card.parent().is_some_and(|parent| parent == sender));
+    assert!(hover.card().is_none(), "blank width in a sender column is not a contact trigger");
+    let (ink, _) = sender.layout().pixel_extents();
+    let (ox, oy) = sender.layout_offsets();
+    let text_x = (ox + ink.x() + ink.width() / 2) as f64;
+    let text_y = (oy + ink.y() + ink.height() / 2) as f64;
+    sender_motion.emit_by_name::<()>("motion", &[&text_x, &text_y]);
+    wait(450);
+    let card = hover.card().expect("moving onto the actual name opens the card");
+    assert_eq!(card.parent().as_ref(), Some(host.upcast_ref::<gtk::Widget>()));
+    crate::window_input::dismiss_transients(&window);
+    assert!(!card.is_visible());
+    assert!(hover.card().is_none());
     window.destroy();
     wait(50);
 }

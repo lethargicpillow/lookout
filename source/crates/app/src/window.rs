@@ -6320,6 +6320,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     toast_overlay.set_vexpand(true);
 
     let window_overlay = gtk::Overlay::new();
+    crate::profile_card::prepare_host(&window_overlay);
     window_overlay.set_child(Some(&background));
     // The dimming layer between the background image and the app content:
     // an opaque-black widget whose opacity (1 - brightness) darkens a

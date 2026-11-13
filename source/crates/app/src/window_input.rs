@@ -52,6 +52,7 @@ fn collect_transients(widget: &gtk::Widget, popovers: &mut Vec<gtk::Popover>, pa
 }
 
 pub(crate) fn dismiss_transients(window: &gtk::Window) {
+    crate::profile_card::dismiss_for_window(window);
     let mut popovers = Vec::new();
     let mut panels = Vec::new();
     collect_transients(window.upcast_ref(), &mut popovers, &mut panels);
