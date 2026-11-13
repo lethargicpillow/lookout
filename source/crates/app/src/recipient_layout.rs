@@ -53,7 +53,9 @@ fn widths(children: &[gtk::Widget]) -> (i32, i32, Vec<i32>, i32) {
             natural = natural.saturating_add(w).saturating_add(GAP);
         }
     }
-    (minimum, natural.min(NATURAL_CAP).max(minimum), chip_widths, editor_min)
+    // Keep the unwrapped width for unconstrained height measurement. The
+    // horizontal preferred width is capped separately in WidgetImpl.
+    (minimum, natural.max(minimum), chip_widths, editor_min)
 }
 
 struct Plan {
@@ -108,10 +110,13 @@ mod imp {
             let children = children(widget.upcast_ref());
             let (min, nat, _, _) = widths(&children);
             if orientation == gtk::Orientation::Horizontal {
-                (min, nat, -1, -1)
+                (min, nat.min(NATURAL_CAP).max(min), -1, -1)
             } else {
-                // Unconstrained natural height uses natural width, not the
-                // narrowest possible width (which would force extra rows).
+                // An unconstrained vertical query is the lower height bound
+                // used by GtkBoxLayout before it distributes actual width.
+                // It must fit a single line, even when preferred horizontal
+                // width is capped. Otherwise GtkBox can report min > nat
+                // on a wide allocation and reserve an empty second row.
                 let width = if for_size < 0 { nat } else { for_size.max(1) };
                 let h = plan(&children, width).height;
                 (h, h, -1, -1)
@@ -188,6 +193,35 @@ mod tests {
         assert_eq!(narrow[2], Slot { x: 0, row: 1, width: 375 });
         let wider = pack(&[120, 150], 100, 500);
         assert_eq!(wider[2].row, 0);
+    }
+
+    #[test]
+    fn unconstrained_height_does_not_reserve_a_wrapped_line() {
+        if !crate::gtk_test::gtk_ready() { return; }
+        let editor = gtk::Text::builder().hexpand(true).build();
+        let surface = InlineRecipients::new(&editor);
+        surface.set_hexpand(true);
+        let chips: Vec<gtk::Widget> = (0..3).map(|_| {
+            gtk::Label::builder().label("Recipient").width_request(260)
+                .height_request(30).build().upcast()
+        }).collect();
+        surface.replace_chips(&editor, &chips);
+        let (min_width, natural_width, _, _) = surface.measure(gtk::Orientation::Horizontal, -1);
+        assert!(natural_width <= NATURAL_CAP.max(min_width));
+        let (base_min, base_nat, _, _) = surface.measure(gtk::Orientation::Vertical, -1);
+        let (wide_min, wide_nat, _, _) = surface.measure(gtk::Orientation::Vertical, 1150);
+        assert_eq!((base_min, base_nat), (wide_min, wide_nat));
+        assert!(surface.measure(gtk::Orientation::Vertical, 500).0 > wide_min);
+
+        // Reproduce the actual composer hierarchy: a fixed label/button
+        // beside the expanding surface. A wide parent must not reserve the
+        // height of the layout at the capped preferred width.
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        header.append(&gtk::Button::builder().label("To…").width_request(56).build());
+        header.append(&surface);
+        let (min, nat, _, _) = header.measure(gtk::Orientation::Vertical, 1228);
+        assert_eq!(min, nat);
+        assert!(min < 2 * wide_min + ROW_GAP);
     }
 
     #[test]
