@@ -115,6 +115,17 @@ pub(crate) fn request_body_fetch(
 ) {
     let (cmd_tx, cache, uidvalidity) = {
         let st = state.borrow();
+        if st.pending_optimistic_removals.get(&mailbox)
+            .is_some_and(|rows| rows.iter().any(|row| row.uid == uid)) {
+            tracing::debug!(?mailbox, uid = uid.0, "FetchBody: skipped optimistically removed message");
+            drop(st);
+            // The selection handler can have staged this request before
+            // invoking us; clear only that same request, not another row.
+            if state.borrow().pending_body_request.as_ref() == Some(&(mailbox.clone(), uid)) {
+                clear_body_fetch_state(state, reading_stack);
+            }
+            return;
+        }
         let Some(account_id) = mailbox_account_id(&mailbox) else { return };
         let Some(handle) = st.accounts.get(&account_id) else { return };
         let uidvalidity = handle.folders.iter().find(|f| f.id == mailbox).map(|f| f.uidvalidity).unwrap_or(UidValidity(0));

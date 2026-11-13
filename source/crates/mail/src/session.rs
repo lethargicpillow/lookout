@@ -1642,7 +1642,7 @@ pub async fn run_account_session(
     // A separate, ordered draft lane survives primary IMAP reconnects.
     let draft_jobs = if davmail_saves_sent(&config.imap, &config.smtp) {
         let (tx, rx) = async_channel::unbounded();
-        tokio::spawn(run_davmail_draft_worker(config.clone(), credentials.clone(), events.clone(), offline_rx.clone(), rx));
+        tokio::spawn(run_davmail_draft_worker(config.clone(), credentials.clone(), events.clone(), offline_rx.clone(), rx, idle_notify_tx.clone()));
         Some(tx)
     } else { None };
     // Keep DavMail preview downloads on a separate connection, never on
@@ -2529,6 +2529,10 @@ async fn connect_and_run(
                                         Ok(cmd) => Wake::Command(cmd),
                                         Err(_) => Wake::ChannelClosed,
                                     },
+                                    m = idle_notify.recv() => match m {
+                                        Ok(mailbox_id) => Wake::IdlePush(mailbox_id),
+                                        Err(_) => Wake::Idle(Ok(async_imap::extensions::idle::IdleResponse::Timeout)),
+                                    },
                                     changed = offline_rx.changed() => match changed {
                                         Ok(()) if *offline_rx.borrow() => Wake::Offline,
                                         Ok(()) => Wake::Idle(Ok(async_imap::extensions::idle::IdleResponse::Timeout)),
@@ -2767,9 +2771,12 @@ async fn connect_and_run(
                     // the server to catch this connection's view up first.
                     // Only needed when the sync will skip its own SELECT
                     // (which refreshes the view anyway).
-                    if session_selected == current_mailbox_id {
+                    if !davmail_compat && session_selected == current_mailbox_id {
                         session.noop().await?;
                     }
+                    // A DavMail draft worker uses a different connection.
+                    // Refresh the selected mailbox's view before trusting its
+                    // membership; NOOP alone is not enough on this bridge.
                     sync_mailbox(
                         &mut session,
                         &account_id,
@@ -2779,7 +2786,7 @@ async fn connect_and_run(
                         cache,
                         &mut folders,
                         interactive_commands,
-                        Some(&session_selected),
+                        if davmail_compat { None } else { Some(&session_selected) },
                         condstore,
                         qresync,
                         local_focus,
@@ -2982,7 +2989,46 @@ async fn connect_and_run(
                     // a deliberate cache-miss sentinel: no row can match 0.
                     let uidvalidity = folders.iter().find(|m| m.id == mailbox).map(|m| m.uidvalidity).unwrap_or(UidValidity(0));
                     let started = std::time::Instant::now();
-                    let bodies = fetch_bodies_on_demand(cache, &mut session, &mailbox, uidvalidity, &uids, davmail_compat).await?;
+                    let mut bodies = fetch_bodies_on_demand(cache, &mut session, &mailbox, uidvalidity, &uids, davmail_compat).await?;
+                    // An empty FETCH is not a MIME parser failure. It may
+                    // mean the selected view predates an expunge, or the
+                    // requested UID really vanished. Re-select once and
+                    // distinguish those cases before retrying.
+                    let missing: Vec<Uid> = uids.iter().copied()
+                        .filter(|uid| !bodies.iter().any(|(found, _)| found == uid)).collect();
+                    if davmail_compat && !missing.is_empty() {
+                        let meta = session.select(&path).await?;
+                        let fresh_validity = UidValidity(meta.uid_validity.unwrap_or(0));
+                        let changed = uidvalidity.0 != 0 && fresh_validity != uidvalidity;
+                        let present = if changed { Vec::new() }
+                            else { uids_still_present(&mut session, &missing).await? };
+                        let vanished: Vec<Uid> = missing.iter().copied()
+                            .filter(|uid| !present.contains(uid)).collect();
+                        tracing::debug!(?mailbox, ?missing, ?present, ?vanished, changed,
+                            "FetchBody: DavMail UID recheck after fresh SELECT");
+                        if changed {
+                            // Old UIDs must never resolve to new messages.
+                            bodies.clear();
+                        } else if !present.is_empty() {
+                            let retry = fetch_bodies_on_demand(cache, &mut session, &mailbox,
+                                fresh_validity, &present, true).await?;
+                            bodies.extend(retry);
+                        }
+                        if changed || !vanished.is_empty() {
+                            tracing::debug!(?mailbox, ?vanished, "FetchBody: refreshing mailbox after stale UID");
+                            sync_mailbox(&mut session, &account_id, &path, &mailbox,
+                                events, cache, &mut folders, interactive_commands,
+                                None, condstore, qresync, local_focus, davmail_compat).await?;
+                            session_selected = mailbox.clone();
+                            dirty_mailboxes.remove(&mailbox);
+                        }
+                        for uid in present {
+                            if !bodies.iter().any(|(found, _)| *found == uid) {
+                                tracing::warn!(?mailbox, uid = uid.0,
+                                    "DavMail UID exists but body unavailable after fresh SELECT and retry");
+                            }
+                        }
+                    }
                     tracing::debug!(
                         ?mailbox,
                         requested = uids.len(),
@@ -6778,6 +6824,7 @@ async fn run_davmail_draft_worker(
     events: async_channel::Sender<AccountEvent>,
     offline: tokio::sync::watch::Receiver<bool>,
     jobs: async_channel::Receiver<DavmailDraftJob>,
+    changed: async_channel::Sender<MailboxId>,
 ) {
     while let Ok(job) = jobs.recv().await {
         match job {
@@ -6804,6 +6851,16 @@ async fn run_davmail_draft_worker(
                             Ok(()) => tracing::debug!("DavMail draft cleanup completed"),
                             Err(e) => tracing::warn!("DavMail draft cleanup failed: {e}"),
                         }
+                        // APPEND landed even if cleanup timed out. A count
+                        // can stay constant across a replacement, so STATUS
+                        // alone cannot detect that the old UID was replaced.
+                        let _ = changed.try_send(MailboxId(format!("{}:{}", config.account_id.0, saved.path)));
+                        if let Some((source, _)) = &saved.source {
+                            let _ = changed.try_send(MailboxId(format!("{}:{}", config.account_id.0, source)));
+                        }
+                        if let Some(trash) = folders.iter().find(|f| f.role == MailboxRole::Trash) {
+                            let _ = changed.try_send(trash.id.clone());
+                        }
                     }
                     failure => {
                         let detail = match failure {
@@ -6828,6 +6885,11 @@ async fn run_davmail_draft_worker(
                 match result {
                     Ok(()) => tracing::debug!("send pipeline: isolated draft deleted"),
                     Err(e) => tracing::warn!("DavMail draft delete failed: {e}"),
+                }
+                // A timeout can be ambiguous (STORE may already have
+                // landed). Re-read membership even in that case.
+                for folder in folders.iter().filter(|f| matches!(f.role, MailboxRole::Drafts | MailboxRole::Trash)) {
+                    let _ = changed.try_send(folder.id.clone());
                 }
             }
         }

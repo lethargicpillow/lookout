@@ -29,13 +29,18 @@ pub(crate) fn optimistic_remove_messages(state: &Rc<RefCell<UiState>>, message_l
     if removed.is_empty() {
         return;
     }
+    // Publish the removal marker before repopulating: GTK emits selection
+    // changes synchronously during the splice. A stale row must not start
+    // another body fetch while the optimistic removal is being applied.
+    {
+        let mut st = state.borrow_mut();
+        if let Some(snapshot) = st.unified_snapshots.get_mut(mailbox) {
+            snapshot.retain(|m| !uids.contains(&m.uid));
+        }
+        st.pending_optimistic_removals.entry(mailbox.clone()).or_default().extend(removed);
+    }
     let (key, descending) = current_sort(state);
     message_list.repopulate(kept, key, descending);
-    let mut st = state.borrow_mut();
-    if let Some(snapshot) = st.unified_snapshots.get_mut(mailbox) {
-        snapshot.retain(|m| !uids.contains(&m.uid));
-    }
-    st.pending_optimistic_removals.entry(mailbox.clone()).or_default().extend(removed);
 }
 
 /// Undoes `optimistic_remove_messages` for `mailbox`/`uids` after an
