@@ -31,7 +31,7 @@ paned > separator {
 }
 .window-toolbars-background {
     background-color: @lookout-toolbar-band;
-    border: 1px solid alpha(@window_fg_color, 0.09);
+    border: 1px solid @lookout-panel-border;
     border-radius: 6px;
 }
 .window-icon-toolbar-background {
@@ -64,7 +64,7 @@ paned > separator {
 /* The vertical folder/calendar splitter is deliberately visible and easy to grab. */
 .folder-calendar-split > separator {
     background-color: transparent;
-    border-top: 1px solid alpha(@view_fg_color, 0.16);
+    border-top: 1px solid @lookout-panel-border;
     min-height: 5px;
     min-width: 1px;
 }
@@ -78,4 +78,5 @@ paned > separator {
 .workspace-pane.card,
 .workspace-pane.calendar-main-background {
     border-radius: 6px;
+    border: 1px solid @lookout-panel-border;
 }

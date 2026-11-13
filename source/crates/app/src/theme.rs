@@ -204,7 +204,7 @@ mod tests {
         assert!(bundled_css("base.css").contains("lookout-pane-bg"));
         assert!(bundled_css("flat-dark.css").contains("lookout-unread"));
         assert!(bundled_css("flat-light.css").contains("lookout-pane-bg"));
-        assert!(bundled_css("flat-light.css").contains("lookout-pane-bg @view_bg_color"));
+        assert!(bundled_css("flat-light.css").contains("lookout-pane-bg #ffffff"));
         assert!(bundled_css("no-such.css").is_empty());
     }
 

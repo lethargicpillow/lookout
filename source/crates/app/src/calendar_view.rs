@@ -71,9 +71,9 @@ const ALL_DAY_BAND_HEIGHT: f64 = 26.0;
 /// themes alike. The business-hours stripe...
 const GRID_BUSINESS_ALPHA: f64 = 0.06;
 /// ...the hour and column hairlines...
-const GRID_LINE_ALPHA: f64 = 0.06;
+const GRID_LINE_ALPHA: f64 = 0.22;
 /// ...the dim-label gutter text...
-const GRID_DIM_TEXT_ALPHA: f64 = 0.6;
+const GRID_DIM_TEXT_ALPHA: f64 = 0.78;
 /// ...and the highlighted slot range's fill and outline.
 const GRID_SELECTION_FILL_ALPHA: f64 = 0.14;
 const GRID_SELECTION_STROKE_ALPHA: f64 = 0.3;
@@ -269,11 +269,11 @@ pub struct MonthGrid {
 
 fn build_month_grid(week_start: chrono::Weekday, on_context: &PendingContext) -> MonthGrid {
     let week_start = Rc::new(Cell::new(week_start));
-    let header_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(1).homogeneous(true).build();
+    let header_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(0).homogeneous(true).build();
     let mut weekday_labels = Vec::with_capacity(7);
     for label in ordered_weekday_labels(week_start.get()) {
-        let weekday_label = gtk::Label::builder().label(label).css_classes(["dim-label", "caption-heading"]).build();
-        let cell = gtk::Box::builder().css_classes(["calendar-day-cell"]).hexpand(true).build();
+        let weekday_label = gtk::Label::builder().label(label).xalign(0.0).css_classes(["calendar-weekday-label"]).build();
+        let cell = gtk::Box::builder().css_classes(["calendar-weekday-cell"]).hexpand(true).build();
         cell.append(&weekday_label);
         header_row.append(&cell);
         weekday_labels.push(weekday_label);
@@ -282,8 +282,8 @@ fn build_month_grid(week_start: chrono::Weekday, on_context: &PendingContext) ->
     let grid = gtk::Grid::builder()
         .row_homogeneous(true)
         .column_homogeneous(true)
-        .row_spacing(1)
-        .column_spacing(1)
+        .row_spacing(0)
+        .column_spacing(0)
         .vexpand(true)
         .hexpand(true)
         .build();
@@ -300,7 +300,7 @@ fn build_month_grid(week_start: chrono::Weekday, on_context: &PendingContext) ->
     for index in 0..42usize {
         let row = index / 7;
         let col = index % 7;
-        let date_label = gtk::Label::builder().xalign(0.0).margin_start(4).margin_top(2).css_classes(["caption"]).build();
+        let date_label = gtk::Label::builder().xalign(0.0).margin_start(6).margin_top(4).margin_bottom(3).css_classes(["calendar-date-label"]).build();
         let events_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(1).vexpand(true).build();
         let container = gtk::Box::builder().orientation(gtk::Orientation::Vertical).css_classes(["calendar-day-cell"]).build();
         container.append(&date_label);
@@ -356,7 +356,7 @@ fn build_month_grid(week_start: chrono::Weekday, on_context: &PendingContext) ->
         });
     }
 
-    let root_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(1).vexpand(true).hexpand(true).build();
+    let root_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(0).vexpand(true).hexpand(true).build();
     root_box.append(&header_row);
     root_box.append(&grid);
 
@@ -443,9 +443,9 @@ pub fn set_month(mg: &MonthGrid, month: NaiveDate) {
         clear_children(&cell.events_box);
 
         if date.month() == month.month() {
-            cell.container.remove_css_class("dim-label");
+            cell.container.remove_css_class("calendar-outside-month");
         } else {
-            cell.container.add_css_class("dim-label");
+            cell.container.add_css_class("calendar-outside-month");
         }
         if date == today {
             cell.date_label.add_css_class("accent");
@@ -3433,7 +3433,7 @@ pub fn build_main(prefs: &crate::settings::CalendarPreferences) -> CalendarMain 
     let week_start = prefs.week_start;
     crate::style::install();
 
-    let header_label = gtk::Label::builder().css_classes(["title-2"]).hexpand(true).xalign(0.0).build();
+    let header_label = gtk::Label::builder().css_classes(["calendar-navigation-title"]).hexpand(true).xalign(0.0).build();
     let prev_button = gtk::Button::from_icon_name("go-previous-symbolic");
     let next_button = gtk::Button::from_icon_name("go-next-symbolic");
     let today_button = gtk::Button::builder().label("Today").build();
@@ -3452,10 +3452,11 @@ pub fn build_main(prefs: &crate::settings::CalendarPreferences) -> CalendarMain 
     let month_button = gtk::MenuButton::builder()
         .popover(&month_popover)
         .child(&header_label)
-        .css_classes(["calendar-toggle"])
+        .always_show_arrow(true)
+        .css_classes(["calendar-navigation-month"])
         .build();
 
-    let normal_header = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
+    let normal_header = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["calendar-navigation"]).build();
     normal_header.append(&today_button);
     normal_header.append(&prev_button);
     normal_header.append(&next_button);
@@ -4771,12 +4772,12 @@ fn draw_calendar_indicator(cr: &gtk::cairo::Context, width: i32, height: i32, co
 fn calendar_color_css(color: &str) -> String {
     let hex = color.trim_start_matches('#');
     format!(
-        ".calendar-event-{hex} {{ background-color: alpha({color}, 0.30); border-left: 5px solid {color}; border-radius: 3px; padding: 1px 4px; }}\n\
+        ".calendar-event-{hex} {{ background-color: alpha({color}, 0.23); border: 1px solid alpha({color}, 0.65); border-left: 4px solid {color}; border-radius: 3px; padding: 2px 4px; }}\n\
          .calendar-event-{hex}.calendar-show-tentative {{ background-color: alpha({color}, 0.16); border-left: 5px dashed {color}; }}\n\
          .calendar-event-{hex}.calendar-show-working-elsewhere {{ background-color: alpha({color}, 0.22); border-left: 5px dotted {color}; }}\n\
          .calendar-event-{hex}.calendar-show-free {{ background-color: transparent; border: 1px solid alpha({color}, 0.7); border-left: 5px solid {color}; }}\n\
          .calendar-event-{hex}.calendar-show-oof {{ background-color: alpha(#7b2cbf, 0.30); border-left: 5px solid #7b2cbf; }}\n\
-         .calendar-event-{hex}.calendar-event-cancelled {{ opacity: 0.6; }}\n"
+         .calendar-event-{hex}.calendar-event-cancelled {{ opacity: 0.8; }}\n"
     )
 }
 

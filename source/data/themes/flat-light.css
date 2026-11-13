@@ -2,18 +2,18 @@
    black translucency and become theme-coloured translucency, the fixed dark
    bands become theme-coloured, and the fixed status hues shift darker so
    they keep contrast on light backgrounds. */
-@define-color lookout-pane-bg @view_bg_color;
-@define-color lookout-toolbar-band @theme_bg_color;
-@define-color lookout-icon-toolbar-bg #f1f2f4;
-@define-color lookout-header-search-bg @theme_base_color;
-@define-color lookout-section-header-bg alpha(@theme_bg_color, 0.9);
-@define-color lookout-column-header-bg alpha(@theme_bg_color, 0.85);
+@define-color lookout-pane-bg #ffffff;
+@define-color lookout-toolbar-band #e5e7ea;
+@define-color lookout-icon-toolbar-bg #edf0f3;
+@define-color lookout-header-search-bg #ffffff;
+@define-color lookout-section-header-bg #edf0f3;
+@define-color lookout-column-header-bg #e9edf1;
 @define-color lookout-subject @theme_fg_color;
 @define-color lookout-muted #565b64;
-@define-color lookout-column-header-fg alpha(@theme_fg_color, 0.55);
-@define-color lookout-row-separator alpha(@theme_fg_color, 0.1);
+@define-color lookout-column-header-fg #404954;
+@define-color lookout-row-separator #cbd1d8;
 @define-color lookout-subject-bar-bg alpha(@theme_fg_color, 0.04);
-@define-color lookout-subject-bar-border alpha(@theme_fg_color, 0.08);
+@define-color lookout-subject-bar-border #c0c7cf;
 @define-color lookout-thread-row-bg alpha(@theme_fg_color, 0.04);
 @define-color lookout-thread-count-bg alpha(@theme_fg_color, 0.08);
 
@@ -32,5 +32,11 @@
 @define-color lookout-icon-red #ad4b51;
 @define-color lookout-icon-amber #967131;
 
-@define-color lookout-ribbon-divider #b9bec5;
+@define-color lookout-ribbon-divider #aeb6c0;
 @define-color lookout-ribbon-caption #4d525a;
+
+@define-color lookout-panel-border #b6bec8;
+@define-color lookout-calendar-grid #c1c8d0;
+@define-color lookout-calendar-header #edf0f3;
+@define-color lookout-calendar-outside #f1f3f5;
+@define-color lookout-calendar-event-text #242b35;

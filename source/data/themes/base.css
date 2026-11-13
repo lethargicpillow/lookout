@@ -111,3 +111,10 @@
 
 @define-color lookout-ribbon-divider alpha(@view_fg_color, 0.26);
 @define-color lookout-ribbon-caption alpha(@view_fg_color, 0.82);
+
+/* Structural lines are separate from text opacity. */
+@define-color lookout-panel-border alpha(@view_fg_color, 0.22);
+@define-color lookout-calendar-grid alpha(@view_fg_color, 0.22);
+@define-color lookout-calendar-header @headerbar_bg_color;
+@define-color lookout-calendar-outside alpha(@view_fg_color, 0.035);
+@define-color lookout-calendar-event-text @view_fg_color;

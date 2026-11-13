@@ -4718,9 +4718,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             themed_icon_name(&["view-calendar-month-symbolic", "x-office-calendar-symbolic"]),
             "Month",
         );
-        group.small_toggle(&schedule_view_button, themed_icon_name(&["view-list-symbolic", "x-office-calendar-symbolic"]), "Schedule");
-        group.small_toggle(&split_view_button, themed_icon_name(&["view-dual-symbolic", "sidebar-show-right-symbolic"]), "Split view");
-        group.small_toggle(&list_view_button, themed_icon_name(&["view-list-symbolic"]), "List");
+        group.toggle(&schedule_view_button, themed_icon_name(&["view-list-symbolic", "x-office-calendar-symbolic"]), "Schedule");
+        group.toggle(&split_view_button, themed_icon_name(&["view-dual-symbolic", "sidebar-show-right-symbolic"]), "Split view");
+        group.toggle(&list_view_button, themed_icon_name(&["view-list-symbolic"]), "List");
     });
     calendar_band.group("Filter", |group| {
         group.button(&filter_button, "edit-find-symbolic", "Filter");

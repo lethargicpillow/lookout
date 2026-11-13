@@ -440,7 +440,18 @@ pub(crate) fn show_composer_in_reading_pane_full(
             // A header bar of its own is what gives the window a drag
             // region - a bare `adw::Window` has none (the People pop-out
             // needed the same, see 0.8.0).
-            let win = adw::Window::builder().default_width(1000).default_height(720).build();
+            // Start wide enough to show the complete Message ribbon. The
+            // toolbar's natural width includes the active commands; a safe
+            // fallback covers the usual 7 groups if the scroller reports 0.
+            let ribbon_width = handle.editor_toolbar.measure(gtk::Orientation::Horizontal, -1).1;
+            let target_width = (ribbon_width + 40).max(1320);
+            let (screen_width, screen_height) = handle.widget.display().monitors().item(0)
+                .and_downcast::<gtk::gdk::Monitor>()
+                .map(|monitor| { let rect = monitor.geometry(); (rect.width(), rect.height()) })
+                .unwrap_or((1920, 1080));
+            let width = target_width.min((screen_width - 80).max(640));
+            let height = 800.min((screen_height - 100).max(480));
+            let win = adw::Window::builder().default_width(width).default_height(height).build();
             let header = adw::HeaderBar::new();
             header.set_title_widget(Some(&adw::WindowTitle::new(&title, "")));
             // A normal title bar contains only the window title and window controls.

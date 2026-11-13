@@ -20,3 +20,9 @@
 
 @define-color lookout-ribbon-divider #4b4d53;
 @define-color lookout-ribbon-caption #c4c6cd;
+
+@define-color lookout-panel-border #44464c;
+@define-color lookout-calendar-grid #41434a;
+@define-color lookout-calendar-header #2b2c30;
+@define-color lookout-calendar-outside #202124;
+@define-color lookout-calendar-event-text #e1e3e9;
