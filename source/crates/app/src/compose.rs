@@ -2946,10 +2946,26 @@ pub fn build_compose_view(
         .build();
     content.add_css_class("compose-workspace");
     content.append(&editor_toolbar);
-    content.append(&fields_group);
+    // The address/attachment area is naturally sized for ordinary messages,
+    // but must not make the toplevel's minimum height grow with every chip
+    // or every wrapped row. Keep the body editor reachable in short windows.
+    let envelope = gtk::Box::builder().orientation(gtk::Orientation::Vertical)
+        .hexpand(true).build();
+    envelope.append(&fields_group);
     attachment_flow.set_margin_start(8);
     attachment_flow.set_margin_end(8);
-    content.append(&attachment_flow);
+    envelope.append(&attachment_flow);
+    let envelope_scroller = gtk::ScrolledWindow::builder()
+        .child(&envelope)
+        .hexpand(true)
+        .vexpand(false)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .min_content_height(72)
+        .max_content_height(240)
+        .propagate_natural_height(true)
+        .build();
+    content.append(&envelope_scroller);
     body_stack.set_margin_start(8);
     body_stack.set_margin_end(8);
     body_stack.set_margin_bottom(8);
