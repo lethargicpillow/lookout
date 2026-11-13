@@ -20,7 +20,6 @@
 /// Software released under the GPL3 license
 use gtk::gdk;
 use adw::prelude::*;
-use webkit::prelude::*;
 
 /// Theme ids as stored in GSettings `theme-id`; also the file names under
 /// `data/themes/` (with `.css` appended) except `system`, which is
@@ -126,35 +125,14 @@ fn accent_css(hex: &str) -> String {
     )
 }
 
-/// Preserve the original transparent canvas when the application's own
-/// surface is dark. Only a light application needs an opaque dark fallback;
-/// reuse the bundled graphite pane colour rather than inventing a palette.
-fn page_canvas_for(dark: bool, app_dark: bool) -> gdk::RGBA {
-    match (dark, app_dark) {
-        (false, _) => gdk::RGBA::new(1.0, 1.0, 1.0, 1.0),
-        (true, true) => gdk::RGBA::new(0.0, 0.0, 0.0, 0.0),
-        (true, false) => gdk::RGBA::new(37.0 / 255.0, 38.0 / 255.0, 41.0 / 255.0, 1.0),
-    }
-}
-
+/// The approved graphite page surface (#252629) is independent of the
+/// application's theme. The WebView canvas is outside the body filter.
 pub(crate) fn page_canvas(dark: bool) -> gdk::RGBA {
-    page_canvas_for(dark, adw::StyleManager::default().is_dark())
-}
-
-/// The global page switch is independent of the application's scheme, but
-/// a live scheme change must update the canvas even if the switch is unchanged.
-pub(crate) fn bind_page_canvas(view: &webkit::WebView) {
-    let manager = adw::StyleManager::default();
-    let weak = view.downgrade();
-    let handler = manager.connect_dark_notify(move |_| {
-        if let Some(view) = weak.upgrade() {
-            view.set_background_color(&page_canvas(crate::settings::page_dark()));
-        }
-    });
-    let handler = std::cell::Cell::new(Some(handler));
-    view.connect_destroy(move |_| {
-        if let Some(handler) = handler.take() { manager.disconnect(handler); }
-    });
+    if dark {
+        gdk::RGBA::new(37.0 / 255.0, 38.0 / 255.0, 41.0 / 255.0, 1.0)
+    } else {
+        gdk::RGBA::new(1.0, 1.0, 1.0, 1.0)
+    }
 }
 
 /// Parses a stored accent (`accent-color` GSettings value: a CSS colour
@@ -201,14 +179,10 @@ mod tests {
     }
 
     #[test]
-    fn page_canvas_preserves_native_dark_surface_and_only_fills_light_app() {
-        let transparent = page_canvas_for(true, true);
-        assert_eq!(transparent.alpha(), 0.0);
-        let fallback = page_canvas_for(true, false);
-        assert_eq!(fallback.alpha(), 1.0);
-        assert!((fallback.red() - 37.0 / 255.0).abs() < 0.001);
-        assert_eq!(page_canvas_for(false, true), gdk::RGBA::new(1.0, 1.0, 1.0, 1.0));
-        assert_eq!(page_canvas_for(false, false), gdk::RGBA::new(1.0, 1.0, 1.0, 1.0));
+    fn page_canvas_matches_the_approved_graphite_and_white() {
+        let dark = page_canvas(true);
+        assert_eq!(dark, gdk::RGBA::new(37.0 / 255.0, 38.0 / 255.0, 41.0 / 255.0, 1.0));
+        assert_eq!(page_canvas(false), gdk::RGBA::new(1.0, 1.0, 1.0, 1.0));
     }
 
     #[test]

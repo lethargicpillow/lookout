@@ -438,7 +438,7 @@ pub(crate) fn lay_out_conversation(ctx: &ConversationContext, generation: u64, o
         }
     }
     let opened: Vec<(MailboxId, Uid)> = cards.iter().filter(|c| c.expanded && c.member.summary.is_unread()).map(|c| c.key()).collect();
-    let html = view::build_document(&cards, chrono::Utc::now(), dark, adw::StyleManager::default().is_dark());
+    let html = view::build_document(&cards, chrono::Utc::now(), dark);
     {
         let mut st = state.borrow_mut();
         st.conversation_inline_parts = inline_parts;
@@ -843,21 +843,6 @@ pub(crate) fn build_conversation_ui(ctx: &ConversationContext, reading_stack: &g
         .hexpand(true)
         .vexpand(true)
         .build();
-    {
-        let manager = adw::StyleManager::default();
-        let weak = web_view.downgrade();
-        let handler = manager.connect_dark_notify(move |manager| {
-            let Some(view) = weak.upgrade() else { return };
-            let script = format!("document.body && document.body.classList.toggle('light-app', {})", !manager.is_dark());
-            glib::spawn_future_local(async move {
-                let _ = view.evaluate_javascript_future(&script, None, None).await;
-            });
-        });
-        let handler = Cell::new(Some(handler));
-        web_view.connect_destroy(move |_| {
-            if let Some(handler) = handler.take() { manager.disconnect(handler); }
-        });
-    }
     // The conversation's message cards are HTML; "All text" blur covers the
     // whole view.
     crate::privacy::mark_blur_all(&web_view);

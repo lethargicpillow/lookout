@@ -870,46 +870,30 @@ pub(crate) const ATTACHMENT_FETCH_TIMEOUT_MS: u64 = 60_000;
 /// would freeze the UI on click.
 pub(crate) const EVENT_CHANNEL_CAPACITY: usize = 64;
 
-/// The "Switch message theme" toggle's stylesheet, injected as a WebKit
-/// *user* style sheet into the reading pane's WebView: it strips whatever
-/// background colour the email itself defines so the app theme's background
-/// shows through instead, and inverts the document's colours so the content
-/// still reads against that (mostly darker) theme background. `html`/`body`
-/// covers the page background proper (inline styles, `<style>` blocks, or
-/// `<body bgcolor>`), while the attribute selectors catch the legacy
-/// `bgcolor`/`background` attributes Outlook-style clients plaster onto
-/// wrapper tables and cells - the common full-bleed case that an
-/// `html, body` override alone would miss. Deliberate backgrounds on content
-/// (code blocks, quoted sections) are left alone. The `!important` is what
-/// wins: user-level `!important` outranks both author `!important` and
-/// inline styles in the cascade, so no email CSS can fight the override.
-/// Injected at the user level so it applies to the already loaded document
-/// the moment the toggle flips (plus a re-render, see the toggle's handler),
-/// and applies to every `load_html` while it's armed.
-///
-/// The inversion is the standard reader-mode trick: `filter: invert()`
-/// flips the whole document (dark text becomes light, coloured headings and
-/// links keep a readable hue via the compensating `hue-rotate`), then media
-/// elements are inverted a second time so photos and inline graphics render
-/// as themselves instead of negatives. Because the email's own backgrounds
-/// are gone above, only the text and any remaining accent colours invert -
-/// against the app theme's background, which is untouched by the page's
-/// filter.
+/// Dark reading/editor stylesheet. The document root owns the graphite
+/// background; only the body content is inverted. Filtering the HTML root
+/// also inverted WebKit's canvas on a light application surface, turning the
+/// approved dark background into light grey. Keep the canvas and root out of
+/// the filter, and counter-invert images as before.
 pub(crate) const MESSAGE_THEME_OVERRIDE_CSS: &str = "\
-html, body {
-    background-color: transparent !important;
-    background-image: none !important;
-}
-*[bgcolor] {
-    background-color: transparent !important;
-}
-*[background] {
-    background-image: none !important;
-}
 html {
-    filter: invert(1) hue-rotate(180deg);
+    background-color: #252629 !important;
+    background-image: none !important;
+    color-scheme: light !important;
+    filter: none !important;
 }
-html img, html picture, html video, html svg, html canvas {
+body {
+    background-color: transparent !important;
+    background-image: none !important;
+    filter: invert(1) hue-rotate(180deg) !important;
+}
+body[bgcolor], body *[bgcolor] {
+    background-color: transparent !important;
+}
+body[background], body *[background] {
+    background-image: none !important;
+}
+body img, body picture, body video, body svg, body canvas {
     filter: invert(1) hue-rotate(180deg);
 }
 ";

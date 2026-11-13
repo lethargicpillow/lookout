@@ -1293,10 +1293,9 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, F
         .hardware_acceleration_policy(webkit::HardwareAccelerationPolicy::Never)
         .build();
     let web_view = Rc::new(webkit::WebView::builder().editable(true).settings(&settings).web_context(&compose_web_context()).build());
-    crate::theme::bind_page_canvas(web_view.as_ref());
-    // A transparent canvas, so the pane's own (possibly translucent)
-    // background shows through instead of WebKit's default white.
-    web_view.set_background_color(&gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0));
+    // The page canvas follows the shared reading/editor switch, not the
+    // surrounding application theme.
+    web_view.set_background_color(&crate::theme::page_canvas(crate::settings::page_dark()));
     // The draft body is editable HTML; "All text" mode blurs the whole view.
     crate::privacy::mark_blur_all(web_view.as_ref());
     // Ctrl+scroll / Ctrl+± zoom on the composer (item 1.20 / M-37).
@@ -3403,7 +3402,14 @@ mod tests {
         let dark_open = format!(r#"<style id="{DARK_VIEW_STYLE_ID}" media="all">"#);
         let start = doc.find(&dark_open).expect("the dark-view style element");
         let dark = &doc[start..];
-        assert!(dark[..dark.find("</style>").unwrap()].contains(crate::window::MESSAGE_THEME_OVERRIDE_CSS));
+        let style = &dark[..dark.find("</style>").unwrap()];
+        assert!(style.contains(crate::window::MESSAGE_THEME_OVERRIDE_CSS));
+        let root_rule = style.split("html {").nth(1).unwrap().split('}').next().unwrap();
+        let body_rule = style.split("body {").nth(1).unwrap().split('}').next().unwrap();
+        assert!(root_rule.contains("background-color: #252629"));
+        assert!(root_rule.contains("filter: none"));
+        assert!(!root_rule.contains("invert("));
+        assert!(body_rule.contains("filter: invert(1) hue-rotate(180deg)"));
         assert!(!doc.contains("prefers-color-scheme"));
         // No fixed light text colour that a dark inline colour would override.
         assert!(!doc.contains("#f0f0f2"));

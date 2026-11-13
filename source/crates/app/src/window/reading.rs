@@ -800,10 +800,8 @@ pub(crate) fn set_message_theme_armed(enabled: bool, web_view: &webkit::WebView,
     user_content_manager.remove_style_sheet(theme_override_sheet);
     if enabled {
         user_content_manager.add_style_sheet(theme_override_sheet);
-        web_view.set_background_color(&crate::theme::page_canvas(true));
-    } else {
-        web_view.set_background_color(&gtk::gdk::RGBA::new(1.0, 1.0, 1.0, 1.0));
     }
+    web_view.set_background_color(&crate::theme::page_canvas(enabled));
 }
 
 /// Re-renders the message currently selected in the message list onto the
