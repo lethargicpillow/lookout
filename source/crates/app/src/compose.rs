@@ -1858,7 +1858,7 @@ pub fn build_compose_view(
         let button = gtk::Button::builder()
             .label(format!("{label}…"))
             .width_request(56)
-            .valign(gtk::Align::Start)
+            .valign(gtk::Align::Fill)
             .tooltip_text(format!("Select {label} recipients from address book"))
             .css_classes(["compose-picker-button"])
             .build();
@@ -1938,8 +1938,8 @@ pub fn build_compose_view(
         }
     }
 
-    // Keep the recipient form independent of Subject. Send stays at the
-    // top beside the addresses, even when recipient chips wrap.
+    // One address form, with Send spanning the recipient and Subject
+    // rows. Optional fields stay hidden.
     let fields_group = gtk::Grid::builder().row_spacing(3).column_spacing(8).hexpand(true).vexpand(false).valign(gtk::Align::Start).css_classes(["compose-fields"]).build();
     let address_form = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(3).hexpand(true).build();
     for row in [&to_row, &cc_row, &bcc_row] { row.widget().set_hexpand(true); }
@@ -1956,7 +1956,7 @@ pub fn build_compose_view(
     address_labels.add_widget(&subject_label);
     subject_line.append(&subject_label);
     subject_line.append(&subject_row);
-    fields_group.attach(&subject_line, 1, 1, 1, 1);
+    address_form.append(&subject_line);
 
     // --- Attachments: a canonical in-session list, rendered as removable
     // chips below the fields, same repopulate-from-truth shape
@@ -2875,11 +2875,10 @@ pub fn build_compose_view(
     send_content.append(&send_icon);
     send_content.append(&gtk::Label::new(Some("Send")));
     send_button.set_child(Some(&send_content));
-    send_button.set_size_request(68, 64);
-    send_button.set_valign(gtk::Align::Start);
+    send_button.set_size_request(68, -1);
+    send_button.set_valign(gtk::Align::Fill);
     send_button.add_css_class("compose-send");
-    // The primary action has a stable size; extra address rows grow the
-    // address area rather than the button. Subject is a separate grid row.
+    // Send spans To, Cc and Subject, plus optional From/Bcc when shown.
     fields_group.attach(&send_button, 0, 0, 1, 1);
     top_row.append(&header_spacer);
     top_row.append(&title_label);
@@ -2923,8 +2922,6 @@ pub fn build_compose_view(
     let editor_area = gtk::Box::builder().orientation(gtk::Orientation::Vertical)
         .hexpand(true).vexpand(true).build();
     editor_area.append(&envelope_scroller);
-    editor_area.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    body_stack.set_margin_top(4);
     body_stack.set_margin_start(8);
     body_stack.set_margin_end(8);
     body_stack.set_margin_bottom(8);
