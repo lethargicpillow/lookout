@@ -68,7 +68,8 @@ async fn sync(account: OtherAccount, url: String) -> Result<bool, String> {
         let scratch = Scratch::new()?;
         let known = crate::oab_cache::fingerprint(&account.id);
         let Some(fingerprint) = download(&url, &account.imap_username, &password, known, &scratch.0)? else { return Ok(false); };
-        crate::oab_cache::import_for_account(&account.id, &scratch.0.join("full.oab"), Some(&fingerprint))?;
+        crate::oab_cache::import_for_account(&account.id, &scratch.0.join("full.oab"), Some(&fingerprint))
+            .map_err(|_| "OAB decode or database import failed")?;
         Ok(true)
     }).await.map_err(|_| "OAB background task failed")?
 }
@@ -117,7 +118,7 @@ pub(crate) fn start(state: Rc<RefCell<UiState>>, worker: Rc<Worker>, refresh: Rc
                         if let Some(query) = query { refresh(&query); }
                     }
                     Ok(false) => tracing::debug!("Exchange GAL is current"),
-                    Err(_) => tracing::warn!("Exchange GAL refresh failed; previous snapshot retained"),
+                    Err(message) => tracing::warn!(reason = %message, "Exchange GAL refresh failed; previous snapshot retained"),
                 }
             });
         }
