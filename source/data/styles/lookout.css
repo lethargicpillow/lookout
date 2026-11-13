@@ -5,3 +5,17 @@
     font-weight: bold;
     font-feature-settings: 'tnum';
 }
+
+/* Page appearance is independent of the chrome's colour scheme. */
+textview.lookout-page-dark,
+textview.lookout-page-dark text {
+    background-color: #212126;
+    color: #f0f0f2;
+    caret-color: #f0f0f2;
+}
+textview.lookout-page-light,
+textview.lookout-page-light text {
+    background-color: #ffffff;
+    color: #202124;
+    caret-color: #202124;
+}
