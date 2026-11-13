@@ -2965,12 +2965,26 @@ pub fn build_compose_view(
         .max_content_height(240)
         .propagate_natural_height(true)
         .build();
-    content.append(&envelope_scroller);
+    let editor_area = gtk::Box::builder().orientation(gtk::Orientation::Vertical)
+        .hexpand(true).vexpand(true).build();
+    editor_area.append(&envelope_scroller);
     body_stack.set_margin_start(8);
     body_stack.set_margin_end(8);
     body_stack.set_margin_bottom(8);
-    content.append(&body_stack);
-    content.append(&top_row);
+    editor_area.append(&body_stack);
+    editor_area.append(&top_row);
+    let completion_overlay = gtk::Overlay::builder().child(&editor_area)
+        .hexpand(true).vexpand(true).build();
+    for row in [&to_row, &cc_row, &bcc_row] {
+        row.install_completion_overlay(&completion_overlay);
+    }
+    {
+        let overlay = completion_overlay.downgrade();
+        envelope_scroller.vadjustment().connect_value_changed(move |_| {
+            if let Some(overlay) = overlay.upgrade() { overlay.queue_allocate(); }
+        });
+    }
+    content.append(&completion_overlay);
 
     // File drop (item 1.20 / C-15): dropping files onto the composer body
     // attaches them - on the plain-text and rich editors and the column

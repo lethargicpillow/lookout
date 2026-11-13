@@ -195,7 +195,9 @@ pub struct RecipientEntry {
     /// members are stored as address tokens and expanded on send. Unused in
     /// plain mode.
     tokens: Rc<RefCell<Vec<Chip>>>,
-    popover: gtk::Popover,
+    // Compose uses an in-window overlay, not a native popup surface.
+    popover: Option<gtk::Popover>,
+    completion_panel: gtk::ScrolledWindow,
     suggestion_list: gtk::ListBox,
     suggestions: Rc<RefCell<Vec<Suggestion>>>,
     source: Rc<RefCell<Option<SuggestionSource>>>,
@@ -323,17 +325,18 @@ impl RecipientEntry {
             .max_content_height(220)
             .hscrollbar_policy(gtk::PolicyType::Never)
             .build();
-        let popover = gtk::Popover::builder()
-            .child(&scroller)
-            .position(gtk::PositionType::Bottom)
-            // Autohide would take the keyboard focus off the entry the moment
-            // the popover appeared, so the next keystroke would go nowhere.
-            // Visibility is managed by hand instead.
-            .autohide(false)
-            .focusable(false)
-            .has_arrow(false)
-            .build();
-        popover.set_parent(&entry);
+        let popover = if compose {
+            scroller.add_css_class("compose-completion-panel");
+            scroller.set_visible(false);
+            scroller.set_focusable(false);
+            None
+        } else {
+            let popup = gtk::Popover::builder()
+                .child(&scroller).position(gtk::PositionType::Bottom)
+                .autohide(false).focusable(false).has_arrow(false).build();
+            popup.set_parent(&entry);
+            Some(popup)
+        };
 
         let this = RecipientEntry {
             root,
@@ -344,6 +347,7 @@ impl RecipientEntry {
             plain,
             tokens: Rc::new(RefCell::new(Vec::new())),
             popover,
+            completion_panel: scroller,
             suggestion_list,
             suggestions: Rc::new(RefCell::new(Vec::new())),
             source: Rc::new(RefCell::new(None)),
@@ -463,7 +467,7 @@ impl RecipientEntry {
             }
             self.entry.set_text(&text);
             self.entry.set_position(-1);
-            self.popover.popdown();
+            self.hide_completion();
             return;
         }
         let existing: Vec<String> = self.addresses().iter().map(|t| address_of(t).to_lowercase()).collect();
@@ -587,7 +591,7 @@ impl RecipientEntry {
                     if !this.take_selected_suggestion() { this.commit_entry_text(); }
                     glib::Propagation::Stop
                 }
-                gtk::gdk::Key::Tab if this.plain && this.popover.is_visible() => {
+                gtk::gdk::Key::Tab if this.plain && this.completion_visible() => {
                     this.take_selected_suggestion();
                     glib::Propagation::Stop
                 }
@@ -606,7 +610,7 @@ impl RecipientEntry {
                     this.move_suggestion_selection(-1);
                     glib::Propagation::Stop
                 }
-                gtk::gdk::Key::Escape if this.popover.is_visible() => {
+                gtk::gdk::Key::Escape if this.completion_visible() => {
                     this.dismiss_suggestions();
                     glib::Propagation::Stop
                 }
@@ -641,6 +645,10 @@ impl RecipientEntry {
             });
             self.root.add_controller(focus);
         }
+        {
+            let this = self.clone();
+            self.entry.connect_unmap(move |_| this.dismiss_suggestions());
+        }
     }
 
     /// Turns the entry's current text into chips. Chip mode only.
@@ -657,7 +665,7 @@ impl RecipientEntry {
         }
         self.tokens.borrow_mut().extend(tokens.into_iter().map(Chip::Address));
         self.entry.set_text("");
-        self.popover.popdown();
+        self.hide_completion();
         self.rebuild_chips();
         self.notify_changed();
     }
@@ -676,7 +684,7 @@ impl RecipientEntry {
         text.push_str(", ");
         self.entry.set_text(&text);
         self.entry.set_position(-1);
-        self.popover.popdown();
+        self.hide_completion();
     }
 
     /// Rebuilds every chip from `tokens`. Wholesale rather than incremental:
@@ -867,22 +875,74 @@ impl RecipientEntry {
         chip
     }
 
+    /// The overlay is shared by the composer and sits outside its address
+    /// scroller so the dropdown covers the body without resizing it.
+    pub(crate) fn install_completion_overlay(&self, overlay: &gtk::Overlay) {
+        if self.popover.is_some() { return; }
+        let panel = &self.completion_panel;
+        overlay.add_overlay(panel);
+        overlay.set_measure_overlay(panel, false);
+        overlay.set_clip_overlay(panel, true);
+        let panel = panel.downgrade();
+        let entry = self.entry.downgrade();
+        overlay.connect_get_child_position(move |overlay, child| {
+            let panel = panel.upgrade()?;
+            if child != panel.upcast_ref::<gtk::Widget>() { return None; }
+            let entry = entry.upgrade()?;
+            let bounds = entry.compute_bounds(overlay)?;
+            let width = overlay.width().max(1);
+            let height = overlay.height().max(1);
+            let x = (bounds.x().floor() as i32).clamp(0, width - 1);
+            let w = (bounds.width().ceil() as i32).max(280).min(width - x).max(1);
+            let bottom = (bounds.y() + bounds.height()).ceil() as i32;
+            let top = bounds.y().floor() as i32;
+            let wanted = child.measure(gtk::Orientation::Vertical, w).1.clamp(1, 222);
+            let below = (height - bottom).clamp(0, height);
+            let above = top.clamp(0, height);
+            let (y, h) = if below >= wanted || below >= above {
+                (bottom.clamp(0, height - 1), wanted.min(below.max(1)))
+            } else {
+                let h = wanted.min(above.max(1));
+                ((top - h).clamp(0, height - 1), h)
+            };
+            Some(gtk::gdk::Rectangle::new(x, y, w, h))
+        });
+    }
+
+    fn completion_visible(&self) -> bool {
+        self.popover.as_ref().map_or_else(|| self.completion_panel.is_visible(), |p| p.is_visible())
+    }
+
+    fn hide_completion(&self) {
+        if let Some(popover) = &self.popover { popover.popdown(); }
+        else { self.completion_panel.set_visible(false); }
+    }
+
+    fn show_completion(&self) {
+        if let Some(popover) = &self.popover {
+            if !popover.is_visible() { popover.popup(); }
+        } else if self.completion_panel.parent().is_some() {
+            self.completion_panel.set_visible(true);
+            if let Some(parent) = self.completion_panel.parent() { parent.queue_allocate(); }
+        }
+    }
+
     fn focus_within_completion(&self) -> bool {
         // GtkRoot retains the logical focus widget even when the X11 popup
         // momentarily changes the active native surface.
         let Some(root) = self.entry.root() else { return false; };
         let Some(focus) = gtk::prelude::RootExt::focus(&root) else {
-            return self.popover.is_visible();
+            return self.completion_visible();
         };
         focus == self.entry.clone().upcast::<gtk::Widget>()
             || focus.is_ancestor(&self.entry)
-            || focus == self.popover.clone().upcast::<gtk::Widget>()
-            || focus.is_ancestor(&self.popover)
+            || focus == self.completion_panel.clone().upcast::<gtk::Widget>()
+            || focus.is_ancestor(&self.completion_panel)
     }
 
     fn dismiss_suggestions(&self) {
         self.suggestion_generation.set(self.suggestion_generation.get().wrapping_add(1));
-        self.popover.popdown();
+        self.hide_completion();
     }
 
     /// Dispatches a suggestion lookup for `prefix` and, once it answers,
@@ -941,7 +1001,7 @@ impl RecipientEntry {
             .collect();
 
         if matches.is_empty() {
-            self.popover.popdown();
+            self.hide_completion();
             self.suggestions.borrow_mut().clear();
             while let Some(row) = self.suggestion_list.first_child() {
                 self.suggestion_list.remove(&row);
@@ -961,6 +1021,7 @@ impl RecipientEntry {
             for candidate in matches.iter().skip(common) {
                 let label = gtk::Label::builder()
                     .label(suggestion_label(candidate))
+                    .ellipsize(gtk::pango::EllipsizeMode::End)
                     .xalign(0.0).margin_top(4).margin_bottom(4)
                     .margin_start(8).margin_end(8).build();
                 crate::privacy::mark(&label);
@@ -975,11 +1036,11 @@ impl RecipientEntry {
                 self.suggestion_list.select_row(Some(&row));
             }
         }
-        if !self.popover.is_visible() { self.popover.popup(); }
+        self.show_completion();
     }
 
     fn move_suggestion_selection(&self, delta: i32) {
-        if !self.popover.is_visible() {
+        if !self.completion_visible() {
             return;
         }
         let count = self.suggestions.borrow().len() as i32;
@@ -996,7 +1057,7 @@ impl RecipientEntry {
     /// Commits the highlighted completion, if there is one. Returns whether
     /// it did, so Enter can fall through to committing the typed text.
     fn take_selected_suggestion(&self) -> bool {
-        if !self.popover.is_visible() {
+        if !self.completion_visible() {
             return false;
         }
         let Some(index) = self.suggestion_list.selected_row().map(|r| r.index()) else {

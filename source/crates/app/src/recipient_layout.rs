@@ -135,18 +135,7 @@ mod imp {
                 let x = if rtl { width - slot.x - slot.width } else { slot.x };
                 let y = offsets[slot.row] + (plan.row_heights[slot.row] - height) / 2;
                 child.size_allocate(&gtk::Allocation::new(x, y, slot.width, *height), -1);
-                // GtkText only presents its own built-in popovers during
-                // allocation. Present the autocomplete anchored to it too,
-                // so it follows the trailing editor as the flow rewraps.
-                if child.is::<gtk::Text>() {
-                    let mut popup = child.first_child();
-                    while let Some(widget) = popup {
-                        popup = widget.next_sibling();
-                        if let Ok(popover) = widget.downcast::<gtk::Popover>() {
-                            if popover.is_visible() { popover.present(); }
-                        }
-                    }
-                }
+
             }
         }
 

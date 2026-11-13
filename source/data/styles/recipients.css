@@ -121,3 +121,14 @@ button.compose-send { padding: 4px 6px; }
     border-radius: 0;
 }
 .compose-status { color: @window_fg_color; }
+
+/* Recipient suggestions are part of the composer, not a native popup. */
+.compose-completion-panel {
+    background-color: @view_bg_color;
+    color: @view_fg_color;
+    border: 1px solid @lookout-panel-border;
+    border-radius: 3px;
+    box-shadow: 0 2px 6px alpha(black, 0.35);
+}
+.compose-completion-panel list { background-color: @view_bg_color; }
+.compose-completion-panel row { padding: 2px; }
