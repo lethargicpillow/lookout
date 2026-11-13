@@ -6998,6 +6998,13 @@ fn davmail_saves_sent(imap: &crate::EndpointConfig, smtp: &crate::EndpointConfig
     local(imap, 1143) && local(smtp, 1025)
 }
 
+/// Test the production IMAP login without selecting a mailbox.
+pub async fn verify_account_login(config: &AccountConfig, credential: Credential) -> Result<()> {
+    let (mut session, _) = login(config, credential).await?;
+    let _ = session.logout().await;
+    Ok(())
+}
+
 async fn login(config: &AccountConfig, credential: Credential) -> Result<(Session<SessionStream>, ServerCapabilities)> {
     let security = config.imap.security;
     tracing::debug!("login: connecting to {}:{} ({security:?})", config.imap.host, config.imap.port);

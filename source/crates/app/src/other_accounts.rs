@@ -553,10 +553,14 @@ pub fn show_add_account_dialog(
             let su = smtp_username_entry.clone();
             let same = same_server_switch.clone();
             let same_password = same_password_switch.clone();
+            let smtp_box = smtp_fields_box.clone();
+            let password_box = smtp_password_box.clone();
             Rc::new(move |imap: crate::account_setup::Server, smtp: crate::account_setup::Server| {
                 if name.text().trim().is_empty() { name.set_text(&email.text()); }
                 same.set_active(imap.host == smtp.host && imap.username == smtp.username);
                 same_password.set_active(true);
+                smtp_box.set_sensitive(!same.is_active());
+                password_box.set_visible(false);
                 ih.set_text(&imap.host);
                 is.set_selected(security_position(imap.security));
                 ip.set_value(imap.port as f64);
@@ -751,7 +755,13 @@ pub fn show_add_account_dialog(
             // account isn't half-configured. Blank password fields (the
             // edit-without-changing-the-password case) skip that slot's
             // write entirely, leaving the existing keyring entry untouched.
+            if !save_button.is_sensitive() { return; }
             save_button.set_sensitive(false);
+            let verify = existing.is_none();
+            if verify {
+                error_label.set_label("Checking IMAP and SMTP authentication…");
+                error_label.set_visible(true);
+            }
             let keyring = keyring.clone();
             let app_config = app_config.clone();
             let dialog = dialog.clone();
@@ -765,6 +775,11 @@ pub fn show_add_account_dialog(
             );
             worker.spawn(async move {
                 let result = async {
+                    if verify {
+                        let imap = secrets.0.clone().ok_or("A password is required")?;
+                        let smtp = secrets.1.clone().ok_or("An SMTP password is required")?;
+                        crate::account_setup::verify_credentials(&account_for_worker, imap, smtp).await?;
+                    }
                     if let Some(password) = &secrets.0 {
                         keyring.store_password(&AccountId(account_for_worker.id.clone()), PROTOCOL_IMAP, password).await?;
                     }

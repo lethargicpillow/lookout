@@ -542,6 +542,34 @@ pub async fn send_smtp(endpoint: &EndpointConfig, credential: Credential, from: 
     Ok(())
 }
 
+/// Verify SMTP authentication without transmitting a message.
+pub async fn verify_smtp_login(endpoint: &EndpointConfig, password: String) -> Result<()> {
+    crate::connection::ensure_crypto_provider_installed();
+    let hello = ClientId::default();
+    let tls_parameters = || TlsParameters::new(endpoint.host.clone()).map_err(|e| Error::LoginFailed(format!("invalid SMTP host name: {e}")));
+    let implicit_tls = (endpoint.security == Security::ImplicitTls).then(tls_parameters).transpose()?;
+    let mut connection = AsyncSmtpConnection::connect_tokio1(
+        (endpoint.host.as_str(), endpoint.port),
+        Some(std::time::Duration::from_secs(20)), &hello, implicit_tls, None,
+    ).await.map_err(|e| Error::LoginFailed(format!("SMTP connection failed: {e}")))?;
+    if endpoint.security == Security::StartTls && !connection.is_encrypted() {
+        if !connection.can_starttls() {
+            connection.abort().await;
+            return Err(Error::LoginFailed("SMTP server does not offer STARTTLS".into()));
+        }
+        if let Err(e) = connection.starttls(tls_parameters()?, &hello).await {
+            connection.abort().await;
+            return Err(Error::LoginFailed(format!("SMTP STARTTLS failed: {e}")));
+        }
+    }
+    if let Err(e) = connection.auth(&DEFAULT_MECHANISMS.to_vec(), &Credentials::new(endpoint.username.clone(), password)).await {
+        connection.abort().await;
+        return Err(Error::AuthRejected(format!("SMTP authentication failed: {e}")));
+    }
+    let _ = connection.quit().await;
+    Ok(())
+}
+
 /// Sends a message that asks for an RFC 3461 delivery receipt. lettre's
 /// `AsyncSmtpTransport` can't put `NOTIFY=` on `RCPT TO` (its `Envelope`
 /// models no DSN parameters), so this drives `AsyncSmtpConnection` directly:

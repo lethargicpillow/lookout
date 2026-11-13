@@ -202,7 +202,7 @@ pub(crate) async fn discover(email: &str) -> Result<Discovery, String> {
     // unauthenticated Exchange challenge; prefer a real EWS URL to a hint.
     if let Some(result) = a.or(b) { return Ok(result); }
     for candidate in [&c, &e] {
-        if matches!(candidate, Some(Discovery::Exchange { ews: Some(_), .. })) { return Ok(candidate.clone().unwrap()); }
+        if let Some(result @ Discovery::Exchange { ews: Some(_), .. }) = candidate { return Ok(result.clone()); }
     }
     c.or(e).ok_or_else(|| "No automatic configuration found. Enter server settings manually, or enter the Exchange EWS URL below.".into())
 }
@@ -267,16 +267,46 @@ pub(crate) fn prepare_gateway(ews: &str) -> Result<(), String> {
     };
     // Reuse a compatible existing service without restarting it.
     let _ = config;
+    if PORTS.iter().copied().all(listening) {
+        service_command(&["is-active", "--quiet", service])?;
+        return Ok(());
+    }
     if !PORTS.iter().copied().all(listening) {
         if PORTS.iter().copied().any(listening) { return Err("Only some gateway ports are available. Check the existing DavMail service; no restart was attempted.".into()); }
         service_command(&["enable", "--now", service])?;
     }
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(15) {
-        if PORTS.iter().copied().all(listening) { return Ok(()); }
+        if PORTS.iter().copied().all(listening) {
+            service_command(&["is-active", "--quiet", service])?;
+            return Ok(());
+        }
         std::thread::sleep(Duration::from_millis(250));
     }
     Err("DavMail did not open all four local ports. Check the user service journal.".into())
+}
+
+/// Verify before saving any secrets or account settings.
+pub(crate) async fn verify_credentials(account: &crate::app_config::OtherAccount, imap_password: String, smtp_password: String) -> Result<(), String> {
+    use lookout_mail::{AccountConfig, EndpointConfig, Credential};
+    let config = AccountConfig {
+        account_id: lookout_core::AccountId(account.id.clone()),
+        display_name: account.display_name.clone(), email: account.email.clone(),
+        mention_addresses: vec![account.email.clone()], mention_rules: vec![],
+        local_focus_enabled: false, local_focus_contacts: vec![],
+        imap: EndpointConfig { host: account.imap_host.clone(), port: account.imap_port,
+            security: account.resolved_imap_security(), username: account.imap_username.clone() },
+        smtp: EndpointConfig { host: account.smtp_host.clone(), port: account.smtp_port,
+            security: account.resolved_smtp_security(), username: account.smtp_username.clone() },
+    };
+    let timeout = Duration::from_secs(30);
+    tokio::time::timeout(timeout, lookout_mail::session::verify_account_login(&config, Credential::Password(imap_password)))
+        .await.map_err(|_| "IMAP login timed out. Check the server and network.")?
+        .map_err(|_| "IMAP login failed. Check the server, TLS settings, username and password.")?;
+    tokio::time::timeout(timeout, lookout_mail::send::verify_smtp_login(&config.smtp, smtp_password))
+        .await.map_err(|_| "SMTP login timed out. Check the server and network.")?
+        .map_err(|_| "SMTP login failed. Check the server, TLS settings, username and password.")?;
+    Ok(())
 }
 
 #[cfg(test)]
