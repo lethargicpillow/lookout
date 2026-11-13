@@ -1372,7 +1372,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .build();
         thread_preview_line.append(&thread_preview_label);
 
-        let thread_column = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).hexpand(true).margin_end(10).build();
+        let thread_column = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).hexpand(true).margin_end(10).css_classes(["message-thread-text"]).build();
         thread_column.append(&thread_sender_line);
         thread_column.append(&thread_subject_line);
         thread_column.append(&thread_preview_line);
@@ -5134,14 +5134,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             group.button(new_folder, "folder-new-symbolic", "New Folder");
         });
         folder_band.group("Actions", |group| {
-            group.button(rename, "document-edit-symbolic", "Rename Folder");
-            group.button(move_folder, folder_move_icon, "Move Folder");
-            group.button(delete, "user-trash-symbolic", "Delete Folder");
+            group.small_button(rename, "document-edit-symbolic", "Rename Folder");
+            group.small_button(move_folder, folder_move_icon, "Move Folder");
+            group.small_button(delete, "user-trash-symbolic", "Delete Folder");
         });
         folder_band.group("Clean Up", |group| {
-            group.button(mark_read, "mail-read-symbolic", "Mark All as Read");
-            group.button(run_rules, "emblem-system-symbolic", "Run Rules Now");
-            group.button(empty, "edit-clear-all-symbolic", "Empty Folder");
+            group.small_button(mark_read, "mail-read-symbolic", "Mark All as Read");
+            group.small_button(run_rules, "emblem-system-symbolic", "Run Rules Now");
+            group.small_button(empty, "edit-clear-all-symbolic", "Empty Folder");
         });
         folder_band.group("Favorites", |group| {
             group.button(favorite, "starred-symbolic", "Show in Favorites");
