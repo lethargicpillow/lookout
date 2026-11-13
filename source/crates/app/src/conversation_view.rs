@@ -555,7 +555,7 @@ button.link:hover { text-decoration: underline; }
 .tile-name { max-width: 200px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tile-size { color: var(--dim); font-size: 11px; }
 iframe.body { display: block; width: 100%; height: 40px; border: 0; background: #fff; border-radius: 4px; }
-.dark iframe.body { background: transparent; }
+.dark iframe.body { background: #212126; }
 .loading { color: var(--dim); padding: 8px 0; }
 .actions { display: flex; gap: 6px; margin-top: 10px; }
 .actions button { background: var(--chip); border: 0; border-radius: 6px; padding: 4px 12px; cursor: pointer; }
