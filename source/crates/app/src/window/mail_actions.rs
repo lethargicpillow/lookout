@@ -2166,9 +2166,20 @@ pub(crate) fn snooze_messages(state: &Rc<RefCell<UiState>>, summaries: &[EmailSu
 pub(crate) fn move_messages_to_role(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, summaries: &[EmailSummary], role: MailboxRole) {
     let mut inverse = Vec::new();
     let mut count = 0usize;
+    let mut permanent = Vec::new();
     for (cmd_tx, mailbox, uids) in command_targets_for(state, summaries) {
+        let destination = mailbox_account_id(&mailbox).and_then(|account_id| role_mailbox_id(state, &account_id, role));
+        if destination.as_ref() == Some(&mailbox) {
+            if role == MailboxRole::Trash {
+                let validity = mailbox_account_id(&mailbox).and_then(|id| {
+                    state.borrow().accounts.get(&id)?.folders.iter().find(|f| f.id == mailbox).map(|f| f.uidvalidity)
+                }).unwrap_or(lookout_core::UidValidity(0));
+                permanent.push((cmd_tx, mailbox, uids, validity));
+            }
+            continue;
+        }
         optimistic_remove_messages(state, message_list, &mailbox, &uids);
-        if let Some(destination) = mailbox_account_id(&mailbox).and_then(|account_id| role_mailbox_id(state, &account_id, role)) {
+        if let Some(destination) = destination {
             inverse.push(AccountCommand::RevertMove {
                 moved_from: mailbox.clone(),
                 moved_to: destination,
@@ -2179,6 +2190,25 @@ pub(crate) fn move_messages_to_role(state: &Rc<RefCell<UiState>>, message_list: 
         let _ = cmd_tx.send_blocking(AccountCommand::MoveMessages { mailbox, uids, role });
     }
     record_undo(state, &undo_move_description(role, count), inverse);
+    if permanent.is_empty() { return; }
+    let Some(parent) = state.borrow().toast_overlay.clone() else { return; };
+    let count: usize = permanent.iter().map(|(_, _, uids, _)| uids.len()).sum();
+    let dialog = adw::AlertDialog::builder()
+        .heading("Permanently delete?")
+        .body(format!("Delete {count} selected message(s) from Deleted Items? This action cannot be undone."))
+        .default_response("cancel").close_response("cancel").build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("delete", "Delete");
+    dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+    dialog.connect_response(None, move |_, response| {
+        if response != "delete" { return; }
+        for (tx, mailbox, uids, validity) in &permanent {
+            let _ = tx.try_send(AccountCommand::PurgeTrashMessages {
+                mailbox: mailbox.clone(), uids: uids.clone(), uidvalidity: *validity,
+            });
+        }
+    });
+    dialog.present(Some(&parent));
 }
 
 /// Reports `summaries` as junk (`junk == true`) or marks them not junk (item

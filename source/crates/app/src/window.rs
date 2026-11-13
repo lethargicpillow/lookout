@@ -1892,30 +1892,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let bound = bound.clone();
             let message_list = message_list_for_rows.clone();
             delete_btn.connect_clicked(move |_| {
-                let Some((mailbox, uid)) = bound.borrow().as_ref().map(|s| (s.mailbox.clone(), s.uid)) else {
-                    return;
-                };
-                let Some(account_id) = mailbox_account_id(&mailbox) else { return };
-                let cmd_tx = state.borrow().accounts.get(&account_id).map(|handle| handle.cmd_tx.clone());
-                if let Some(cmd_tx) = cmd_tx {
-                    optimistic_remove_messages(&state, &message_list, &mailbox, &[uid]);
-                    // Undo: move the message back out of Trash.
-                    if let Some(trash) = role_mailbox_id(&state, &account_id, MailboxRole::Trash) {
-                        record_undo(
-                            &state,
-                            &undo_move_description(MailboxRole::Trash, 1),
-                            vec![AccountCommand::RevertMove {
-                                moved_from: mailbox.clone(),
-                                moved_to: trash,
-                                uids: vec![uid],
-                            }],
-                        );
-                    }
-                    let _ = cmd_tx.send_blocking(AccountCommand::MoveMessage {
-                        mailbox,
-                        uid,
-                        role: MailboxRole::Trash,
-                    });
+                let Some(summary) = bound.borrow().clone() else { return; };
+                move_messages_to_role(&state, &message_list, &[summary], MailboxRole::Trash);
+            });
                 }
             });
         }

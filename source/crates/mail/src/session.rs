@@ -537,6 +537,12 @@ pub enum AccountCommand {
     EmptyMailbox {
         mailbox: MailboxId,
     },
+    /// Permanently delete only the explicitly confirmed selection in Trash.
+    PurgeTrashMessages {
+        mailbox: MailboxId,
+        uids: Vec<Uid>,
+        uidvalidity: UidValidity,
+    },
     /// The folder pane's "Mark all as read": `UID STORE 1:* +FLAGS (\Seen)`
     /// over the whole of `mailbox`, SELECTing it on demand.
     MarkMailboxRead {
@@ -3444,7 +3450,7 @@ async fn connect_and_run(
                         session.select(&path).await?;
                         session_selected = mailbox.clone();
                     }
-                    match move_message_to_role(&mut session, &folders, &account_id, &[uid], role, has_move, has_uidplus).await {
+                    match move_message_to_role(&mut session, &folders, &account_id, &mailbox, &[uid], role, has_move, has_uidplus).await {
                         Ok((destination, moved)) => {
                             let info = cached_move_info(cache, &mailbox, &[uid]).await;
                             move_ledger.record(&mailbox, &destination, &[uid], &moved, &info.message_ids);
@@ -3527,7 +3533,7 @@ async fn connect_and_run(
                         session.select(&path).await?;
                         session_selected = mailbox.clone();
                     }
-                    match move_message_to_role(&mut session, &folders, &account_id, &uids, role, has_move, has_uidplus).await {
+                    match move_message_to_role(&mut session, &folders, &account_id, &mailbox, &uids, role, has_move, has_uidplus).await {
                         Ok((destination, moved)) => {
                             let info = cached_move_info(cache, &mailbox, &uids).await;
                             move_ledger.record(&mailbox, &destination, &uids, &moved, &info.message_ids);
@@ -3906,6 +3912,44 @@ async fn connect_and_run(
                         Err(e) => {
                             tracing::warn!(%copied_from, %copied_to, "undo copy failed: {e}");
                             let _ = events.send(AccountEvent::Error(format!("Couldn't undo: {e}"))).await;
+                        }
+                    }
+                }
+                AccountCommand::PurgeTrashMessages { mailbox, uids, uidvalidity } => {
+                    if uids.is_empty() { continue; }
+                    let Some(path) = mailbox.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) else { continue; };
+                    if !folders.iter().any(|f| f.id == mailbox && f.role == MailboxRole::Trash) {
+                        let _ = events.send(AccountEvent::Error("Permanent deletion is only allowed in Trash.".into())).await;
+                        continue;
+                    }
+                    let result = davmail_purge_draft_uids(&mut session, &path,
+                        (uidvalidity.0 != 0).then_some(uidvalidity.0), &uids, has_uidplus).await;
+                    // The helper SELECTs this mailbox; reselect the active
+                    // folder on the next iteration even on failure.
+                    session_selected = mailbox.clone();
+                    match result {
+                        Ok(()) => {
+                            if let Some(Err(e)) = cache_op(cache, {
+                                let mailbox = mailbox.clone();
+                                let uids = uids.clone();
+                                move |c| c.delete_messages(&mailbox, &uids)
+                            }).await {
+                                tracing::warn!("failed to remove purged messages from cache: {e}");
+                            }
+                            emit_cached_messages_after_removal(cache, &mailbox, events).await;
+                            dirty_mailboxes.insert(mailbox.clone());
+                            sync_mailbox(&mut session, &account_id, &path, &mailbox, events,
+                                cache, &mut folders, interactive_commands, None, condstore,
+                                qresync, local_focus, davmail_compat).await?;
+                            dirty_mailboxes.remove(&mailbox);
+                        }
+                        Err(e) => {
+                            let _ = events.send(AccountEvent::Error(format!("Couldn't permanently delete messages: {e}"))).await;
+                            // A timed-out command may leave the stream out of
+                            // sync. Reconnect instead of reusing it.
+                            if matches!(&e, Error::Io(io) if io.kind() == std::io::ErrorKind::TimedOut) {
+                                return Err(e);
+                            }
                         }
                     }
                 }
@@ -5781,6 +5825,7 @@ async fn move_message_to_role(
     session: &mut Session<SessionStream>,
     folders: &[Mailbox],
     account_id: &AccountId,
+    source: &MailboxId,
     uids: &[Uid],
     role: MailboxRole,
     has_move: bool,
@@ -5789,8 +5834,11 @@ async fn move_message_to_role(
     let Some(target) = folders.iter().find(|m| m.role == role) else {
         return Err(Error::NoSuchFolder(role));
     };
+    if &target.id == source {
+        return Err(Error::Io(std::io::Error::other("Source and destination are the same mailbox")));
+    }
     let Some(path) = target.id.0.strip_prefix(&format!("{}:", account_id.0)) else {
-        return Ok((target.id.clone(), Vec::new()));
+        return Err(Error::Io(std::io::Error::other("Unknown target mailbox")));
     };
     let moved = move_uids_to_path(session, uids, path, has_move, has_uidplus).await?;
     Ok((target.id.clone(), moved))

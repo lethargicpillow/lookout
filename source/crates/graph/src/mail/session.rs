@@ -1111,6 +1111,7 @@ impl GraphMailSession {
             AccountCommand::CopyMessagesTo { mailbox, uids, target } => self.copy_messages(&mailbox, &uids, &target).await,
             AccountCommand::RevertCopy { copied_from, copied_to, uids } => self.revert_copy(&copied_from, &copied_to, &uids).await,
             AccountCommand::EmptyMailbox { mailbox } => self.empty_mailbox(&mailbox).await,
+            AccountCommand::PurgeTrashMessages { mailbox, uids, .. } => self.purge_trash_messages(&mailbox, &uids).await,
             AccountCommand::MarkMailboxRead { mailbox } => self.mark_mailbox_read(&mailbox).await,
             AccountCommand::CreateMailbox { parent, name } => self.create_mailbox(parent.as_ref(), &name).await,
             AccountCommand::RenameMailbox { mailbox, new_name } => self.rename_mailbox(&mailbox, &new_name).await,
@@ -1902,6 +1903,28 @@ impl GraphMailSession {
     }
 
     // --- Whole-folder operations -------------------------------------------------
+
+    async fn purge_trash_messages(&mut self, mailbox: &MailboxId, uids: &[Uid]) {
+        if self.role_of(mailbox) != MailboxRole::Trash { return; }
+        let ids = self.graph_ids(uids).await;
+        let mut deleted = Vec::new();
+        for uid in uids {
+            if let Some(id) = ids.get(uid) {
+                match self.client.delete_message(id).await {
+                    Ok(()) => deleted.push(*uid),
+                    Err(e) => tracing::warn!(%mailbox, "graph mail: deleting selected trash message failed: {e}"),
+                }
+            }
+        }
+        if deleted.len() != uids.len() {
+            let _ = self.events.send(AccountEvent::Error("Some selected messages could not be deleted.".into())).await;
+        }
+        let _ = cache_op(&self.cache, {
+            let mailbox = mailbox.clone();
+            move |cache| cache.delete_messages(&mailbox, &deleted)
+        }).await;
+        self.emit_mailbox(mailbox, true).await;
+    }
 
     async fn empty_mailbox(&mut self, mailbox: &MailboxId) {
         let role = self.role_of(mailbox);
