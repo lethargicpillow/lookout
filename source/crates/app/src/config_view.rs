@@ -734,8 +734,8 @@ pub fn build() -> ConfigView {
     // inverted - while the header's moon/sun toggle still overrides the
     // current message either way.
     let message_theme_dark_row = adw::SwitchRow::builder()
-        .title("Dark message theme")
-        .subtitle("Open HTML messages in dark mode by default instead of their original colours")
+        .title("Dark page background")
+        .subtitle("Use dark pages for reading, composing, signatures and templates, independently of the application theme")
         .build();
     appearance_group.add(&message_theme_dark_row);
     let accent_switch_row = adw::SwitchRow::builder()
