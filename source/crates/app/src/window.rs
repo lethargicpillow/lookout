@@ -1893,7 +1893,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let message_list = message_list_for_rows.clone();
             delete_btn.connect_clicked(move |_| {
                 let Some(summary) = bound.borrow().clone() else { return; };
-                move_messages_to_role(&state, &message_list, &[summary], MailboxRole::Trash);
+                move_messages_to_role(&state, &message_list, std::slice::from_ref(summary.as_ref()), MailboxRole::Trash);
             });
         }
         {

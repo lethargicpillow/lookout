@@ -19,7 +19,6 @@
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
 use gtk::gdk;
-use adw::prelude::*;
 
 /// Theme ids as stored in GSettings `theme-id`; also the file names under
 /// `data/themes/` (with `.css` appended) except `system`, which is
