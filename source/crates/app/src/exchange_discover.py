@@ -37,6 +37,49 @@ def secure_url(value):
 def related(host, original):
     return host == original or host.endswith("." + original)
 
+def oab_manifest_url(value):
+    url = secure_url(value)
+    if not url:
+        return None
+    path = urlsplit(url).path
+    if path.lower().endswith("/oab.xml"):
+        return url
+    if path.endswith("/") or re.fullmatch(r"[0-9a-fA-F-]{36}", path.rsplit("/", 1)[-1]):
+        return url.rstrip("/") + "/oab.xml"
+    return None
+
+
+def oab_candidates(protocols, selected, ews):
+    """Prefer published external URLs, then the advertised external EWS
+    origin with the exact published OAB path, then other published URLs.
+    Never invent a server name or mailbox GUID."""
+    published = []
+    other = []
+    for p in [selected] + [p for p in protocols if p is not selected]:
+        url = oab_manifest_url(p.findtext("OABUrl", "").strip())
+        if not url:
+            continue
+        if p is selected or p.findtext("Type", "").upper() == "EXPR" or (
+                p.findtext("Type", "").upper() == "EXHTTP"
+                and urlsplit(url).hostname == urlsplit(ews).hostname):
+            published.append(url)
+        else:
+            other.append(url)
+    # Even when the internal OAB hostname is unreachable, its exact
+    # published GUID path can be exposed on the external EWS origin.
+    # These are candidates only; an authenticated manifest GET must
+    # validate them before replacing the published external address.
+    origin = urlsplit(ews)
+    derived = []
+    for url in published + other:
+        path = urlsplit(url).path
+        if path.lower().startswith("/oab/") and urlsplit(url).hostname != origin.hostname:
+            derived.append(origin.scheme + "://" + origin.netloc + path)
+    # GUID paths are more specific than a bare /OAB/ virtual directory.
+    derived.sort(key=lambda u: urlsplit(u).path.lower() == "/oab/oab.xml")
+    return list(dict.fromkeys(published + derived + other))[:8]
+
+
 def parse(data):
     if b"<!DOCTYPE" in data.upper() or b"<!ENTITY" in data.upper():
         return None
@@ -70,22 +113,9 @@ def parse(data):
                 continue
             if urlsplit(ews).hostname in CLOUD:
                 return {"status": "cloud"}
-            oab = None
-            external = p.findtext("Type", "").upper() in ("EXPR", "EXHTTP")
-            for q in [p] + [q for q in protocols if q is not p]:
-                url = secure_url(q.findtext("OABUrl", "").strip())
-                if not url:
-                    continue
-                if external and q.findtext("Type", "").upper() == "EXCH" and urlsplit(url).hostname != urlsplit(ews).hostname:
-                    continue
-                path = urlsplit(url).path
-                if path.lower().endswith("/oab.xml"):
-                    oab = url
-                    break
-                if path.endswith("/") or re.fullmatch(r"[0-9a-fA-F-]{36}", path.rsplit("/", 1)[-1]):
-                    oab = url.rstrip("/") + "/oab.xml"
-                    break
-            return {"status": "exchange", "ews": ews, "oab": oab}
+            urls = oab_candidates(protocols, p, ews)
+            return {"status": "exchange", "ews": ews,
+                    "oab": urls[0] if urls else None, "oab_candidates": urls}
     except (ET.ParseError, ValueError, TypeError):
         return None
     return None
@@ -102,6 +132,60 @@ def srv_candidates(host):
                 if r.port == 443 and domain("x@" + str(r.target).rstrip("."))][:8]
     except Exception:
         return []
+
+def valid_oab_manifest(data):
+    if not data or b"<!DOCTYPE" in data.upper() or b"<!ENTITY" in data.upper():
+        return False
+    try:
+        root = ET.fromstring(data)
+        return root.tag == "OAB" and any(
+            f.text and re.fullmatch(r"[A-Za-z0-9_.-]+\.lzx", f.text.strip(), re.I)
+            and f.get("size") and f.get("SHA")
+            for f in root.findall("./OAL/Full"))
+    except (ET.ParseError, ValueError):
+        return False
+
+
+def choose_oab(urls, authorized, probe):
+    """Return the first verified authorized endpoint, or a published
+    authorized fallback for later retry. No credentials on untrusted hosts."""
+    trusted = [url for url in urls if authorized(url)]
+    for url in trusted:
+        outcome = probe(url)
+        if outcome == "ok":
+            return url, True
+        if outcome == "authentication":
+            break  # no repeated rejected-password attempts
+    return (trusted[0], False) if trusted else (None, False)
+
+
+def probe_oab(session, url, login, password):
+    import requests
+    from requests_ntlm import HttpNtlmAuth
+    args = dict(timeout=(3, 5), stream=True, allow_redirects=False)
+    try:
+        with session.get(url, **args) as response:
+            status = response.status_code
+            challenge = response.headers.get("WWW-Authenticate", "").lower()
+            if status == 200:
+                return "ok" if valid_oab_manifest(read_xml(response)) else "unavailable"
+        if status != 401 or not password:
+            return "unavailable"
+        if "ntlm" in challenge or "negotiate" in challenge:
+            auth = HttpNtlmAuth(login, password)
+        elif "basic" in challenge:
+            auth = requests.auth.HTTPBasicAuth(login, password)
+        else:
+            return "unavailable"
+        with session.get(url, auth=auth, **args) as response:
+            if response.status_code in (401, 403):
+                return "authentication"
+            if response.status_code == 200 and valid_oab_manifest(read_xml(response)):
+                return "ok"
+    except (requests.RequestException, ValueError):
+        pass
+    return "unavailable"
+
 
 def discover(cfg):
     import requests
@@ -210,9 +294,17 @@ def discover(cfg):
                     elif kind == "exchange":
                         # EWS/OAB are where the actual account password will
                         # later be used, so apply the same trust boundary.
-                        for endpoint in [result["ews"], result.get("oab")]:
-                            if endpoint and not authorized(endpoint):
-                                return approval(endpoint)
+                        if not authorized(result["ews"]):
+                            return approval(result["ews"])
+                        urls = result.pop("oab_candidates", [])
+                        selected, verified = choose_oab(urls, authorized, lambda endpoint:
+                            probe_oab(session, endpoint, cfg.get("login") or cfg["email"], password))
+                        if selected is None and urls:
+                            return approval(urls[0])
+                        # If none worked, keep the best published address
+                        # for the background GAL retry, not a guessed host.
+                        result["oab"] = selected
+                        result["oab_verified"] = verified
                         return result
             except (requests.RequestException, ValueError):
                 pass
@@ -231,7 +323,7 @@ def read_xml(response):
     return bytes(data)
 
 def main():
-    signal.alarm(65)
+    signal.alarm(110)
     try:
         cfg = json.load(sys.stdin)
         result = discover(cfg)
