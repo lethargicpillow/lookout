@@ -2199,173 +2199,148 @@ pub fn build_compose_view(
             });
         });
     }
-    // --- Signature menu: a "Signature" button that drops down the global
-    // signature list (Config → Accounts → Signatures), one row per
-    // signature inserting it at the cursor - the HTML form in rich mode,
-    // the plain text in text mode - with a "Manage Signatures…" row at the
-    // bottom jumping to the settings screen. Rebuilt every time the popover
-    // opens, so a signature added via Settings while a composer is open
-    // lands in the list immediately; the button is disabled entirely while
-    // no signatures exist. The button lives at the end of the toolbar (the
-    // formatting controls stay ahead of it) and carries the bundled
-    // signature icon instead of a text label, matching the toolbar's other
-    // icon buttons. Use a symbolic icon, not the legacy white SVG:
-    // the same glyph must remain legible on light and dark surfaces.
+    // Signature selection is an embedded dialog, not a native GtkPopover.
+    // X11/XWayland can leave an override-redirect popup above unrelated
+    // applications; a child of the AdwWindow cannot escape that window.
     let signature_icon = crate::window::themed_icon_name(&[
         "document-edit-symbolic", "accessories-text-editor-symbolic", "text-editor-symbolic",
     ]);
-    let signature_button = gtk::MenuButton::builder()
+    let signature_button = gtk::Button::builder()
         .icon_name(signature_icon)
         .css_classes(["flat"])
-        .tooltip_text("Insert a signature")
+        .tooltip_text("Insert or manage signatures")
         .build();
-    // A visible drop-down arrow next to the icon, like other menu buttons.
-    signature_button.set_always_show_arrow(true);
-    let signature_popover = gtk::Popover::new();
-    signature_popover.set_autohide(true);
-    let signature_list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::Single).build();
-    let signature_scroller = gtk::ScrolledWindow::builder()
-        .child(&signature_list)
-        .min_content_width(240)
-        .max_content_width(320)
-        .max_content_height(240)
-        .propagate_natural_height(true)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vscrollbar_policy(gtk::PolicyType::Automatic)
-        .build();
-    // The menu's root: the scrollable signature list above, and "Manage
-    // Signatures…" pinned below the list - outside the scroller - so the
-    // settings shortcut is always on screen no matter how long the list
-    // grows (only the list portion ever scrolls, and only when the screen
-    // forces it).
-    let signature_menu_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
-    signature_menu_box.append(&signature_scroller);
-    signature_menu_box.append(&gtk::Separator::builder().orientation(gtk::Orientation::Horizontal).build());
-    let manage_label = gtk::Label::builder()
-        .label("Manage Signatures…")
-        .xalign(0.0)
-        .margin_start(10)
-        .margin_end(10)
-        .margin_top(3)
-        .margin_bottom(3)
-        .build();
-    crate::privacy::mark_ui(&manage_label);
-    let manage_button = gtk::Button::builder().css_classes(["flat"]).build();
-    manage_button.set_child(Some(&manage_label));
     {
+        let signatures_source = signatures_source.clone();
         let manage_signatures = manage_signatures.clone();
-        let signature_popover = signature_popover.clone();
-        let anchor = signature_button.downgrade();
-        manage_button.connect_clicked(move |button| {
-            // Capture the actual toplevel before closing the popover: the
-            // ribbon may reparent its controls when the menu is dismissed.
-            let parent = anchor.upgrade().and_then(|anchor| anchor.root().and_downcast::<gtk::Window>())
-                .or_else(|| button.root().and_downcast::<gtk::Window>());
-            let fallback = anchor.upgrade().map(|anchor| anchor.upcast::<gtk::Widget>())
-                .unwrap_or_else(|| button.clone().upcast());
-            signature_popover.popdown();
-            if let Some(manage) = manage_signatures.clone() {
-                let anchor = parent.map(|parent| parent.upcast::<gtk::Widget>()).unwrap_or(fallback);
-                tracing::debug!("signature manager: menu action activated");
-                // Stay on the actual click's activation path. A native
-                // embedded dialog does not require a new window activation.
-                manage(&anchor);
-            }
-        });
-    }
-    signature_menu_box.append(&manage_button);
-    signature_popover.set_child(Some(&signature_menu_box));
-    signature_button.set_popover(Some(&signature_popover));
-
-    let rebuild_signature_menu: Rc<RefCell<Box<dyn Fn()>>> = Rc::new(RefCell::new(Box::new(|| {})));
-    {
-        let signatures_source = signatures_source.clone();
-        let signature_list = signature_list.clone();
-        let signature_button = signature_button.clone();
-        *rebuild_signature_menu.borrow_mut() = Box::new(move || {
-            while let Some(child) = signature_list.first_child() {
-                signature_list.remove(&child);
-            }
-            let signatures = signatures_source();
-            // The management action is available even with zero signatures.
-            signature_button.set_sensitive(true);
-            // Plain labels are appended (the ListBox wraps each in a row),
-            // matching the recipient-suggestions popover. "Manage
-            // Signatures…" is not part of the list - it's pinned below the
-            // scroller.
-            for signature in &signatures {
-                let label = gtk::Label::builder()
-                    .label(&signature.name)
-                    .xalign(0.0)
-                    .ellipsize(gtk::pango::EllipsizeMode::End)
-                    .margin_start(10)
-                    .margin_end(10)
-                    .margin_top(6)
-                    .margin_bottom(6)
-                    .build();
-                signature_list.append(&label);
-            }
-        });
-    }
-    (rebuild_signature_menu.borrow())();
-    {
-        let rebuild_handle = rebuild_signature_menu.clone();
-        signature_popover.connect_map(move |_| {
-            (rebuild_handle.borrow())();
-        });
-    }
-    // One activation handler for the whole list, like the recipient
-    // suggestions: the index is resolved against the *current* signature
-    // list at click time, so a rebuild can never leave a stale handler
-    // mapping a row onto the wrong signature.
-    {
-        let signatures_source = signatures_source.clone();
-        let signature_popover = signature_popover.clone();
         let rich_web_view = rich_web_view.clone();
         let body_view = body_view.clone();
         let rich_toggle = rich_toggle.clone();
-        signature_list.connect_row_activated(move |_, row| {
-            let index = row.index() as usize;
-            signature_popover.popdown();
-            let signatures = signatures_source();
-            let Some(signature) = signatures.get(index) else { return };
-            if rich_toggle.is_active() {
-                // Rich mode: insert the signature's HTML at the editor's
-                // cursor. `webkit_web_view_execute_editing_command_with_argument`
-                // doesn't reliably resolve WebKit's "InsertHTML" editing
-                // command (the paste handler's `document.execCommand` JS
-                // path is the proven one - same round trip, minus the C
-                // command-name translation), so the insertion goes through
-                // `evaluate_javascript` like the paste path. The script
-                // restores the editor's focus (the popover click blurred
-                // it), keeps the user's caret/selection when one exists,
-                // and falls back to appending at the end of the body when
-                // the selection was cleared - an insertion must never
-                // silently vanish.
-                let html_json = serde_json::to_string(&signature.html).unwrap_or_else(|_| "\"\"".to_string());
-                let script = format!(
-                    r#"(function () {{
-                        document.body.focus();
-                        var sel = window.getSelection();
-                        if (!sel || sel.rangeCount === 0) {{
-                            var range = document.createRange();
-                            range.selectNodeContents(document.body);
-                            range.collapse(false);
-                            sel.removeAllRanges();
-                            sel.addRange(range);
-                        }}
-                        document.execCommand('insertHTML', false, {html_json});
-                    }})()"#
-                );
-                let web_view = rich_web_view.clone();
-                glib::spawn_future_local(async move {
-                    let _ = web_view.evaluate_javascript_future(&script, None, None).await;
-                });
-            } else {
-                body_view.buffer().insert_at_cursor(&signature.text);
+        signature_button.connect_clicked(move |button| {
+            let Some(parent) = button.root().and_downcast::<gtk::Window>()
+                .or_else(|| body_view.root().and_downcast::<gtk::Window>()) else {
+                tracing::warn!("signature picker: no composer window");
+                return;
+            };
+            // If the ribbon group was collapsed, close its native overflow
+            // popup too before showing the embedded picker.
+            let mut ancestor = button.parent();
+            let mut popovers = Vec::new();
+            while let Some(widget) = ancestor {
+                ancestor = widget.parent();
+                if let Ok(popover) = widget.downcast::<gtk::Popover>() { popovers.push(popover); }
             }
+            for popover in popovers { popover.popdown(); }
+
+            let signatures = signatures_source();
+            let dialog = adw::Dialog::builder().title("Signature")
+                .content_width(340).content_height(250).build();
+            let toolbar = adw::ToolbarView::new();
+            toolbar.add_top_bar(&adw::HeaderBar::new());
+            let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical)
+                .spacing(8).margin_top(12).margin_bottom(12).margin_start(12).margin_end(12).build();
+            let list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None)
+                .activate_on_single_click(true).css_classes(["boxed-list"]).build();
+            let scroller = gtk::ScrolledWindow::builder().child(&list)
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .vscrollbar_policy(gtk::PolicyType::Automatic)
+                .propagate_natural_height(true).max_content_height(200).vexpand(true).build();
+            for signature in &signatures {
+                let label = gtk::Label::builder().label(&signature.name).xalign(0.0)
+                    .ellipsize(gtk::pango::EllipsizeMode::End)
+                    .margin_start(12).margin_end(12).margin_top(8).margin_bottom(8).build();
+                crate::privacy::mark_content(&label);
+                list.append(&label);
+            }
+            if signatures.is_empty() {
+                list.set_placeholder(Some(&gtk::Label::new(Some("No signatures yet"))));
+            }
+            content.append(&scroller);
+            let manage_button = gtk::Button::with_label("Manage Signatures…");
+            manage_button.set_sensitive(manage_signatures.is_some());
+            content.append(&manage_button);
+            toolbar.set_content(Some(&content));
+            dialog.set_child(Some(&toolbar));
+
+            enum Choice { Insert(Signature), Manage }
+            let choice = Rc::new(RefCell::new(None::<Choice>));
+            {
+                let choice = choice.clone();
+                let dialog = dialog.downgrade();
+                list.connect_row_activated(move |_, row| {
+                    if let Some(signature) = signatures.get(row.index() as usize) {
+                        *choice.borrow_mut() = Some(Choice::Insert(signature.clone()));
+                        if let Some(dialog) = dialog.upgrade() { dialog.close(); }
+                    }
+                });
+            }
+            {
+                let choice = choice.clone();
+                let dialog = dialog.downgrade();
+                manage_button.connect_clicked(move |_| {
+                    *choice.borrow_mut() = Some(Choice::Manage);
+                    if let Some(dialog) = dialog.upgrade() { dialog.close(); }
+                });
+            }
+            let parent_for_action = parent.downgrade();
+            let manage_signatures = manage_signatures.clone();
+            let rich_web_view = rich_web_view.clone();
+            let body_view = body_view.clone();
+            let rich_toggle = rich_toggle.clone();
+            dialog.connect_closed(move |_| {
+                let selected = choice.borrow_mut().take();
+                let signature = match selected {
+                    Some(Choice::Insert(signature)) => signature,
+                    Some(Choice::Manage) => {
+                        if let (Some(manage), Some(parent)) = (&manage_signatures, parent_for_action.upgrade()) {
+                            tracing::debug!("signature manager: menu action activated");
+                            manage(parent.upcast_ref());
+                        }
+                        return;
+                    }
+                    None => return,
+                };
+                if rich_toggle.is_active() {
+                    // Rich mode: insert the signature's HTML at the editor's
+                    // cursor. `webkit_web_view_execute_editing_command_with_argument`
+                    // doesn't reliably resolve WebKit's "InsertHTML" editing
+                    // command (the paste handler's `document.execCommand` JS
+                    // path is the proven one - same round trip, minus the C
+                    // command-name translation), so the insertion goes through
+                    // `evaluate_javascript` like the paste path. The script
+                    // restores the editor's focus (the popover click blurred
+                    // it), keeps the user's caret/selection when one exists,
+                    // and falls back to appending at the end of the body when
+                    // the selection was cleared - an insertion must never
+                    // silently vanish.
+                    let html_json = serde_json::to_string(&signature.html).unwrap_or_else(|_| "\"\"".to_string());
+                    let script = format!(
+                        r#"(function () {{
+                                document.body.focus();
+                                var sel = window.getSelection();
+                                if (!sel || sel.rangeCount === 0) {{
+                                    var range = document.createRange();
+                                    range.selectNodeContents(document.body);
+                                    range.collapse(false);
+                                    sel.removeAllRanges();
+                                    sel.addRange(range);
+                                }}
+                                document.execCommand('insertHTML', false, {html_json});
+                        }})()"#
+                    );
+                    let web_view = rich_web_view.clone();
+                    glib::spawn_future_local(async move {
+                        let _ = web_view.evaluate_javascript_future(&script, None, None).await;
+                    });
+                } else {
+                    body_view.buffer().insert_at_cursor(&signature.text);
+                }
+
+            });
+            dialog.present(Some(&parent));
         });
     }
+
     // --- My Templates menu (item 2.10 / C-17): like the signature menu, a
     // button dropping down the global template list, one row per template
     // inserting its snippet at the cursor - the HTML form in rich mode, the
@@ -2603,7 +2578,7 @@ pub fn build_compose_view(
     editor_band.group("Include", |group| {
         group.small_button(&attach_button, "mail-attachment-symbolic", "Attach Files");
         group.small_button(&format.link, "insert-link-symbolic", "Link");
-        group.small_menu(&signature_button, signature_icon, "Signature");
+        group.small_button(&signature_button, signature_icon, "Signature");
     });
     insert_band.group("Insert", |group| {
         group.menu(&templates_button, "edit-copy-symbolic", "Templates");
