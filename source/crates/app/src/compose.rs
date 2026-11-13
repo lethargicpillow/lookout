@@ -821,6 +821,9 @@ pub(crate) struct FormatControls {
     pub bullets: gtk::Button,
     pub numbering: gtk::Button,
     pub font_size: gtk::DropDown,
+    pub font_grow: gtk::Button,
+    pub font_shrink: gtk::Button,
+    pub highlight: gtk::Button,
     pub color: gtk::ColorDialogButton,
     pub link: gtk::Button,
     pub emoji: gtk::MenuButton,
@@ -881,6 +884,9 @@ impl FormatControls {
     pub(crate) fn set_sensitive(&self, sensitive: bool) {
         for widget in self.all() {
             widget.set_sensitive(sensitive);
+        }
+        for button in [&self.font_grow, &self.font_shrink, &self.highlight] {
+            button.set_sensitive(sensitive);
         }
     }
 }
@@ -1439,6 +1445,29 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, F
         });
     }
 
+    // These commands belong to the composer's compact Basic Text panel.
+    // Drive the existing size selector so its value and editing command
+    // stay in step; at either end a click is a no-op.
+    let font_grow = gtk::Button::from_icon_name("format-font-size-larger-symbolic");
+    font_grow.set_tooltip_text(Some("Increase font size"));
+    let font_shrink = gtk::Button::from_icon_name("format-font-size-smaller-symbolic");
+    font_shrink.set_tooltip_text(Some("Decrease font size"));
+    for (button, delta) in [(&font_grow, 1i32), (&font_shrink, -1i32)] {
+        let size = font_size.clone();
+        button.connect_clicked(move |_| {
+            let selected = size.selected();
+            if selected < 7 {
+                size.set_selected((selected as i32 + delta).clamp(0, 6) as u32);
+            }
+        });
+    }
+    let highlight = gtk::Button::from_icon_name(crate::window::themed_icon_name(&["format-text-highlight-symbolic", "document-edit-symbolic"]));
+    highlight.set_tooltip_text(Some("Highlight text in yellow"));
+    {
+        let web_view = web_view.clone();
+        highlight.connect_clicked(move |_| web_view.execute_editing_command_with_argument("BackColor", "#ffff00"));
+    }
+
     let color_dialog = gtk::ColorDialog::new();
     let color_button = gtk::ColorDialogButton::builder().dialog(&color_dialog).tooltip_text("Text color").rgba(&gtk::gdk::RGBA::BLACK).build();
     {
@@ -1650,6 +1679,9 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, F
         bullets,
         numbering,
         font_size,
+        font_grow,
+        font_shrink,
+        highlight,
         color: color_button,
         link: link_button,
         emoji: emoji_button,
@@ -2541,58 +2573,76 @@ pub fn build_compose_view(
             }
         }
     });
-    // Outlook's Basic Text is one compact formatting surface. Both rows
-    // share the same height across font and paragraph commands.
+    // Outlook arranges independent compact rows rather than a shared grid:
+    // selectors/size/list commands above, character/colour/paragraph below.
     editor_band.group("Basic Text", |group| {
-        // One grid with two equal-height rows. Keep selectors spanning
-        // the same cells as B/I/U/S/clear/color, but let their columns
-        // measure independently: a wide colour or font-size selector must
-        // not inflate all ten columns and collapse Include unnecessarily.
-        let block = gtk::Grid::builder()
-            .row_homogeneous(true).column_homogeneous(false)
-            .row_spacing(2).column_spacing(2)
-            // Fill the command area internally, without requesting spare
-            // vertical space from the ribbon or the editor window.
+        let block = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical).spacing(2).homogeneous(true)
             .vexpand(false).valign(gtk::Align::Fill).halign(gtk::Align::Start)
             .css_classes(["compose-format-block"]).build();
+        let top = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
+            .spacing(2).valign(gtk::Align::Center).build();
+        let bottom = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
+            .spacing(2).valign(gtk::Align::Center).build();
 
-        format.font_family.set_size_request(-1, -1);
-        format.font_family.set_hexpand(false);
-        format.font_family.set_halign(gtk::Align::Fill);
-        format.font_family.set_valign(gtk::Align::Fill);
-        format.font_family.set_vexpand(true);
-        format.font_family.add_css_class("compose-format-select");
-        format.font_size.set_size_request(-1, -1);
-        format.font_size.set_halign(gtk::Align::Fill);
-        format.font_size.set_valign(gtk::Align::Fill);
-        format.font_size.set_vexpand(true);
-        format.font_size.add_css_class("compose-format-select");
-        block.attach(&format.font_family, 0, 0, 4, 1);
-        block.attach(&format.font_size, 4, 0, 2, 1);
-
-        let place = |button: &gtk::Button, col: i32, row: i32| {
+        for (selector, width) in [(&format.font_family, 112), (&format.font_size, 64)] {
+            selector.set_size_request(width, -1);
+            selector.set_hexpand(false);
+            selector.set_halign(gtk::Align::Fill);
+            selector.set_valign(gtk::Align::Center);
+            selector.add_css_class("compose-format-select");
+            top.append(selector);
+        }
+        let append = |row: &gtk::Box, button: &gtk::Button| {
             button.add_css_class("compose-format-button");
+            button.add_css_class("flat");
             button.set_width_request(28);
-            button.set_halign(gtk::Align::Fill);
-            button.set_valign(gtk::Align::Fill);
-            button.set_vexpand(true);
-            block.attach(button, col, row, 1, 1);
+            button.set_halign(gtk::Align::Center);
+            button.set_valign(gtk::Align::Center);
+            button.set_vexpand(false);
+            row.append(button);
         };
-        for (col, button) in [&format.bold, &format.italic, &format.underline, &format.strikethrough, &format.clear_formatting].into_iter().enumerate() {
-            place(button, col as i32, 1);
+        let divider = |row: &gtk::Box| {
+            let line = gtk::Separator::new(gtk::Orientation::Vertical);
+            line.add_css_class("compose-format-divider");
+            row.append(&line);
+        };
+        for button in [&format.font_grow, &format.font_shrink] {
+            append(&top, button);
         }
+        divider(&top);
+        for button in [&format.bullets, &format.numbering] {
+            append(&top, button);
+        }
+        divider(&top);
+        append(&top, &format.clear_formatting);
+
+        for button in [&format.bold, &format.italic, &format.underline, &format.strikethrough] {
+            append(&bottom, button);
+        }
+        divider(&bottom);
+        append(&bottom, &format.highlight);
         format.color.set_size_request(-1, -1);
-        format.color.set_halign(gtk::Align::Fill);
-        format.color.set_valign(gtk::Align::Fill);
-        format.color.set_vexpand(true);
+        format.color.set_valign(gtk::Align::Center);
+        format.color.set_vexpand(false);
         format.color.add_css_class("compose-format-color");
-        block.attach(&format.color, 5, 1, 1, 1);
-        for (col, button) in [&format.bullets, &format.numbering, &format.outdent, &format.indent].into_iter().enumerate() {
-            place(button, 6 + col as i32, 0);
+        let color = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
+            .spacing(2).valign(gtk::Align::Center).build();
+        let color_icon = gtk::Image::from_icon_name(crate::window::themed_icon_name(&["format-text-color-symbolic", "format-text-bold-symbolic"]));
+        color_icon.set_tooltip_text(Some("Text color"));
+        color.append(&color_icon);
+        color.append(&format.color);
+        bottom.append(&color);
+        divider(&bottom);
+        for button in [&format.align_left, &format.align_center, &format.align_right, &format.justify] {
+            append(&bottom, button);
         }
-        for (col, button) in [&format.align_left, &format.align_center, &format.align_right, &format.justify].into_iter().enumerate() {
-            place(button, 6 + col as i32, 1);
+        divider(&bottom);
+        for button in [&format.outdent, &format.indent] {
+            append(&bottom, button);
         }
+        block.append(&top);
+        block.append(&bottom);
         group.widget(&block);
     });
     editor_band.group("Names", |group| {
