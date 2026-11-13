@@ -2284,11 +2284,17 @@ pub fn build_compose_view(
         let manage_signatures = manage_signatures.clone();
         let signature_popover = signature_popover.clone();
         let anchor = signature_button.downgrade();
-        manage_button.connect_clicked(move |_| {
+        manage_button.connect_clicked(move |button| {
+            // Capture the actual toplevel before closing the popover: the
+            // ribbon may reparent its controls when the menu is dismissed.
+            let parent = anchor.upgrade().and_then(|anchor| anchor.root().and_downcast::<gtk::Window>())
+                .or_else(|| button.root().and_downcast::<gtk::Window>());
+            let fallback = anchor.upgrade().map(|anchor| anchor.upcast::<gtk::Widget>())
+                .unwrap_or_else(|| button.clone().upcast());
             signature_popover.popdown();
-            if let (Some(manage), Some(anchor)) = (manage_signatures.clone(), anchor.upgrade()) {
-                // Release the popover grab before presenting another window.
-                glib::idle_add_local_once(move || manage(anchor.upcast_ref()));
+            if let Some(manage) = manage_signatures.clone() {
+                let anchor = parent.map(|parent| parent.upcast::<gtk::Widget>()).unwrap_or(fallback);
+                glib::idle_add_local_once(move || manage(&anchor));
             }
         });
     }
