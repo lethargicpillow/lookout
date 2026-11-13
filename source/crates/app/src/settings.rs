@@ -1016,6 +1016,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn compiled_schema_contains_every_settings_key() {
+        // resolve() uses Memory in tests, so exercise the real build-time
+        // schema directly. An omitted XML key otherwise aborts the app.
+        let out_dir = std::path::PathBuf::from(env!("OUT_DIR"));
+        let source = gio::SettingsSchemaSource::from_directory(&out_dir, None, false)
+            .expect("build must compile the GSettings schema (install glib-compile-schemas)");
+        let schema = source.lookup(SCHEMA_ID, false)
+            .expect("compiled schema must contain the Lookout schema");
+        let mut missing: Vec<_> = defaults().into_keys()
+            .filter(|key| !schema.has_key(key))
+            .collect();
+        missing.sort_unstable();
+        assert!(missing.is_empty(), "missing GSettings schema keys: {missing:?}");
+        for key in [MAIL_SENT_LIST_COLUMNS, MAIL_LIST_COLUMN_WIDTHS] {
+            let value = schema.key(key).default_value();
+            assert_eq!(value.type_().as_str(), "as", "{key} must be a string array");
+            assert_eq!(value.n_children(), 0, "{key} must default to an empty array");
+        }
+    }
+
+    #[test]
     fn bool_round_trip() {
         let store = resolve();
         store.set_bool(ANIMATE_TRANSITIONS, false);
