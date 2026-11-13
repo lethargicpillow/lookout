@@ -602,7 +602,9 @@ fn sync_dark_view(web_view: &webkit::WebView) {
 
 /// A shared toggle usable in the composer, signature and template editors.
 pub(crate) fn page_background_button() -> gtk::ToggleButton {
-    let button = gtk::ToggleButton::builder().css_classes(["flat"]).build();
+    let button = gtk::ToggleButton::builder().css_classes(["flat"]).valign(gtk::Align::Center).build();
+    button.set_widget_name("page-background-toggle");
+    button.update_property(&[gtk::accessible::Property::Label("Page background")]);
     let weak = button.downgrade();
     crate::settings::observe_page_dark(move |dark| {
         let Some(button) = weak.upgrade() else { return false };
@@ -614,11 +616,41 @@ pub(crate) fn page_background_button() -> gtk::ToggleButton {
                 &["weather-clear-night-symbolic", "night-light-symbolic", "weather-clear-symbolic"]
             }));
         }
-        button.set_tooltip_text(Some(if dark { "View in Light Mode" } else { "View in Dark Mode" }));
+        button.set_tooltip_text(Some(if dark { "Switch page to light background" } else { "Switch page to dark background" }));
         true
     });
     button.connect_toggled(|button| crate::settings::set_page_dark(button.is_active()));
     button
+}
+
+/// A single always-visible page switch, independent of ribbon selection.
+fn compose_tabs_with_page_background(tabs: &gtk::StackSwitcher) -> gtk::Box {
+    let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
+        .spacing(6).hexpand(true).build();
+    row.append(tabs);
+    row.append(&gtk::Box::builder().hexpand(true).build());
+    let label = gtk::Label::new(Some("Page Background"));
+    label.add_css_class("dim-label");
+    row.append(&label);
+    let button = page_background_button();
+    button.set_margin_end(6);
+    row.append(&button);
+    row
+}
+
+/// Only the formatting strip scrolls; the page switch remains accessible
+/// even in a narrow signature or template editor.
+pub(crate) fn editor_format_toolbar(strip: &gtk::Box) -> gtk::Box {
+    let toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
+        .spacing(6).css_classes(["toolbar"]).build();
+    let scroller = gtk::ScrolledWindow::builder().child(strip)
+        .hexpand(true).vexpand(false).propagate_natural_height(true)
+        .propagate_natural_width(false).min_content_width(0)
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vscrollbar_policy(gtk::PolicyType::Never).build();
+    toolbar.append(&scroller);
+    toolbar.append(&page_background_button());
+    toolbar
 }
 
 /// Keep the native editor's original palette when it already matches the
@@ -2621,7 +2653,9 @@ pub fn build_compose_view(
     editor_stack.add_titled(options_band.root(), Some("options"), "Options");
     let tabs = gtk::StackSwitcher::builder().stack(&editor_stack).halign(gtk::Align::Start).build();
     tabs.add_css_class("compose-ribbon-tabs");
-    editor_toolbar.append(&tabs);
+    // Keep the page switch outside all ribbon pages and the overflow menu.
+    // The whole toolbar follows the composer between docked and pop-out.
+    editor_toolbar.append(&compose_tabs_with_page_background(&tabs));
     let ribbon_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(4).hexpand(true).vexpand(false).css_classes(["compose-ribbon-commands"]).build();
     editor_toolbar.append(&ribbon_row);
     let editor_scroller = gtk::ScrolledWindow::builder()
@@ -2834,7 +2868,6 @@ pub fn build_compose_view(
     let moving = Rc::new(Cell::new(false));
     let popped_out = Rc::new(Cell::new(false));
     // Both rich and plain-text pages follow the global appearance.
-    let light_view_button = page_background_button();
     bind_plain_page_theme(&body_view);
     let pop_out_button = gtk::Button::from_icon_name(crate::window::themed_icon_name(&["popout1", "window-new-symbolic", "view-restore-symbolic"]));
     pop_out_button.set_tooltip_text(Some("Pop out compose window"));
@@ -2847,7 +2880,6 @@ pub fn build_compose_view(
         group.small_button(&cancel_button, "user-trash-symbolic", "Discard");
     });
     options_band.group("Window", |group| {
-        group.small_toggle(&light_view_button, "view-reveal-symbolic", "Page Background");
         group.small_button(&pop_out_button, "window-new-symbolic", "Pop Out");
         group.small_button(&dock_button, "view-restore-symbolic", "Dock");
         group.small_button(&close_button, "window-close-symbolic", "Close");
@@ -3387,6 +3419,32 @@ mod tests {
             headers,
             auth_results: None,
         }
+    }
+
+    #[test]
+    fn page_background_toggle_stays_outside_compose_tabs_and_syncs_other_editors() {
+        if !crate::gtk_test::gtk_ready() { return; }
+        let original = crate::settings::page_dark();
+        let stack = gtk::Stack::new();
+        for name in ["message", "insert", "options"] {
+            stack.add_titled(&gtk::Box::new(gtk::Orientation::Vertical, 0), Some(name), name);
+        }
+        let tabs = gtk::StackSwitcher::builder().stack(&stack).build();
+        let row = compose_tabs_with_page_background(&tabs);
+        let button = row.last_child().unwrap().downcast::<gtk::ToggleButton>().unwrap();
+        let other = page_background_button();
+        assert_eq!(button.widget_name(), "page-background-toggle");
+        for name in ["message", "insert", "options"] {
+            stack.set_visible_child_name(name);
+            assert!(button.is_visible());
+            assert_eq!(button.parent().as_ref(), Some(row.upcast_ref::<gtk::Widget>()));
+        }
+        button.set_active(!original);
+        assert_eq!(crate::settings::page_dark(), !original);
+        assert_eq!(other.is_active(), !original);
+        other.set_active(original);
+        assert_eq!(button.is_active(), original);
+        assert_eq!(crate::settings::page_dark(), original);
     }
 
     #[test]
