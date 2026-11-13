@@ -357,10 +357,10 @@ pub fn show_add_account_dialog(
     // do not contact external domains for each partially typed address.
     let detect_button = gtk::Button::with_label("Find settings");
     let setup_status = gtk::Label::builder().wrap(true).halign(gtk::Align::Start).css_classes(["dim-label"]).build();
-    let exchange_entry = gtk::Entry::builder().placeholder_text("https://exchange.example/EWS/Exchange.asmx").hexpand(true).build();
-    let gateway_button = gtk::Button::with_label("Set up DavMail");
+    let approve_button = gtk::Button::with_label("Trust this server and continue");
+    approve_button.set_visible(false);
     if !is_edit {
-        let intro = gtk::Label::builder().label("Enter your email address, then find server settings. For Exchange, set up the local gateway before adding the account.").wrap(true).halign(gtk::Align::Start).build();
+        let intro = gtk::Label::builder().label("Enter your email address and password, then find settings. Exchange server settings are discovered automatically.").wrap(true).halign(gtk::Align::Start).build();
         form.attach(&intro, 0, row, 4, 1);
         row += 1;
     }
@@ -374,10 +374,7 @@ pub fn show_add_account_dialog(
     if !is_edit {
         form.attach(&setup_status, 1, row, 3, 1);
         row += 1;
-        form.attach(&field_label("Exchange EWS URL"), 0, row, 1, 1);
-        form.attach(&exchange_entry, 1, row, 3, 1);
-        row += 1;
-        form.attach(&gateway_button, 1, row, 3, 1);
+        form.attach(&approve_button, 1, row, 3, 1);
         row += 1;
     }
     form.attach(&field_label("IMAP server"), 0, row, 1, 1);
@@ -572,47 +569,86 @@ pub fn show_add_account_dialog(
             })
         };
         let running = Rc::new(std::cell::Cell::new(false));
+        let approved = Rc::new(RefCell::new(Vec::<String>::new()));
+        let pending = Rc::new(RefCell::new(None::<String>));
+        let detected_address = Rc::new(RefCell::new(String::new()));
         let detect = {
             let email = email_entry.clone();
+            let password = imap_password_entry.clone();
             let button = detect_button.clone();
-            let gateway = gateway_button.clone();
-            let exchange = exchange_entry.clone();
+            let approve = approve_button.clone();
             let oab = oab_entry.clone();
             let status = setup_status.clone();
             let save_button = save_button.clone();
             let worker = worker.clone();
             let apply = apply.clone();
             let running = running.clone();
+            let approved = approved.clone();
+            let pending = pending.clone();
+            let detected_address = detected_address.clone();
             Rc::new(move || {
                 if running.replace(true) { return; }
                 let address = email.text().trim().to_owned();
+                if *detected_address.borrow() != address {
+                    approved.borrow_mut().clear();
+                    pending.borrow_mut().take();
+                    *detected_address.borrow_mut() = address.clone();
+                }
                 button.set_sensitive(false);
-                gateway.set_sensitive(false);
+                approve.set_visible(false);
                 save_button.set_sensitive(false);
-                status.set_label("Looking for mail server settings…");
+                status.set_label("Discovering mail and Exchange settings…");
                 let (tx, rx) = async_channel::bounded(1);
                 let request = address.clone();
-                worker.spawn(async move { let _ = tx.send(crate::account_setup::discover(&request).await).await; });
-                let (email, button, gateway, exchange, oab, status, apply, running, save_button) =
-                    (email.clone(), button.clone(), gateway.clone(), exchange.clone(), oab.clone(), status.clone(), apply.clone(), running.clone(), save_button.clone());
+                let secret = password.text().to_string();
+                let trusted = approved.borrow().clone();
+                worker.spawn(async move {
+                    let result = crate::account_setup::discover(&request, &secret, trusted).await;
+                    // The user's explicit Find settings action authorizes
+                    // creation of the local gateway once the verified
+                    // endpoint is known. Never ask for a server URL.
+                    let result = match result {
+                        Ok(Discovery::Exchange { ews: Some(ews), oab }) => {
+                            let endpoint = ews.clone();
+                            match tokio::task::spawn_blocking(move || crate::account_setup::prepare_gateway(&endpoint)).await {
+                                Ok(Ok(())) => Ok(Discovery::Exchange { ews: Some(ews), oab }),
+                                Ok(Err(e)) => Err(e),
+                                Err(_) => Err("Gateway setup stopped".into()),
+                            }
+                        }
+                        other => other,
+                    };
+                    let _ = tx.send(result).await;
+                });
+                let (email, button, approve, oab, status, apply, running, save_button, pending, password) =
+                    (email.clone(), button.clone(), approve.clone(), oab.clone(), status.clone(), apply.clone(), running.clone(), save_button.clone(), pending.clone(), password.clone());
                 glib::spawn_future_local(async move {
                     let result = rx.recv().await;
                     running.set(false);
                     button.set_sensitive(true);
-                    gateway.set_sensitive(true);
                     save_button.set_sensitive(true);
                     if email.text().trim() != address { status.set_label("Email changed. Find settings again."); return; }
                     match result {
                         Ok(Ok(Discovery::Mail { imap, smtp })) => {
                             apply(imap, smtp);
-                            status.set_label("Secure IMAP/SMTP settings found. Enter your password and add the account.");
+                            status.set_label("Secure IMAP/SMTP settings found. Add the account to verify your password.");
                         }
-                        Ok(Ok(Discovery::Exchange { ews, oab: discovered_oab })) => {
-                            if let Some(url) = ews { exchange.set_text(&url); }
-                            if let Some(url) = discovered_oab.filter(|url| crate::oab_sync::valid_url(url)) { oab.set_text(&url); }
-                            status.set_label("Exchange detected. Review or enter the EWS URL, then select Set up DavMail.");
+                        Ok(Ok(Discovery::Exchange { ews: Some(_), oab: discovered_oab })) => {
+                            if let Some(url) = discovered_oab { oab.set_text(&url); }
+                            let server = |port| crate::account_setup::Server { host: "127.0.0.1".into(), port, security: Security::Plain, username: address.clone() };
+                            apply(server(1143), server(1025));
+                            status.set_label("Exchange discovered and DavMail ready. Add the account to verify sign-in; calendar and contacts use the same account.");
                         }
-                        Ok(Ok(Discovery::Microsoft365)) => status.set_label("Microsoft 365 / Outlook.com: use the Microsoft 365 sign-in option in Accounts (OAuth), not a password-only IMAP account."),
+                        Ok(Ok(Discovery::PasswordRequired | Discovery::Exchange { ews: None, .. })) => {
+                            status.set_label("Exchange requires authentication. Enter your password and find settings again.");
+                            password.grab_focus();
+                        }
+                        Ok(Ok(Discovery::ApproveHost(host))) => {
+                            status.set_label(&format!("Autodiscover directs your account to {host}. Trust this server only if it belongs to your organization or mail provider."));
+                            *pending.borrow_mut() = Some(host);
+                            approve.set_visible(true);
+                        }
+                        Ok(Ok(Discovery::Microsoft365)) => status.set_label("Microsoft 365 detected. Use the Microsoft 365 sign-in option in Accounts (OAuth)."),
                         Ok(Err(message)) => status.set_label(&message),
                         Err(_) => status.set_label("Discovery stopped. Try again."),
                     }
@@ -623,53 +659,23 @@ pub fn show_add_account_dialog(
             let detect = detect.clone();
             detect_button.connect_clicked(move |_| detect());
         }
-        email_entry.connect_activate(move |_| detect());
         {
+            let detect = detect.clone();
+            email_entry.connect_activate(move |_| detect());
+        }
+        {
+            let detect = detect.clone();
+            imap_password_entry.connect_activate(move |_| detect());
+        }
+        {
+            let detect = detect.clone();
             let email = email_entry.clone();
-            let exchange = exchange_entry.clone();
-            let status = setup_status.clone();
-            let detect = detect_button.clone();
-            let save_button = save_button.clone();
-            let worker = worker.clone();
-            let running = running.clone();
-            gateway_button.connect_clicked(move |button| {
-                if running.replace(true) { return; }
-                let address = email.text().trim().to_owned();
-                if !crate::recipient_entry::is_plausible_address(&address) {
-                    status.set_label("Enter a valid email address first.");
-                    running.set(false);
-                    return;
+            approve_button.connect_clicked(move |_| {
+                if *detected_address.borrow() != email.text().trim() { return; }
+                if let Some(host) = pending.borrow_mut().take() {
+                    approved.borrow_mut().push(host);
                 }
-                let ews = exchange.text().trim().to_owned();
-                button.set_sensitive(false);
-                detect.set_sensitive(false);
-                save_button.set_sensitive(false);
-                status.set_label("Preparing local DavMail gateway…");
-                let (tx, rx) = async_channel::bounded(1);
-                worker.spawn(async move {
-                    let result = tokio::task::spawn_blocking(move || crate::account_setup::prepare_gateway(&ews)).await
-                        .unwrap_or_else(|_| Err("Gateway setup stopped".into()));
-                    let _ = tx.send(result).await;
-                });
-                let (email, button, detect, save_button, status, apply, running) =
-                    (email.clone(), button.clone(), detect.clone(), save_button.clone(), status.clone(), apply.clone(), running.clone());
-                glib::spawn_future_local(async move {
-                    let result = rx.recv().await;
-                    running.set(false);
-                    button.set_sensitive(true);
-                    detect.set_sensitive(true);
-                    save_button.set_sensitive(true);
-                    if email.text().trim() != address { status.set_label("Email changed. Review gateway settings again."); return; }
-                    match result {
-                        Ok(Ok(())) => {
-                            let server = |port| crate::account_setup::Server { host: "127.0.0.1".into(), port, security: Security::Plain, username: address.clone() };
-                            apply(server(1143), server(1025));
-                            status.set_label("DavMail is listening locally. Enter your Exchange password and add the account. Calendar and contacts use the same account.");
-                        }
-                        Ok(Err(message)) => status.set_label(&message),
-                        Err(_) => status.set_label("Gateway setup stopped. Try again."),
-                    }
-                });
+                detect();
             });
         }
     }
