@@ -8,13 +8,14 @@
 .folder-pane.spacing-loose .folder-tree-content { padding-top: 6px; padding-bottom: 6px; }
 
 .message-list .message-text { margin-top: 3px; margin-bottom: 3px; }
-.message-list .message-thread-row { padding-top: 3px; padding-bottom: 3px; }
+.message-list .message-thread-row { padding-top: 0; padding-bottom: 0; }
+.message-list .message-thread-text { margin-top: 3px; margin-bottom: 3px; }
 .message-list .message-section-header { margin-top: 2px; margin-bottom: 2px; }
 .message-list.spacing-medium .message-text { margin-top: 4px; margin-bottom: 4px; }
-.message-list.spacing-medium .message-thread-row { padding-top: 4px; padding-bottom: 4px; }
+.message-list.spacing-medium .message-thread-text { margin-top: 4px; margin-bottom: 4px; }
 .message-list.spacing-medium .message-section-header { margin-top: 3px; margin-bottom: 3px; }
 .message-list.spacing-loose .message-text { margin-top: 7px; margin-bottom: 7px; }
-.message-list.spacing-loose .message-thread-row { padding-top: 7px; padding-bottom: 7px; }
+.message-list.spacing-loose .message-thread-text { margin-top: 7px; margin-bottom: 7px; }
 .message-list.spacing-loose .message-section-header { margin-top: 5px; margin-bottom: 5px; }
 
 /* No asymmetric margin on centered avatars or selection checkboxes. */
