@@ -117,8 +117,10 @@ struct Preview {
     status: glib::WeakRef<gtk::Label>,
     previous: glib::WeakRef<gtk::Button>,
     next: glib::WeakRef<gtk::Button>,
-    minus: glib::WeakRef<gtk::Button>,
-    plus: glib::WeakRef<gtk::Button>,
+    slider: glib::WeakRef<gtk::Scale>,
+    zoom_label: glib::WeakRef<gtk::Label>,
+    zoom_revision: Cell<u64>,
+    rendered_zoom: Cell<Option<usize>>,
     retry: glib::WeakRef<gtk::Button>,
 }
 impl Preview {
@@ -126,20 +128,44 @@ impl Preview {
         let idle = !self.busy.get();
         let known = self.pages.get() > 0;
         if let Some(label) = self.counter.upgrade() {
-            label.set_text(&format!("Page {} / {}   ·   {}%",
-                self.page.get(), if known { self.pages.get().to_string() } else { "…".into() }, ZOOM[self.zoom.get()]));
+            label.set_text(&format!("{} / {}",
+                self.page.get(), if known { self.pages.get().to_string() } else { "…".into() }));
+        }
+        if let Some(label) = self.zoom_label.upgrade() {
+            label.set_text(&format!("{}%", ZOOM[self.zoom.get()]));
+        }
+        if let Some(slider) = self.slider.upgrade() {
+            // Do not interrupt a drag when rendering starts. Changes are
+            // coalesced and the newest requested zoom wins.
+            slider.set_sensitive(known);
         }
         for (button, enabled) in [
             (&self.previous, self.page.get() > 1),
             (&self.next, known && self.page.get() < self.pages.get()),
-            (&self.minus, known && self.zoom.get() > 0),
-            (&self.plus, known && self.zoom.get() + 1 < ZOOM.len()),
             (&self.retry, true),
         ] {
             if let Some(button) = button.upgrade() {
                 button.set_sensitive(idle && enabled);
             }
         }
+    }
+
+    fn request_zoom(self: &Rc<Self>, value: f64) {
+        let zoom = value.round().clamp(0.0, (ZOOM.len() - 1) as f64) as usize;
+        if self.zoom.replace(zoom) == zoom { return; }
+        self.controls();
+        let revision = self.zoom_revision.get().wrapping_add(1);
+        self.zoom_revision.set(revision);
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local_once(Duration::from_millis(180), move || {
+            let Some(preview) = weak.upgrade() else { return; };
+            if preview.zoom_revision.get() == revision
+                && !preview.busy.get()
+                && preview.rendered_zoom.get() != Some(preview.zoom.get())
+            {
+                preview.begin();
+            }
+        });
     }
 
     fn begin(self: &Rc<Self>) {
@@ -158,18 +184,28 @@ impl Preview {
             let _ = tx.send_blocking(render_page(&bytes, page, zoom, pages));
         });
         if started.is_err() {
-            self.finish(Err("Could not start PDF preview worker.".into()));
+            self.finish(zoom, Err("Could not start PDF preview worker.".into()));
             return;
         }
         let preview = self.clone();
         glib::spawn_future_local(async move {
             let result = rx.recv().await.unwrap_or_else(|_| Err("PDF preview worker stopped.".into()));
-            preview.finish(result);
+            preview.finish(zoom, result);
         });
     }
 
-    fn finish(&self, result: Result<Rendered, String>) {
+    fn finish(self: &Rc<Self>, rendered_zoom: usize, result: Result<Rendered, String>) {
         self.busy.set(false);
+        if self.picture.upgrade().is_none() { return; }
+        // A slider change during a render supersedes that result. Never
+        // present a stale zoom or launch concurrent Poppler subprocesses.
+        if let Ok(rendered) = &result {
+            self.pages.set(rendered.pages);
+        }
+        if self.zoom.get() != rendered_zoom {
+            self.begin();
+            return;
+        }
         let (Some(picture), Some(status), Some(retry)) =
             (self.picture.upgrade(), self.status.upgrade(), self.retry.upgrade()) else { return; };
         let result = result.and_then(|rendered| {
@@ -179,6 +215,7 @@ impl Preview {
         });
         match result {
             Ok(texture) => {
+                self.rendered_zoom.set(Some(rendered_zoom));
                 picture.set_paintable(Some(&texture));
                 picture.set_size_request(texture.width(), texture.height());
                 picture.set_visible(true);
@@ -186,6 +223,7 @@ impl Preview {
                 retry.set_visible(false);
             }
             Err(message) => {
+                self.rendered_zoom.set(None);
                 picture.set_visible(false);
                 status.set_text(&message);
                 status.set_visible(true);
@@ -197,27 +235,34 @@ impl Preview {
 }
 
 pub(super) fn show(content: &gtk::Box, bytes: &[u8]) {
-    let bar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
-        .spacing(8).margin_start(12).margin_end(12).margin_top(8).margin_bottom(8).build();
-    let previous = gtk::Button::with_label("Previous");
-    let next = gtk::Button::with_label("Next");
-    let minus = gtk::Button::with_label("−");
-    let plus = gtk::Button::with_label("+");
-    minus.set_tooltip_text(Some("Zoom out"));
-    plus.set_tooltip_text(Some("Zoom in"));
+    // Only the titlebar is above the document. Navigation and zoom occupy
+    // the narrow side rails, not a horizontal toolbar.
+    let body = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
+        .vexpand(true).hexpand(true).build();
+    let navigation = gtk::Box::builder().orientation(gtk::Orientation::Vertical)
+        .spacing(6).margin_start(8).margin_end(8).valign(gtk::Align::Center).build();
+    let previous = gtk::Button::from_icon_name("go-up-symbolic");
+    previous.set_tooltip_text(Some("Previous page"));
+    let next = gtk::Button::from_icon_name("go-down-symbolic");
+    next.set_tooltip_text(Some("Next page"));
     let counter = gtk::Label::new(None);
+    counter.set_tooltip_text(Some("Current page / Total pages"));
     let retry = gtk::Button::with_label("Retry");
-    for button in [&previous, &next] { bar.append(button); }
-    bar.append(&counter);
-    for button in [&minus, &plus, &retry] { bar.append(button); }
-    content.append(&bar);
+    navigation.append(&previous);
+    navigation.append(&counter);
+    navigation.append(&next);
+    navigation.append(&retry);
+    body.append(&navigation);
+    body.append(&gtk::Separator::new(gtk::Orientation::Vertical));
 
     let status = gtk::Label::new(None);
     status.set_wrap(true);
-    status.set_margin_top(12);
+    status.set_justify(gtk::Justification::Center);
+    status.set_halign(gtk::Align::Center);
+    status.set_valign(gtk::Align::Center);
     status.set_margin_start(12);
     status.set_margin_end(12);
-    content.append(&status);
+    status.set_can_target(false);
     let picture = gtk::Picture::new();
     picture.set_can_shrink(false);
     picture.set_content_fit(gtk::ContentFit::Contain);
@@ -225,29 +270,63 @@ pub(super) fn show(content: &gtk::Box, bytes: &[u8]) {
     picture.set_valign(gtk::Align::Start);
     crate::privacy::mark_blur_all(&picture);
     let scroller = gtk::ScrolledWindow::builder().child(&picture).vexpand(true).hexpand(true).build();
-    content.append(&scroller);
+    let document = gtk::Overlay::new();
+    document.set_hexpand(true);
+    document.set_vexpand(true);
+    document.set_child(Some(&scroller));
+    document.add_overlay(&status);
+    body.append(&document);
+    body.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+
+    let zoom_rail = gtk::Box::builder().orientation(gtk::Orientation::Vertical)
+        .spacing(8).margin_start(8).margin_end(8).valign(gtk::Align::Center).build();
+    let slider = gtk::Scale::with_range(gtk::Orientation::Vertical, 0.0, (ZOOM.len() - 1) as f64, 1.0);
+    slider.set_inverted(true);
+    slider.set_draw_value(false);
+    slider.set_digits(0);
+    slider.set_size_request(-1, 220);
+    slider.set_value(1.0);
+    slider.set_tooltip_text(Some("PDF zoom"));
+    for (index, percent) in ZOOM.iter().enumerate() {
+        slider.add_mark(index as f64, gtk::PositionType::Right, Some(&format!("{percent}%")));
+    }
+    let zoom_label = gtk::Label::new(Some("100%"));
+    zoom_rail.append(&slider);
+    zoom_rail.append(&zoom_label);
+    body.append(&zoom_rail);
+    content.append(&body);
 
     let preview = Rc::new(Preview {
         bytes: Arc::new(bytes.to_vec()), page: Cell::new(1), pages: Cell::new(0),
         zoom: Cell::new(1), busy: Cell::new(false),
         picture: picture.downgrade(), counter: counter.downgrade(), status: status.downgrade(),
-        previous: previous.downgrade(), next: next.downgrade(), minus: minus.downgrade(),
-        plus: plus.downgrade(), retry: retry.downgrade(),
+        previous: previous.downgrade(), next: next.downgrade(),
+        slider: slider.downgrade(), zoom_label: zoom_label.downgrade(),
+        zoom_revision: Cell::new(0), rendered_zoom: Cell::new(None), retry: retry.downgrade(),
     });
-    for (button, action) in [(&previous, 0), (&next, 1), (&minus, 2), (&plus, 3), (&retry, 4)] {
+    for (button, action) in [(&previous, 0), (&next, 1), (&retry, 2)] {
         let preview = preview.clone();
+        let scroller = scroller.downgrade();
         button.connect_clicked(move |_| {
             if preview.busy.get() { return; }
             match action {
                 0 if preview.page.get() > 1 => preview.page.set(preview.page.get() - 1),
                 1 if preview.page.get() < preview.pages.get() => preview.page.set(preview.page.get() + 1),
-                2 if preview.zoom.get() > 0 => preview.zoom.set(preview.zoom.get() - 1),
-                3 if preview.zoom.get() + 1 < ZOOM.len() => preview.zoom.set(preview.zoom.get() + 1),
-                4 => {},
+                2 => {},
                 _ => return,
+            }
+            if action != 2 {
+                if let Some(scroller) = scroller.upgrade() {
+                    let adjustment = scroller.vadjustment();
+                    adjustment.set_value(adjustment.lower());
+                }
             }
             preview.begin();
         });
+    }
+    {
+        let preview = preview.clone();
+        slider.connect_value_changed(move |slider| preview.request_zoom(slider.value()));
     }
     preview.begin();
 }

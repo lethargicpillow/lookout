@@ -280,18 +280,17 @@ pub(crate) fn start_attachment_preview(state: &Rc<RefCell<UiState>>, parent: &gt
         .default_width(860).default_height(640).transient_for(parent).build();
     if let Some(app) = parent.application() { window.set_application(Some(&app)); }
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    let bar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
-        .spacing(6).margin_start(12).margin_end(12).margin_top(8).margin_bottom(8).build();
+    // File actions share the window's existing titlebar instead of consuming
+    // a second horizontal strip above the attachment.
+    let header = gtk::HeaderBar::new();
     let actions = ["Open", "Open With…", "Save…"].map(gtk::Button::with_label);
-    for button in &actions { button.set_sensitive(false); bar.append(button); }
+    for button in &actions { button.set_sensitive(false); header.pack_start(button); }
     let label = gtk::Label::new(Some(&format!("{} · {}", attachment_display_name(part), human_size(part.size.into()))));
-    label.set_hexpand(true);
-    label.set_xalign(1.0);
     label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    label.set_max_width_chars(36);
     crate::privacy::mark(&label);
-    bar.append(&label);
-    root.append(&bar);
-    root.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    header.set_title_widget(Some(&label));
+    window.set_titlebar(Some(&header));
     let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).vexpand(true).hexpand(true).build();
     preview_status(&content, "Loading attachment…");
     root.append(&content);
