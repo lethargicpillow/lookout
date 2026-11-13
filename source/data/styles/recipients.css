@@ -139,3 +139,6 @@ button.compose-send { padding: 4px 6px; }
 }
 .compose-completion-panel list { background-color: @view_bg_color; }
 .compose-completion-panel row { padding: 2px; }
+
+/* Reflect formatting at the editor caret without changing button geometry. */
+button.compose-format-active { background-color: alpha(@accent_bg_color, 0.20); }

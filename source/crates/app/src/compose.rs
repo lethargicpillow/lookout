@@ -984,6 +984,78 @@ pub(crate) async fn read_content(web_view: &webkit::WebView) -> Option<EditorCon
     Some(EditorContent { html, text, images })
 }
 
+const EDITOR_FORMAT_SCRIPT: &str = r#"(function () {
+    if (window.__lookoutReportFormat) return;
+    let queued = false;
+    let last = '';
+    function report() {
+        if (queued) return;
+        queued = true;
+        requestAnimationFrame(() => {
+            queued = false;
+            const sel = window.getSelection();
+            if (!sel || !sel.rangeCount || !document.body.contains(sel.anchorNode)) return;
+            const node = sel.anchorNode.nodeType === 1 ? sel.anchorNode : sel.anchorNode.parentElement;
+            if (!node) return;
+            const css = getComputedStyle(node);
+            const commands = ['Bold', 'Italic', 'Underline', 'StrikeThrough',
+                'InsertUnorderedList', 'InsertOrderedList', 'JustifyLeft',
+                'JustifyCenter', 'JustifyRight', 'JustifyFull'];
+            const active = commands.map(command => !!document.queryCommandState(command));
+            if (!active.slice(6).some(Boolean)) {
+                const align = css.textAlign;
+                active[6] = align === 'left' || align === 'start' || align === 'normal';
+                active[7] = align === 'center';
+                active[8] = align === 'right' || align === 'end';
+                active[9] = align === 'justify';
+            }
+            const payload = JSON.stringify({
+                active,
+                family: document.queryCommandValue('FontName') || css.fontFamily,
+                size: String(document.queryCommandValue('FontSize') || ''),
+                points: parseFloat(css.fontSize) * 0.75
+            });
+            if (payload === last) return;
+            last = payload;
+            window.webkit.messageHandlers.lookoutEditorFormat.postMessage(payload);
+        });
+    }
+    window.__lookoutReportFormat = report;
+    for (const event of ['selectionchange', 'input', 'keyup', 'mouseup', 'focusin']) {
+        document.addEventListener(event, report);
+    }
+    report();
+})()"#;
+
+const EDITOR_FONT_FAMILIES: [&str; 13] = ["sans-serif", "Arial", "Calibri", "Aptos", "Verdana", "Tahoma", "Times New Roman", "Liberation Sans", "Liberation Serif", "DejaVu Sans", "Noto Sans", "Courier New", "monospace"];
+const EDITOR_FONT_POINTS: [f64; 7] = [8.0, 10.0, 12.0, 14.0, 18.0, 24.0, 36.0];
+
+fn editor_font_family_index(value: &str) -> u32 {
+    for family in value.split(',').map(|part| part.trim().trim_matches(['\'', '"'])) {
+        if let Some(i) = EDITOR_FONT_FAMILIES.iter().position(|name| name.eq_ignore_ascii_case(family)) {
+            return i as u32;
+        }
+    }
+    gtk::INVALID_LIST_POSITION
+}
+
+fn editor_font_size_index(value: &str, points: Option<f64>) -> u32 {
+    // WebKit may report legacy HTML font sizes (1..7). Otherwise prefer
+    // the actual CSS size. Do not claim an unlisted size is a listed one.
+    if let Ok(size) = value.parse::<u32>() {
+        if (1..=7).contains(&size) { return size - 1; }
+    }
+    points.and_then(|p| EDITOR_FONT_POINTS.iter().position(|v| (p - v).abs() < 0.25))
+        .map(|i| i as u32).unwrap_or(gtk::INVALID_LIST_POSITION)
+}
+
+fn refresh_editor_format(web: &webkit::WebView) {
+    let web = web.clone();
+    glib::spawn_future_local(async move {
+        let _ = web.evaluate_javascript_future("window.__lookoutReportFormat?.()", None, None).await;
+    });
+}
+
 /// Adds a toolbar button that fires a plain WebKit editing command (bold,
 /// italic, list, ...) on click. Built exactly like the main window's ribbon
 /// command-toolbar buttons (`gtk::Button::from_icon_name` + tooltip), so the
@@ -993,7 +1065,10 @@ fn toolbar_command_button(icon_name: &str, tooltip: &str, command: &'static str,
     let button = gtk::Button::from_icon_name(icon_name);
     button.set_tooltip_text(Some(tooltip));
     let web_view = web_view.clone();
-    button.connect_clicked(move |_| web_view.execute_editing_command(command));
+    button.connect_clicked(move |_| {
+        web_view.execute_editing_command(command);
+        refresh_editor_format(&web_view);
+    });
     button
 }
 
@@ -1515,7 +1590,10 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, F
         .enable_javascript(true)
         .hardware_acceleration_policy(webkit::HardwareAccelerationPolicy::Never)
         .build();
-    let web_view = Rc::new(webkit::WebView::builder().editable(true).settings(&settings).web_context(&compose_web_context()).build());
+    let content_manager = webkit::UserContentManager::new();
+    let web_view = Rc::new(webkit::WebView::builder().editable(true).settings(&settings)
+        .web_context(&compose_web_context()).user_content_manager(&content_manager).build());
+    let syncing_format = Rc::new(Cell::new(false));
     // The page canvas follows the shared reading/editor switch, not the
     // surrounding application theme.
     web_view.set_background_color(&crate::theme::page_canvas(crate::settings::page_dark()));
@@ -1626,9 +1704,12 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, F
     let font_size = gtk::DropDown::builder().model(&font_sizes).selected(2).tooltip_text("Font size").build();
     {
         let web_view = web_view.clone();
+        let syncing = syncing_format.clone();
         font_size.connect_selected_notify(move |dropdown| {
+            if syncing.get() { return; }
             if let Some(arg) = font_size_args.get(dropdown.selected() as usize) {
                 web_view.execute_editing_command_with_argument("FontSize", arg);
+                refresh_editor_format(&web_view);
             }
         });
     }
@@ -1725,7 +1806,7 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, F
     let horizontal_rule = toolbar_command_button("insert-hr-symbolic", "Horizontal rule", "InsertHorizontalRule", &web_view);
     let clear_formatting = toolbar_command_button("edit-clear-all-symbolic", "Remove formatting", "RemoveFormat", &web_view);
 
-    let font_family_args = ["sans-serif", "Arial", "Calibri", "Aptos", "Verdana", "Tahoma", "Times New Roman", "Liberation Sans", "Liberation Serif", "DejaVu Sans", "Noto Sans", "Courier New", "monospace"];
+    let font_family_args = EDITOR_FONT_FAMILIES;
     let font_families = gtk::StringList::new(&font_family_args);
     let font_family = gtk::DropDown::builder().model(&font_families).selected(0).tooltip_text("Font family").build();
     // A GtkDropDown otherwise measures every font name and propagates the
@@ -1762,9 +1843,12 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, F
     font_family.set_list_factory(Some(&list_factory));
     {
         let web_view = web_view.clone();
+        let syncing = syncing_format.clone();
         font_family.connect_selected_notify(move |dropdown| {
+            if syncing.get() { return; }
             if let Some(arg) = font_family_args.get(dropdown.selected() as usize) {
                 web_view.execute_editing_command_with_argument("FontName", arg);
+                refresh_editor_format(&web_view);
             }
         });
     }
@@ -1888,6 +1972,48 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, F
         table: table_button,
         image: insert_image_button,
     };
+    // Each editor owns its own bridge and weak control references. A
+    // selection update only changes the toolbar; it never edits the body.
+    let tracked = [&controls.bold, &controls.italic, &controls.underline,
+        &controls.strikethrough, &controls.bullets, &controls.numbering,
+        &controls.align_left, &controls.align_center, &controls.align_right, &controls.justify]
+        .map(|button| button.downgrade());
+    let family = controls.font_family.downgrade();
+    let size = controls.font_size.downgrade();
+    content_manager.connect_script_message_received(Some("lookoutEditorFormat"), move |_, value| {
+        let Ok(state) = serde_json::from_str::<serde_json::Value>(&value.to_string()) else { return };
+        let Some(active) = state.get("active").and_then(|v| v.as_array()) else { return };
+        if active.len() != tracked.len() || active.iter().any(|v| !v.is_boolean()) { return; }
+        for (button, selected) in tracked.iter().zip(active) {
+            if let Some(button) = button.upgrade() {
+                if selected.as_bool() == Some(true) {
+                    button.add_css_class("compose-format-active");
+                } else {
+                    button.remove_css_class("compose-format-active");
+                }
+            }
+        }
+        syncing_format.set(true);
+        if let (Some(family), Some(value)) = (family.upgrade(), state.get("family").and_then(|v| v.as_str())) {
+            let index = editor_font_family_index(value);
+            if family.selected() != index { family.set_selected(index); }
+        }
+        if let Some(size) = size.upgrade() {
+            let index = editor_font_size_index(state.get("size").and_then(|v| v.as_str()).unwrap_or(""),
+                state.get("points").and_then(|v| v.as_f64()));
+            if size.selected() != index { size.set_selected(index); }
+        }
+        syncing_format.set(false);
+    });
+    if content_manager.register_script_message_handler("lookoutEditorFormat", None) {
+        web_view.connect_load_changed(|view, event| {
+            if event != webkit::LoadEvent::Finished { return; }
+            let view = view.clone();
+            glib::spawn_future_local(async move {
+                let _ = view.evaluate_javascript_future(EDITOR_FORMAT_SCRIPT, None, None).await;
+            });
+        });
+    }
     (web_view, controls)
 }
 
@@ -3613,6 +3739,16 @@ mod tests {
             headers,
             auth_results: None,
         }
+    }
+
+    #[test]
+    fn editor_format_selection_maps_known_fonts_and_sizes_without_guessing() {
+        assert_eq!(editor_font_family_index("'Calibri', sans-serif"), 2);
+        assert_eq!(editor_font_family_index("system-ui, sans-serif"), 0);
+        assert_eq!(editor_font_family_index("Unknown Font"), gtk::INVALID_LIST_POSITION);
+        assert_eq!(editor_font_size_index("3", Some(12.0)), 2);
+        assert_eq!(editor_font_size_index("", Some(18.0)), 4);
+        assert_eq!(editor_font_size_index("", Some(11.0)), gtk::INVALID_LIST_POSITION);
     }
 
     #[test]
