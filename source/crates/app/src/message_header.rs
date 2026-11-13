@@ -26,6 +26,8 @@ pub struct MessageHeader {
     pub(crate) sender_name_label: gtk::Label,
     sender_email_label: gtk::Label,
     to_label: gtk::Label,
+    cc_label: gtk::Label,
+    bcc_label: gtk::Label,
     date_label: gtk::Label,
     pub reply_button: gtk::Button,
     pub reply_all_button: gtk::Button,
@@ -71,6 +73,7 @@ pub fn build() -> MessageHeader {
         .build();
     subject_bar.append(&back_button);
     subject_bar.append(&subject_label);
+    crate::privacy::mark(&subject_label);
 
     let avatar_label = gtk::Label::builder()
         .css_classes(["avatar-circle"])
@@ -153,18 +156,19 @@ pub fn build() -> MessageHeader {
     // Do not show a dead More button in every opened message.
     header_more_button.set_visible(false);
 
-    let to_label = gtk::Label::builder()
-        .xalign(0.0)
-        .hexpand(true)
-        .css_classes(["message-header-meta"])
-        .ellipsize(gtk::pango::EllipsizeMode::End)
-        .build();
-    // The "To:" recipient list.
-    crate::privacy::mark(&to_label);
-    let date_label = gtk::Label::builder().css_classes(["message-header-meta"]).valign(gtk::Align::Center).build();
-    let meta_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
-    meta_row.append(&to_label);
-    meta_row.append(&date_label);
+    let recipient_label = || {
+        let label = gtk::Label::builder().xalign(0.0).hexpand(true)
+            .wrap(true).wrap_mode(gtk::pango::WrapMode::WordChar)
+            .selectable(true).css_classes(["message-header-meta"]).build();
+        crate::privacy::mark(&label);
+        label
+    };
+    let to_label = recipient_label();
+    let cc_label = recipient_label();
+    let bcc_label = recipient_label();
+    let date_label = gtk::Label::builder().xalign(0.0).css_classes(["message-header-meta"]).build();
+    let meta_row = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(3).build();
+    for label in [&to_label, &cc_label, &bcc_label, &date_label] { meta_row.append(label); }
 
     let widget = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -187,6 +191,8 @@ pub fn build() -> MessageHeader {
         sender_name_label,
         sender_email_label,
         to_label,
+        cc_label,
+        bcc_label,
         date_label,
         reply_button,
         reply_all_button,
@@ -220,12 +226,30 @@ impl MessageHeader {
             }
         }
 
-        let to = summary.to.iter().map(|a| a.display_label()).collect::<Vec<_>>().join(", ");
-        self.to_label.set_label(&format!("To: {to}"));
+        set_recipient_line(&self.to_label, "To", &summary.to);
+        set_recipient_line(&self.cc_label, "Cc", &summary.cc);
+        self.bcc_label.set_label("");
+        self.bcc_label.set_visible(false);
 
         self.date_label
             .set_label(&summary.date.with_timezone(&chrono::Local).format("%a %d/%m/%Y %I:%M %p").to_string());
     }
+
+    /// Bcc is deliberately not in EmailSummary: display it only if the
+    /// opened message actually contains a Bcc header, never infer it.
+    pub fn update_body_headers(&self, headers: &[(String, String)]) {
+        let raw = headers.iter().filter(|(name, _)| name.eq_ignore_ascii_case("bcc"))
+            .map(|(_, value)| value.trim()).filter(|value| !value.is_empty())
+            .collect::<Vec<_>>().join(", ");
+        self.bcc_label.set_label(&format!("Bcc: {raw}"));
+        self.bcc_label.set_visible(!raw.is_empty());
+    }
+}
+
+fn set_recipient_line(label: &gtk::Label, prefix: &str, addresses: &[lookout_core::EmailAddress]) {
+    let text = addresses.iter().map(|a| a.display_label()).collect::<Vec<_>>().join(", ");
+    label.set_label(&format!("{prefix}: {text}"));
+    label.set_visible(!addresses.is_empty());
 }
 
 /// First+last initials for a multi-word name ("Microsoft Security" -> "MS",

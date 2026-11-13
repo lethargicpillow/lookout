@@ -588,6 +588,7 @@ fn render_data(state: &Rc<RefCell<UiState>>, entry: &Rc<RefCell<MessageWindowSta
         )
     };
     header.update(&summary);
+    header.update_body_headers(&body.headers);
 
     // Sender-authentication (6.1), external-sender (6.2) and sensitivity
     // (6.5) info bars, mirroring the reading pane's.

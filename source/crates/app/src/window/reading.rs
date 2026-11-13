@@ -1187,6 +1187,7 @@ pub(crate) fn render_body(
         message_header.back_button.set_visible(st.rendered_conversation.is_some());
         if let Some(summary) = st.pending_header.take() {
             message_header.update(&summary);
+            message_header.update_body_headers(&body.headers);
             rendered_follow_up = summary.follow_up().map(|flag| (mailbox.clone(), uid, flag));
             let sender = summary.from.first().map(|a| a.address.trim().to_lowercase());
             st.rendered_trust_sender = mailbox_account_id(&mailbox).zip(sender);

@@ -2199,9 +2199,16 @@ async fn connect_and_run(
                         // sent. Archive the sent copy, then delete the draft
                         // it replaces so a queued send leaves drafts in place
                         // until it actually lands.
-                        if let Some(sent_id) = archive_sent_message(&mut session, &folders, &account_id, &raw).await {
-                            sent_to_sync.get_or_insert(sent_id);
-                        }
+                        // DavMail SMTP saves to Exchange Sent Items itself
+                        // by default. A second IMAP APPEND creates a duplicate
+                        // (one delivery, two server-side copies). Only the
+                        // conventional paired local bridge gets this policy.
+                        let sent_id = if davmail_saves_sent(&config.imap, &config.smtp) {
+                            folders.iter().find(|m| matches!(m.role, lookout_core::MailboxRole::Sent)).map(|m| m.id.clone())
+                        } else {
+                            archive_sent_message(&mut session, &folders, &account_id, &raw).await
+                        };
+                        if let Some(sent_id) = sent_id { sent_to_sync.get_or_insert(sent_id); }
                         if let Some(draft_id) = message.draft_message_id.as_deref() {
                             if let Err(e) = delete_draft(&mut session, &folders, &account_id, draft_id, has_uidplus).await {
                                 tracing::warn!("message sent but deleting its draft failed: {e}");
@@ -6558,6 +6565,16 @@ fn is_authentication_rejection(error: &async_imap::error::Error) -> bool {
 fn is_local_davmail_endpoint(endpoint: &crate::EndpointConfig, has_idle: bool) -> bool {
     !has_idle && endpoint.port == 1143 && endpoint.security == Security::Plain
         && matches!(endpoint.host.to_ascii_lowercase().as_str(), "localhost" | "127.0.0.1" | "::1")
+}
+
+/// Paired local DavMail endpoints; independent of optional IMAP IDLE.
+/// Assumes the bridge's default SMTP save-in-Sent setting is enabled.
+fn davmail_saves_sent(imap: &crate::EndpointConfig, smtp: &crate::EndpointConfig) -> bool {
+    let local = |endpoint: &crate::EndpointConfig, port| {
+        endpoint.port == port && endpoint.security == Security::Plain
+            && matches!(endpoint.host.to_ascii_lowercase().as_str(), "localhost" | "127.0.0.1" | "::1")
+    };
+    local(imap, 1143) && local(smtp, 1025)
 }
 
 async fn login(config: &AccountConfig, credential: Credential) -> Result<(Session<SessionStream>, ServerCapabilities)> {
