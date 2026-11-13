@@ -923,6 +923,7 @@ struct MessageRowKey {
     importance: lookout_core::Importance,
     follow_up: Option<lookout_core::FollowUpFlag>,
     mentions: bool,
+    has_attachment: bool,
 }
 
 /// A compact fingerprint of the fields one message-list row displays, keyed
@@ -969,6 +970,7 @@ fn message_row_key(m: &EmailSummary) -> MessageRowKey {
         // filter; it arrives with `PreviewsFetched`, so a late patch must
         // count as a change.
         mentions: m.mentions,
+        has_attachment: m.has_attachment,
     }
 }
 
@@ -1739,6 +1741,18 @@ impl MessageListModel {
         // render stale data.
         *self.truth.borrow_mut() = messages;
         self.recompute_and_apply(sort_key, sort_descending);
+    }
+
+    /// Correct a message's attachment badge without changing selection or
+    /// rebuilding the list when the envelope estimate was already correct.
+    pub(crate) fn update_attachment_flag(&self, mailbox: &MailboxId, uid: Uid, has_attachment: bool, sort_key: SortKey, descending: bool) {
+        {
+            let mut truth = self.truth.borrow_mut();
+            let Some(message) = truth.iter_mut().find(|m| &m.mailbox == mailbox && m.uid == uid) else { return; };
+            if message.has_attachment == has_attachment { return; }
+            message.has_attachment = has_attachment;
+        }
+        self.recompute_and_apply(sort_key, descending);
     }
 
     /// Splices one account's slice into `truth` in place - for the unified
@@ -3589,6 +3603,9 @@ mod tests {
         let mut read_flip = a.clone();
         read_flip[0].flags = std::collections::BTreeSet::from([lookout_core::SystemFlagBit::Seen]);
         assert!(!same_message_list(&a, &read_flip));
+        let mut attachment_flip = a.clone();
+        attachment_flip[0].has_attachment = true;
+        assert!(!same_message_list(&a, &attachment_flip));
 
         // A preview arriving is a real change - the two-phase sync's second
         // event differs from the first in nothing else, so if this compared

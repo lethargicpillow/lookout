@@ -979,6 +979,19 @@ pub(crate) fn spawn_account_event_loop(
                             st.body_cache.insert(mailbox.clone(), uid, Rc::clone(&body));
                             is_current
                         };
+                        // The assembled body is authoritative for the visible
+                        // attachment strip (e.g. TNEF with only RTF).
+                        let has_attachment = body.parts.iter().any(|part| part.is_attachment);
+                        {
+                            let mut st = state.borrow_mut();
+                            if let Some(snapshot) = st.unified_snapshots.get_mut(&mailbox) {
+                                if let Some(message) = snapshot.iter_mut().find(|m| m.uid == uid) {
+                                    message.has_attachment = has_attachment;
+                                }
+                            }
+                        }
+                        let (key, descending) = current_sort(&state);
+                        message_list.update_attachment_flag(&mailbox, uid, has_attachment, key, descending);
                         // A message-menu action waiting for this body (item
                         // 1.17) runs once the borrow above is dropped.
                         let waiter = {
