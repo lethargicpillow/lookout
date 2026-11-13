@@ -457,7 +457,7 @@ pub(crate) fn directory_accounts(state: &UiState) -> Vec<(AccountId, String)> {
         }
     }
     let mut accounts: Vec<_> = ids.into_iter().filter(|id| state.account_enabled(id)).map(|id| {
-        let label = state.contacts_by_account.get(&id).map(|a| a.display_name.clone())
+        let label = state.contacts_by_account.get(&id).map(|a| a.display_name().to_owned())
             .or_else(|| state.accounts.get(&id).map(|a| a.display_name.clone()))
             .or_else(|| config.other_accounts.iter().find(|a| a.id == id.0).map(|a| a.display_name.clone()))
             .unwrap_or_else(|| id.0.clone());

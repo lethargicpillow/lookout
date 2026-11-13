@@ -879,7 +879,6 @@ fn show_create_contact_with_seed(
     }
     let (books, book_accounts, fallback_account) = {
         let st = state.borrow();
-        let directory_accounts = crate::directory::directory_accounts(&st);
         let mut accounts: Vec<(&AccountId, &ContactsAccountSnapshot)> = st.contacts_by_account.iter().collect();
         accounts.sort_by_key(|(_, snapshot)| snapshot.display_name.to_lowercase());
         // The email's own account's books come first, so the picker defaults
@@ -1602,6 +1601,7 @@ pub fn refresh_contacts_category_ui(
 
     {
         let st = state.borrow();
+        let directory_accounts = crate::directory::directory_accounts(&st);
         let mut accounts: Vec<(&AccountId, &ContactsAccountSnapshot)> = st.contacts_by_account.iter().collect();
         accounts.sort_by_cached_key(|(_, data)| data.display_name.to_lowercase());
 

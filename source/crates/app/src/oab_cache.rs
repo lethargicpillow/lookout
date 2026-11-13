@@ -47,6 +47,7 @@ pub(crate) fn import_for_email(email: &str, file: &Path) -> Result<(usize, usize
     if matches.len() != 1 { return Err("Expected exactly one configured DavMail account matching that email/login".into()); }
     let bytes = std::fs::read(file).map_err(|e| e.to_string())?;
     let book = crate::oab_decode::decode(&bytes)?;
+    tracing::debug!(properties = book.properties.len(), populated_properties = book.present_counts.len(), records = book.declared_records, "Decoded OAB schema");
     let root = cache_root();
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     #[cfg(unix)]
