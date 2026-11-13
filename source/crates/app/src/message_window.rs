@@ -203,6 +203,7 @@ pub(crate) fn open_message_window(parent: &adw::ApplicationWindow, state: &Rc<Re
         .top_margin(12)
         .bottom_margin(12)
         .build();
+    crate::compose::bind_plain_page_theme(&text_view);
     let text_scroller = gtk::ScrolledWindow::builder().child(&text_view).build();
     let content_stack = gtk::Stack::new();
     content_stack.set_widget_name("body");
@@ -292,6 +293,12 @@ pub(crate) fn open_message_window(parent: &adw::ApplicationWindow, state: &Rc<Re
     // can't fire for the initial state.
     let initial_dark = state.borrow().message_theme_dark_default();
     header.theme_button.set_active(initial_dark);
+    header.theme_button.set_icon_name(if initial_dark {
+        crate::window::themed_icon_name(&["weather-clear-symbolic", "display-brightness-symbolic"])
+    } else {
+        crate::window::themed_icon_name(&["weather-clear-night-symbolic", "night-light-symbolic", "weather-clear-symbolic"])
+    });
+    header.theme_button.set_tooltip_text(Some(if initial_dark { "View in Light Mode" } else { "View in Dark Mode" }));
     crate::window::set_message_theme_armed(initial_dark, &web_view, &user_content_manager, &theme_override_sheet);
 
     // The initial body: render straight from the cache when it's already
