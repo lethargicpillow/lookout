@@ -418,18 +418,15 @@ fn ldap_directories_in_scope<'a>(config: &'a AppConfig, account: Option<&Account
         .collect()
 }
 
-/// Whether the People rail should offer its Directory row: at least one
-/// Microsoft 365 account the user has opted into GAL search for, or one
-/// enabled LDAP directory (item 4.7.8). Pure, so the visibility rule is
-/// unit-tested without a window or a live directory; a configured but
-/// unconsented GAL still shows the row, and its search simply answers empty
-/// until the opt-in flow is completed.
-pub(crate) fn directory_configured(config: &AppConfig, graph_accounts: &[AccountId]) -> bool {
-    graph_accounts.iter().any(|account_id| config.directory_enabled_for(account_id)) || config.ldap_directories.iter().any(|directory| directory.enabled)
+/// Explicitly configured directory owners, excluding automatic DavMail/OAB
+/// discovery. Shared by the People rail and its configuration tests.
+fn configured_directory_accounts(config: &AppConfig, graph_accounts: &[AccountId]) -> HashSet<AccountId> {
+    graph_accounts.iter().filter(|id| config.directory_enabled_for(id)).cloned()
+        .chain(config.ldap_directories.iter().filter(|d| d.enabled).map(|d| d.account_id.clone()))
+        .collect()
 }
 
-/// [`directory_configured`] for the running window: the Graph-capable
-/// accounts are the ones that own a Microsoft 365 mailbox (`graph_pin`).
+/// Whether the People rail has an enabled directory owner.
 pub(crate) fn directory_configured_for_state(state: &UiState) -> bool {
     !directory_accounts(state).is_empty()
 }
@@ -438,15 +435,9 @@ pub(crate) fn directory_configured_for_state(state: &UiState) -> bool {
 /// directory-only accounts even before their contacts snapshot has arrived.
 pub(crate) fn directory_accounts(state: &UiState) -> Vec<(AccountId, String)> {
     let config = state.app_config.borrow();
-    let mut ids = HashSet::new();
-    for (id, handle) in &state.accounts {
-        if handle.graph_pin.is_some() && config.directory_enabled_for(id) {
-            ids.insert(id.clone());
-        }
-    }
-    for directory in &config.ldap_directories {
-        if directory.enabled { ids.insert(directory.account_id.clone()); }
-    }
+    let graph_accounts: Vec<_> = state.accounts.iter()
+        .filter(|(_, handle)| handle.graph_pin.is_some()).map(|(id, _)| id.clone()).collect();
+    let mut ids = configured_directory_accounts(&config, &graph_accounts);
     for account in &config.other_accounts {
         let id = AccountId(account.id.clone());
         if crate::other_accounts::davmail_accounts(account).is_some()
@@ -649,20 +640,20 @@ mod tests {
     fn directory_configured_needs_an_opt_in_or_an_enabled_ldap_directory() {
         let account = AccountId("account_1".into());
         let mut config = AppConfig::default();
-        assert!(!directory_configured(&config, &[]));
-        assert!(!directory_configured(&config, std::slice::from_ref(&account)));
+        assert!(configured_directory_accounts(&config, &[]).is_empty());
+        assert!(configured_directory_accounts(&config, std::slice::from_ref(&account)).is_empty());
 
         // A GAL opt-in counts only for an account that is actually Graph
         // capable (the caller passes just those ids).
         config.set_directory_enabled(&account, true);
-        assert!(directory_configured(&config, std::slice::from_ref(&account)));
-        assert!(!directory_configured(&config, &[]));
+        assert_eq!(configured_directory_accounts(&config, std::slice::from_ref(&account)), HashSet::from([account.clone()]));
+        assert!(configured_directory_accounts(&config, &[]).is_empty());
 
         // An enabled LDAP directory is enough on its own; a disabled one is not.
         config.directory_accounts.clear();
         config.ldap_directories = vec![ldap("ldap:a", "account_1", true)];
-        assert!(directory_configured(&config, &[]));
+        assert_eq!(configured_directory_accounts(&config, &[]), HashSet::from([account.clone()]));
         config.ldap_directories[0].enabled = false;
-        assert!(!directory_configured(&config, &[]));
+        assert!(configured_directory_accounts(&config, &[]).is_empty());
     }
 }
