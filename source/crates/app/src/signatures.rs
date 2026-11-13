@@ -17,7 +17,7 @@ use lookout_core::Signature;
 use crate::app_config::AppConfig;
 
 /// Manage the saved signatures and the two per-account defaults in a
-/// single nonmodal transient window, without leaving the active composer.
+/// single embedded dialog, without leaving the active composer.
 pub(crate) fn show_manager(
     anchor: &gtk::Widget,
     app_config: Rc<RefCell<AppConfig>>,
@@ -27,32 +27,16 @@ pub(crate) fn show_manager(
 ) {
     accounts.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.0.cmp(&b.0.0)));
     let accounts = Rc::new(accounts);
-    // A caller can pass the captured toplevel directly, even when its
-    // originating ribbon control is temporarily detached.
     let Some(parent) = anchor.clone().downcast::<gtk::Window>().ok()
         .or_else(|| anchor.root().and_downcast::<gtk::Window>()) else {
         tracing::warn!("signature manager: missing parent window");
         return;
     };
-    // Only one manager per composer window. A nonmodal transient stays with
-    // its parent without blocking the other Lookout windows.
-    let toplevels = gtk::Window::toplevels();
-    for index in 0..toplevels.n_items() {
-        if let Some(existing) = toplevels.item(index).and_downcast::<gtk::Window>() {
-            if existing.widget_name() == "lookout-signature-manager"
-                && existing.transient_for().as_ref() == Some(&parent)
-                && existing.is_visible()
-            {
-                existing.present();
-                return;
-            }
-        }
-    }
-    let dialog = gtk::Window::builder().title("Signatures and Stationery")
-        .modal(false).destroy_with_parent(true)
-        .default_width(780).default_height(520).build();
-    dialog.set_widget_name("lookout-signature-manager");
-    dialog.set_transient_for(Some(&parent));
+    let dialog = adw::Dialog::builder().title("Signatures and Stationery")
+        .content_width(780).content_height(520).build();
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+    dialog.set_child(Some(&toolbar));
     let root = gtk::Box::builder().orientation(gtk::Orientation::Vertical)
         .spacing(12).margin_top(16).margin_bottom(16).margin_start(16).margin_end(16).build();
     let columns = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(16).vexpand(true).build();
@@ -101,7 +85,7 @@ pub(crate) fn show_manager(
     done.add_css_class("suggested-action");
     done.set_halign(gtk::Align::End);
     root.append(&done);
-    dialog.set_child(Some(&root));
+    toolbar.set_content(Some(&root));
 
     let ids: Rc<RefCell<Vec<uuid::Uuid>>> = Rc::new(RefCell::new(Vec::new()));
     let selected_id: Rc<dyn Fn() -> Option<uuid::Uuid>> = {
@@ -212,7 +196,8 @@ pub(crate) fn show_manager(
         done.connect_clicked(move |_| dialog.close());
     }
     refresh();
-    dialog.present();
+    tracing::debug!("signature manager: presenting embedded dialog");
+    dialog.present(Some(&parent));
 }
 
 /// Presents the modal signature editor, anchored to `anchor`'s window when
