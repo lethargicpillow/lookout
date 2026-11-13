@@ -452,6 +452,21 @@ impl RowDisplay {
     /// column for the single-line column band.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply(self, avatar: &gtk::Overlay, checkbox: &gtk::CheckButton, preview: &gtk::Label, three_line: &impl IsA<gtk::Widget>, single_line: &impl IsA<gtk::Widget>) {
+        let size = if self.single_line { 24 } else { 32 };
+        avatar.set_size_request(size, size);
+        avatar.set_valign(gtk::Align::Center);
+        let mut child = avatar.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            if widget.is::<gtk::Label>() || widget.is::<gtk::Picture>() {
+                widget.set_size_request(size, size);
+            }
+        }
+        checkbox.set_size_request(size, size);
+        checkbox.set_valign(gtk::Align::Center);
+        if let Some(leading) = avatar.parent() {
+            leading.set_valign(gtk::Align::Center);
+        }
         avatar.set_visible(!self.select_mode && self.show_sender_images);
         checkbox.set_visible(self.select_mode);
         apply_preview_lines(preview, self.preview_lines);

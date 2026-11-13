@@ -224,7 +224,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 .height_request(14)
                 .build();
             let count = gtk::Label::builder().xalign(1.0).css_classes(["folder-unread-count"]).build();
-            let row_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
+            let row_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6)
+                .css_classes(["folder-tree-content"]).build();
             row_box.append(&icon);
             row_box.append(&label);
             row_box.append(&spinner);
@@ -550,6 +551,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     }
 
     let folder_list_view = gtk::ListView::new(Some(folder_selection.clone()), Some(folder_factory));
+    folder_list_view.add_css_class("mail-folder-tree");
     let folder_scroller = gtk::ScrolledWindow::builder().child(&folder_list_view).vexpand(true).build();
     let folder_card = card_section(&folder_scroller);
     folder_card.add_css_class("folder-pane");
@@ -949,9 +951,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .width_request(32)
             .height_request(32)
             .halign(gtk::Align::Center)
-            // Top-aligned with the sender line so the avatar spans the row's
-            // three (or four) lines, as Outlook's does.
-            .valign(gtk::Align::Start)
+            .valign(gtk::Align::Center)
             .margin_start(8)
             .margin_end(8)
             .child(&avatar_label)
@@ -1252,7 +1252,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .orientation(gtk::Orientation::Horizontal)
             .width_request(crate::message_columns::ROW_LEADING_WIDTH - crate::message_columns::UNREAD_ACCENT_WIDTH)
             .halign(gtk::Align::Start)
-            .valign(gtk::Align::Start)
+            .valign(gtk::Align::Center)
             .build();
         let message_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).build();
         message_box.add_css_class("message-row");
@@ -1501,10 +1501,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .hexpand(true)
             .margin_end(crate::message_columns::ROW_TRAILING_MARGIN)
             .valign(gtk::Align::Center)
-            // Match a message row's height (the 32 px avatar sets it), so a
-            // conversation header does not sit shorter than the messages it
-            // groups in the single-line layout.
-            .height_request(32)
             .build();
         thread_single_line.add_css_class("message-single-line");
         thread_single_line.append(&thread_leading);
@@ -2644,8 +2640,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let registry = row_display_registry.clone();
         let header = column_header.clone();
         let width = list_width.clone();
+        let list = message_list_view.clone();
         Rc::new(move |single_line: bool| {
             tracing::debug!("message-list layout: single-line={single_line}");
+            if single_line { list.add_css_class("single-line-layout"); }
+            else { list.remove_css_class("single-line-layout"); }
             let display = RowDisplay { single_line, ..row_display.get() };
             if row_display.get() != display {
                 row_display.set(display);

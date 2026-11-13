@@ -1,65 +1,33 @@
-/* The panes' density around items (Config → Appearance → 'Density',
-   UX-83): the whole point of the setting is that every row kind in a
-   pane moves together, so all the folder rows and all the
-   message-list row kinds share one value per level. Outlook's names
-   map on as Full = `spacing-loose` (roomiest), Medium =
-   `spacing-medium` (the default) and Compact = `spacing-tight` (the
-   app's original look). The `tight` rules therefore stay as they
-   were; `spacing-medium` / `spacing-loose` add 5% / 20% more padding
-   (rounded to whole pixels); in `spacing-loose` the folder rows get
-   20% more again than the message rows. The folder row's margin rides
-   on the name label (`folder-row-label`) and unread count, so `bind`
-   must keep those classes on every row (headings included) -
-   replacing them is what used to leave the folder items unspaced. */
-.message-list .message-text,
-.message-list .message-thread-row,
-.folder-pane .folder-row-label,
-.folder-pane .folder-unread-count {
-    margin-top: 6px;
-    margin-bottom: 6px;
-}
-.message-list .message-section-header {
-    margin-top: 4px;
-    margin-bottom: 4px;
-}
-.message-list.spacing-medium .message-text,
-.message-list.spacing-medium .message-thread-row,
-.folder-pane.spacing-medium .folder-row-label,
-.folder-pane.spacing-medium .folder-unread-count {
-    margin-top: 7px;
-    margin-bottom: 7px;
-}
-.message-list.spacing-medium .message-section-header {
-    margin-top: 5px;
-    margin-bottom: 5px;
-}
-.message-list.spacing-loose .message-text,
-.message-list.spacing-loose .message-thread-row {
-    margin-top: 10px;
-    margin-bottom: 10px;
-}
-/* The avatar and the Select-mode checkbox sit on the sender line, so
-   they follow the same top margin the text column's density level
-   uses - otherwise the avatar would float above the sender by the
-   pane's row padding. */
+/* Main mail density: one vertical padding policy per row type.
+   Keep the unread accent and selection full-height. */
+.mail-folder-tree > row,
+.message-list > row { padding: 0; min-height: 0; }
+
+.folder-pane .folder-tree-content { padding: 2px 4px; min-height: 20px; }
+.folder-pane.spacing-medium .folder-tree-content { padding-top: 3px; padding-bottom: 3px; }
+.folder-pane.spacing-loose .folder-tree-content { padding-top: 6px; padding-bottom: 6px; }
+
+.message-list .message-text { margin-top: 3px; margin-bottom: 3px; }
+.message-list .message-thread-row { padding-top: 3px; padding-bottom: 3px; }
+.message-list .message-section-header { margin-top: 2px; margin-bottom: 2px; }
+.message-list.spacing-medium .message-text { margin-top: 4px; margin-bottom: 4px; }
+.message-list.spacing-medium .message-thread-row { padding-top: 4px; padding-bottom: 4px; }
+.message-list.spacing-medium .message-section-header { margin-top: 3px; margin-bottom: 3px; }
+.message-list.spacing-loose .message-text { margin-top: 7px; margin-bottom: 7px; }
+.message-list.spacing-loose .message-thread-row { padding-top: 7px; padding-bottom: 7px; }
+.message-list.spacing-loose .message-section-header { margin-top: 5px; margin-bottom: 5px; }
+
+/* No asymmetric margin on centered avatars or selection checkboxes. */
 .message-list .message-avatar,
-.message-list .message-select-checkbox {
-    margin-top: 6px;
+.message-list .message-select-checkbox { margin-top: 0; margin-bottom: 0; }
+
+/* Single-line messages and conversations share a minimum height even when
+   sender images are hidden. Text may still grow for accessibility fonts. */
+.message-list.single-line-layout .message-row,
+.message-list.single-line-layout .message-thread-row {
+    min-height: 28px; padding-top: 0; padding-bottom: 0;
 }
-.message-list.spacing-medium .message-avatar,
-.message-list.spacing-medium .message-select-checkbox {
-    margin-top: 7px;
-}
-.message-list.spacing-loose .message-avatar,
-.message-list.spacing-loose .message-select-checkbox {
-    margin-top: 10px;
-}
-.message-list.spacing-loose .message-section-header {
-    margin-top: 7px;
-    margin-bottom: 7px;
-}
-.folder-pane.spacing-loose .folder-row-label,
-.folder-pane.spacing-loose .folder-unread-count {
-    margin-top: 12px;
-    margin-bottom: 12px;
-}
+.message-list.single-line-layout.spacing-medium .message-row,
+.message-list.single-line-layout.spacing-medium .message-thread-row { min-height: 32px; }
+.message-list.single-line-layout.spacing-loose .message-row,
+.message-list.single-line-layout.spacing-loose .message-thread-row { min-height: 38px; }
