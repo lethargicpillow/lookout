@@ -894,6 +894,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // cells the user has turned off (or the width cannot fit).
     let column_state = crate::window::columns::ColumnState::from_settings(&state.borrow().settings);
     let column_state_for_rows = column_state.clone();
+    let column_state_for_setup = column_state.clone();
     // Weak handles to every created row's display-dependent widgets, so a
     // change to Select mode, "Show sender images" or the preview line count
     // updates the rows already on screen in place (the list view recycles row
@@ -1606,11 +1607,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let person_hover = {
             let resolve: crate::profile_card::PersonResolver = {
                 let bound = bound.clone();
+                let columns = column_state_for_setup.clone();
                 Rc::new(move || {
-                    bound
-                        .borrow()
-                        .as_ref()
-                        .and_then(|summary| summary.from.first().map(|sender| (sender.clone(), mailbox_account_id(&summary.mailbox))))
+                    bound.borrow().as_ref().and_then(|summary| {
+                        let person = if columns.sent_view() { summary.to.first().or_else(|| summary.cc.first()) } else { summary.from.first() };
+                        person.map(|address| (address.clone(), mailbox_account_id(&summary.mailbox)))
+                    })
                 })
             };
             let hover = crate::profile_card::PersonHover::new(profile_card_provider_for_rows.clone(), &overlay, resolve);
@@ -1620,7 +1622,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 Rc::new(move || avatar.upgrade().is_none_or(|avatar| !avatar.is_mapped()))
             };
             hover.add_trigger(&sender_label, no_avatar.clone());
-            hover.add_trigger(&single_sender, no_avatar);
+            hover.add_trigger(&single_sender, Rc::new({
+                let columns = column_state_for_setup.clone();
+                let no_avatar = no_avatar.clone();
+                move || !columns.sent_view() && no_avatar()
+            }));
+            hover.add_trigger(&single_to, Rc::new({
+                let columns = column_state_for_setup.clone();
+                move || columns.sent_view() && no_avatar()
+            }));
             hover
         };
 
@@ -2098,8 +2108,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 widgets.checkbox.set_active(list_item.is_selected());
                 widgets.checkbox_suppress.set(false);
 
+                let sent_view = is_sent_view(&state_clone2.borrow());
                 let sender = summary.from.first();
-                match sender {
+                let display_person = if sent_view { summary.to.first().or_else(|| summary.cc.first()) } else { sender };
+                match display_person {
                     Some(address) => {
                         widgets.avatar_label.set_label(&crate::message_header::initials(address.name.as_deref(), &address.address));
                         for class in crate::message_header::AVATAR_COLOR_CLASSES {
@@ -2118,6 +2130,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 }
 
                 let from = sender.map(|a| a.display_label().to_string()).unwrap_or_else(|| "(unknown)".into());
+                let to_text = crate::message_list::recipient_labels(&summary.to);
+                let display = if sent_view {
+                    if !to_text.is_empty() { to_text.clone() }
+                    else if !summary.cc.is_empty() { crate::message_list::recipient_labels(&summary.cc) }
+                    else { "(no visible recipients)".into() }
+                } else { from.clone() };
                 // In the unified "All Inboxes" view, stamp each row with its
                 // owning account so mail from mixed mailboxes stays readable.
                 let account_label = {
@@ -2135,8 +2153,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     }
                 };
                 widgets.sender_label.set_label(&match account_label {
-                    Some(acc) => format!("{from} · {acc}"),
-                    None => from,
+                    Some(acc) => format!("{display} · {acc}"),
+                    None => display,
                 });
                 widgets.subject_label.set_label(summary.subject.as_deref().unwrap_or("(no subject)"));
                 // The attachment and invite indicators: explicit on every
@@ -2204,11 +2222,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 // The three-line labels were just filled, so the single-line
                 // ones reuse their text rather than recomputing the account
                 // suffix, subject fallback or date format.
-                widgets.single_sender.set_label(&widgets.sender_label.label());
+                if sent_view { widgets.single_sender.set_label(&from); }
+                else { widgets.single_sender.set_label(&widgets.sender_label.label()); }
                 widgets.single_subject.set_label(&widgets.subject_label.label());
                 widgets.single_date.set_label(&widgets.date_label.label());
-                let to_text = summary.to.first().map(|address| address.display_label()).unwrap_or_default();
-                widgets.single_to.set_label(to_text);
+                widgets.single_to.set_label(&to_text);
                 widgets.single_size.set_label(&crate::message_columns::format_size(summary.size));
                 widgets.single_attachment_icon.set_visible(summary.has_attachment);
                 widgets.single_calendar_icon.set_visible(summary.has_calendar);
@@ -2249,7 +2267,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 *widgets.bound.borrow_mut() = None;
                 *widgets.bound_thread.borrow_mut() = Some(thread.id.clone());
                 widgets.thread_expander.set_list_row(Some(&row));
-                widgets.thread_sender.set_label(&thread.sender);
+                let sent_view = is_sent_view(&state_clone2.borrow());
+                widgets.thread_sender.set_label(if sent_view { &thread.recipient_display } else { &thread.sender });
                 widgets.thread_attachment_icon.set_visible(thread.has_attachment);
                 widgets.thread_calendar_icon.set_visible(thread.has_calendar);
                 widgets.thread_mention_icon.set_visible(thread.has_mentions);
@@ -2306,7 +2325,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let subject = thread.subject.as_deref().unwrap_or("(no subject)");
                 widgets.thread_single_subject.set_label(&format!("{subject} ({})", thread.count));
                 widgets.thread_single_date.set_label(&widgets.thread_date.label());
-                widgets.thread_single_to.set_label(&thread.participants.join(", "));
+                widgets.thread_single_to.set_label(&thread.to);
                 widgets.thread_single_size.set_label(&crate::message_columns::format_size(thread.size));
                 widgets.thread_single_attachment_icon.set_visible(thread.has_attachment);
                 widgets.thread_single_calendar_icon.set_visible(thread.has_calendar);
@@ -2770,6 +2789,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     search_refiner_row.set_visible(false);
 
     let list_header = ListHeader {
+        column_header: Rc::downgrade(&column_header),
         folder_label: folder_title_label,
         account_label: account_title_label,
         favorite_button: favorite_button.clone(),

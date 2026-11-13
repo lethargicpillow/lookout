@@ -22,6 +22,11 @@ use lookout_core::{EmailSummary, MailboxId, ThreadKey, Uid};
 
 use crate::worker::Worker;
 
+/// Render all visible recipients, in their original envelope order.
+pub(crate) fn recipient_labels(addresses: &[lookout_core::EmailAddress]) -> String {
+    addresses.iter().map(|a| a.display_label()).collect::<Vec<_>>().join(", ")
+}
+
 /// Which field the message list is ordered by. Paired with
 /// `UiState::sort_descending`, this is the whole of the list's ordering
 /// policy - see `sort_messages`. The key also decides how the list is
@@ -626,6 +631,10 @@ pub struct ThreadRow {
     pub id: ThreadId,
     /// The newest message's sender, rendered like a message row's sender.
     pub sender: String,
+    /// Actual To recipients of the newest message, not the conversation's
+    /// participant set (which can include its sender and other messages).
+    pub to: String,
+    pub recipient_display: String,
     /// Every participant's display name, newest-message first - the header's
     /// tooltip, so who's in the conversation is a hover away.
     pub participants: Vec<String>,
@@ -843,9 +852,15 @@ fn group_threads(messages: &[EmailSummary]) -> Vec<ThreadEntry> {
                 }
             }
         }
+        let to = recipient_labels(&latest.to);
+        let recipient_display = if !to.is_empty() { to.clone() }
+            else if !latest.cc.is_empty() { recipient_labels(&latest.cc) }
+            else { "(no visible recipients)".into() };
         let row = ThreadRow {
             id,
             sender,
+            to,
+            recipient_display,
             participants,
             subject: latest.subject.clone(),
             preview: latest.preview.clone(),
@@ -900,6 +915,8 @@ struct MessageRowKey {
     date: DateTime<Utc>,
     subject: Option<String>,
     from: String,
+    to: Vec<lookout_core::EmailAddress>,
+    cc: Vec<lookout_core::EmailAddress>,
     preview: Option<String>,
     tags: Vec<String>,
     thread_key: ThreadKey,
@@ -940,6 +957,8 @@ fn message_row_key(m: &EmailSummary) -> MessageRowKey {
         date: m.date,
         subject: m.subject.clone(),
         from,
+        to: m.to.clone(),
+        cc: m.cc.clone(),
         preview: m.preview.clone(),
         tags,
         thread_key: m.thread_key.clone(),
@@ -1025,6 +1044,8 @@ fn section_row_key(group: GroupKey, label: &str) -> SectionRowKey {
 struct ThreadRowKey {
     id: ThreadId,
     sender: String,
+    to: String,
+    recipient_display: String,
     participants: Vec<String>,
     subject: Option<String>,
     preview: Option<String>,
@@ -1045,6 +1066,8 @@ fn thread_row_key(row: &ThreadRow) -> ThreadRowKey {
     ThreadRowKey {
         id: row.id.clone(),
         sender: row.sender.clone(),
+        to: row.to.clone(),
+        recipient_display: row.recipient_display.clone(),
         participants: row.participants.clone(),
         subject: row.subject.clone(),
         preview: row.preview.clone(),
@@ -3559,6 +3582,8 @@ mod tests {
         ThreadRow {
             id: (MailboxId("a:INBOX".into()), ThreadKey("t".into())),
             sender: "Alice".into(),
+            to: "Bob".into(),
+            recipient_display: "Bob".into(),
             participants: vec!["Alice".into(), "Bob".into()],
             subject: Some("Subject".into()),
             preview: Some("Snippet".into()),

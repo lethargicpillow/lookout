@@ -126,6 +126,17 @@ pub const DEFAULT_COLUMNS: [MessageColumn; 6] = [
     MessageColumn::Size,
 ];
 
+/// Sent Items has its own Outlook-style profile. To is a real column (not
+/// a renamed From cell), including its recipient sort.
+pub const DEFAULT_SENT_COLUMNS: [MessageColumn; 6] = [
+    MessageColumn::Importance,
+    MessageColumn::Attachment,
+    MessageColumn::To,
+    MessageColumn::Subject,
+    MessageColumn::Received,
+    MessageColumn::Size,
+];
+
 /// The gutter left of the first column: the unread accent bar (3 px) plus the
 /// avatar cell's two 8 px margins and its 32 px circle. The header uses the
 /// same number so its labels sit exactly over their cells.
@@ -206,6 +217,11 @@ pub fn columns_for_width(configured: &[MessageColumn], available: i32) -> Vec<Me
     for column in SHED_ORDER {
         if row_width(&columns) <= available {
             break;
+        }
+        // Keep the only address column. Sent Items defaults to To without
+        // From, so narrowing the pane must not shed its primary recipient.
+        if column == MessageColumn::To && !columns.contains(&MessageColumn::From) {
+            continue;
         }
         columns.retain(|candidate| *candidate != column);
     }

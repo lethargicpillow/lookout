@@ -38,6 +38,8 @@ use crate::settings::SettingsStore;
 #[derive(Clone)]
 pub(crate) struct ColumnState {
     configured: Rc<RefCell<Vec<MessageColumn>>>,
+    sent_configured: Rc<RefCell<Vec<MessageColumn>>>,
+    sent_view: Rc<Cell<bool>>,
     visible: Rc<RefCell<Vec<MessageColumn>>>,
     /// The width last fitted against, so a configuration change can re-fit
     /// without waiting for a resize.
@@ -47,11 +49,41 @@ pub(crate) struct ColumnState {
 impl ColumnState {
     pub(crate) fn from_settings(settings: &SettingsStore) -> Self {
         let configured = message_columns::parse_columns(&settings.get_strv(crate::settings::MAIL_LIST_COLUMNS));
+        let sent_ids = settings.get_strv(crate::settings::MAIL_SENT_LIST_COLUMNS);
+        let sent_configured = if sent_ids.iter().any(|id| MessageColumn::from_id(id).is_some()) {
+            message_columns::parse_columns(&sent_ids)
+        } else {
+            message_columns::DEFAULT_SENT_COLUMNS.to_vec()
+        };
         ColumnState {
             visible: Rc::new(RefCell::new(configured.clone())),
             configured: Rc::new(RefCell::new(configured)),
+            sent_configured: Rc::new(RefCell::new(sent_configured)),
+            sent_view: Rc::new(Cell::new(false)),
             width: Rc::new(Cell::new(0)),
         }
+    }
+
+    pub(crate) fn sent_view(&self) -> bool { self.sent_view.get() }
+
+    fn configured(&self) -> &RefCell<Vec<MessageColumn>> {
+        if self.sent_view() { &self.sent_configured } else { &self.configured }
+    }
+
+    fn settings_key(&self) -> &'static str {
+        if self.sent_view() { crate::settings::MAIL_SENT_LIST_COLUMNS }
+        else { crate::settings::MAIL_LIST_COLUMNS }
+    }
+
+    fn default_columns(&self) -> &'static [MessageColumn] {
+        if self.sent_view() { &message_columns::DEFAULT_SENT_COLUMNS }
+        else { &message_columns::DEFAULT_COLUMNS }
+    }
+
+    fn set_sent_view(&self, sent: bool) -> bool {
+        if self.sent_view.replace(sent) == sent { return false; }
+        self.refit();
+        true
     }
 
     pub(crate) fn visible(&self) -> Vec<MessageColumn> {
@@ -66,7 +98,7 @@ impl ColumnState {
     /// current width can fit it. The column chooser's checks follow this, so a
     /// column that is merely shed for space still reads as on.
     pub(crate) fn is_configured(&self, column: MessageColumn) -> bool {
-        self.configured.borrow().contains(&column)
+        self.configured().borrow().contains(&column)
     }
 
     /// Fits the configured columns to `width`, returning whether the visible
@@ -74,7 +106,7 @@ impl ColumnState {
     /// the band the columns fit into does any work.
     pub(crate) fn fit_width(&self, width: i32) -> bool {
         self.width.set(width);
-        let fitted = message_columns::columns_for_width(&self.configured.borrow(), width);
+        let fitted = message_columns::columns_for_width(&self.configured().borrow(), width);
         let mut visible = self.visible.borrow_mut();
         if *visible == fitted {
             return false;
@@ -86,7 +118,7 @@ impl ColumnState {
     /// Adds or removes one column, persists the new order, and re-fits to the
     /// current width. Returns whether the visible set changed.
     pub(crate) fn set_column_visible(&self, column: MessageColumn, visible: bool, settings: &SettingsStore) -> bool {
-        let mut configured = self.configured.borrow_mut();
+        let mut configured = self.configured().borrow_mut();
         let was_present = configured.contains(&column);
         if visible && !was_present {
             configured.push(column);
@@ -99,22 +131,22 @@ impl ColumnState {
         // order, and Outlook's default is that order minus To.
         let all = MessageColumn::ALL;
         configured.sort_by_key(|candidate| all.iter().position(|value| value == candidate).unwrap_or(usize::MAX));
-        settings.set_strv(crate::settings::MAIL_LIST_COLUMNS, message_columns::columns_to_ids(&configured));
+        settings.set_strv(self.settings_key(), message_columns::columns_to_ids(&configured));
         drop(configured);
         self.refit()
     }
 
     /// Restores Outlook's default columns and persists them.
     pub(crate) fn reset(&self, settings: &SettingsStore) -> bool {
-        let mut configured = self.configured.borrow_mut();
-        *configured = message_columns::DEFAULT_COLUMNS.to_vec();
-        settings.set_strv(crate::settings::MAIL_LIST_COLUMNS, message_columns::columns_to_ids(&configured));
+        let mut configured = self.configured().borrow_mut();
+        *configured = self.default_columns().to_vec();
+        settings.set_strv(self.settings_key(), message_columns::columns_to_ids(&configured));
         drop(configured);
         self.refit()
     }
 
     fn refit(&self) -> bool {
-        let fitted = message_columns::columns_for_width(&self.configured.borrow(), self.width.get());
+        let fitted = message_columns::columns_for_width(&self.configured().borrow(), self.width.get());
         let mut visible = self.visible.borrow_mut();
         if *visible == fitted {
             return false;
@@ -330,6 +362,13 @@ impl ColumnHeader {
         }
     }
 
+    pub(crate) fn set_sent_view(self: &Rc<Self>, sent: bool) {
+        if self.parts.state.set_sent_view(sent) {
+            self.rebuild();
+            (self.parts.on_columns_changed)();
+        }
+    }
+
     fn click_column(&self, column: MessageColumn) {
         let (current, descending) = self.parts.sort.get();
         let key = column.sort_key();
@@ -456,6 +495,8 @@ mod tests {
     fn state() -> ColumnState {
         ColumnState {
             configured: Rc::new(RefCell::new(DEFAULT_COLUMNS.to_vec())),
+            sent_configured: Rc::new(RefCell::new(message_columns::DEFAULT_SENT_COLUMNS.to_vec())),
+            sent_view: Rc::new(Cell::new(false)),
             visible: Rc::new(RefCell::new(DEFAULT_COLUMNS.to_vec())),
             width: Rc::new(Cell::new(0)),
         }
@@ -463,6 +504,20 @@ mod tests {
 
     fn ids(state: &ColumnState) -> Vec<&'static str> {
         state.visible().iter().map(|column| column.id()).collect()
+    }
+
+    #[test]
+    fn sent_profile_has_to_and_restores_inbox_columns() {
+        let state = state();
+        state.fit_width(1200);
+        assert!(state.set_sent_view(true));
+        assert!(state.visible().contains(&MessageColumn::To));
+        assert!(!state.visible().contains(&MessageColumn::From));
+        state.fit_width(400);
+        assert!(state.visible().contains(&MessageColumn::To));
+        assert!(state.set_sent_view(false));
+        assert!(state.visible().contains(&MessageColumn::From));
+        assert!(!state.visible().contains(&MessageColumn::To));
     }
 
     #[test]

@@ -202,6 +202,7 @@ fn remove_dragged_rows(state: &Rc<RefCell<UiState>>, message_list: Option<&Messa
 /// signature.
 #[derive(Clone)]
 pub(crate) struct ListHeader {
+    pub(crate) column_header: std::rc::Weak<crate::window::columns::ColumnHeader>,
     pub(crate) folder_label: gtk::Label,
     pub(crate) account_label: gtk::Label,
     pub(crate) favorite_button: gtk::ToggleButton,
@@ -262,7 +263,16 @@ pub(crate) fn current_view_title(state: &Rc<RefCell<UiState>>) -> (String, Strin
 /// title lines, plus the star's pressed state and whether it's actionable at
 /// all (the unified view spans every account, so there's no single folder to
 /// favorite).
+pub(crate) fn is_sent_view(state: &UiState) -> bool {
+    matches!(state.mail_view, MailView::Single)
+        && state.current_mailbox.as_ref().is_some_and(|mailbox| mailbox_role(state, mailbox) == Some(MailboxRole::Sent))
+}
+
 pub(crate) fn refresh_list_header(state: &Rc<RefCell<UiState>>, header: &ListHeader) {
+    let sent = is_sent_view(&state.borrow());
+    if let Some(columns) = header.column_header.upgrade() {
+        columns.set_sent_view(sent);
+    }
     let (folder, account) = current_view_title(state);
     header.folder_label.set_label(&folder);
     header.account_label.set_label(&account);

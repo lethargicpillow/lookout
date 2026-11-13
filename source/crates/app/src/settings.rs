@@ -115,6 +115,8 @@ pub const MAIL_FILTERS: &str = "mail-filters";
 /// UX-27): a `strv` of `message_columns::MessageColumn` ids. Empty means
 /// Outlook's default set.
 pub const MAIL_LIST_COLUMNS: &str = "mail-list-columns";
+/// A separate column set for Sent Items; empty uses the recipient-first default.
+pub const MAIL_SENT_LIST_COLUMNS: &str = "mail-sent-list-columns";
 /// How the message list lays its rows out (M-07 / UX-27): `auto` picks the
 /// single-line columnar layout when the reading pane is bottom/off or the list
 /// is wide enough; `three-line` and `single-line` force one.
@@ -395,6 +397,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(MAIL_CONVERSATION_INCLUDE_SENT, Value::Bool(true));
     map.insert(MAIL_FILTERS, Value::Strv(Vec::new()));
     map.insert(MAIL_LIST_COLUMNS, Value::Strv(Vec::new()));
+    map.insert(MAIL_SENT_LIST_COLUMNS, Value::Strv(Vec::new()));
     map.insert(MAIL_LIST_STYLE, Value::String("auto".into()));
     map.insert(MAIL_SEARCH_SCOPE, Value::String("all".into()));
     map.insert(CALENDAR_SEARCH_SCOPE, Value::String("all".into()));

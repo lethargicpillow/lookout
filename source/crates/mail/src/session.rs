@@ -8528,6 +8528,24 @@ mod tests {
         assert!(!is_local_davmail_endpoint(&endpoint, false));
     }
 
+    #[test]
+    fn sent_archive_is_server_owned_only_for_paired_local_davmail() {
+        let mut imap = crate::EndpointConfig {
+            host: "127.0.0.1".into(), port: 1143, security: Security::Plain,
+            username: "test@example.com".into(),
+        };
+        let mut smtp = crate::EndpointConfig {
+            host: "localhost".into(), port: 1025, security: Security::Plain,
+            username: "test@example.com".into(),
+        };
+        assert!(davmail_saves_sent(&imap, &smtp));
+        smtp.host = "smtp.example.com".into();
+        assert!(!davmail_saves_sent(&imap, &smtp));
+        smtp.host = "localhost".into();
+        imap.port = 143;
+        assert!(!davmail_saves_sent(&imap, &smtp));
+    }
+
     #[tokio::test]
     async fn rejected_starttls_never_sends_credentials() {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
