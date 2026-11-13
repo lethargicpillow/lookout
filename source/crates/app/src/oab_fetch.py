@@ -22,7 +22,7 @@ def fetch(session, url, limit, target=None):
         if response.status_code in (401, 403):
             raise Failure("authentication")
         if response.status_code != 200:
-            raise Failure("network")
+            raise Failure("http_" + str(response.status_code))
         data = bytearray()
         count = 0
         digest = hashlib.sha1()
@@ -128,6 +128,17 @@ if __name__ == "__main__":
     except Failure as e:
         print(str(e))
         sys.exit(1)
-    except Exception:
-        print("network")
+    except Exception as exc:
+        import requests
+        if isinstance(exc, requests.exceptions.SSLError):
+            code = "tls"
+        elif isinstance(exc, requests.exceptions.Timeout):
+            code = "timeout"
+        elif isinstance(exc, requests.exceptions.ConnectionError):
+            code = "connection"
+        elif isinstance(exc, requests.exceptions.RequestException):
+            code = "http_transport"
+        else:
+            code = "helper"
+        print(code)
         sys.exit(1)

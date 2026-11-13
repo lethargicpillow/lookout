@@ -71,13 +71,19 @@ def parse(data):
             if urlsplit(ews).hostname in CLOUD:
                 return {"status": "cloud"}
             oab = None
+            external = p.findtext("Type", "").upper() in ("EXPR", "EXHTTP")
             for q in [p] + [q for q in protocols if q is not p]:
                 url = secure_url(q.findtext("OABUrl", "").strip())
-                if url and urlsplit(url).path.lower().endswith("/oab.xml"):
+                if not url:
+                    continue
+                if external and q.findtext("Type", "").upper() == "EXCH" and urlsplit(url).hostname != urlsplit(ews).hostname:
+                    continue
+                path = urlsplit(url).path
+                if path.lower().endswith("/oab.xml"):
                     oab = url
                     break
-                if url and urlsplit(url).path.endswith("/"):
-                    oab = url + "oab.xml"
+                if path.endswith("/") or re.fullmatch(r"[0-9a-fA-F-]{36}", path.rsplit("/", 1)[-1]):
+                    oab = url.rstrip("/") + "/oab.xml"
                     break
             return {"status": "exchange", "ews": ews, "oab": oab}
     except (ET.ParseError, ValueError, TypeError):

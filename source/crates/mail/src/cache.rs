@@ -814,8 +814,8 @@ impl Cache {
         // proceed against the last committed snapshot while a write is in
         // flight. `journal_mode` is persistent (stored in the file header),
         // so this also upgrades databases created before it was set.
-        conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
         // Room for every `prepare_cached` statement at once (rusqlite's default
         // is 16): the hot read paths and the eight overlay lookups would
         // otherwise evict the sync and delete statements, and each other.

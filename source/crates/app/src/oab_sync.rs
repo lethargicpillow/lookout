@@ -51,6 +51,15 @@ fn download(url: &str, login: &str, password: &str, known: Option<String>, dir: 
             "manifest" => "Invalid or ambiguous OAB manifest",
             "integrity" => "OAB integrity check failed",
             "unpack" => "OAB decompression failed",
+            "tls" => "OAB TLS certificate or handshake failed",
+            "timeout" => "OAB request timed out",
+            "connection" => "OAB connection or DNS resolution failed",
+            "http_transport" => "OAB HTTP transport failed",
+            "helper" => "OAB helper failed internally",
+            "http_404" => "OAB manifest or download not found (HTTP 404)",
+            "http_503" => "OAB service unavailable (HTTP 503)",
+            "http_500" => "OAB server error (HTTP 500)",
+            "http_301" | "http_302" | "http_307" | "http_308" => "OAB server returned a redirect",
             _ => "OAB network/helper failure",
         }.into());
     }
