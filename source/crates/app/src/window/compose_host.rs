@@ -670,7 +670,11 @@ pub(crate) fn show_composer_in_reading_pane_full(
         // "Manage Signatures…" opens File ▸ Options on the Accounts section;
         // set by `build_window` once the File page exists (see
         // `UiState::manage_signatures`).
-        state.borrow().manage_signatures.clone(),
+        {
+            let manage = state.borrow().manage_signatures.clone();
+            let account = account_id.clone();
+            manage.map(|manage| Rc::new(move |anchor: &gtk::Widget| manage(anchor, account.clone())) as Rc<dyn Fn(&gtk::Widget)>)
+        },
         // The composer's My Templates menu re-reads the global template list
         // each time it opens (item 2.10 / C-17), like the signature menu.
         {
