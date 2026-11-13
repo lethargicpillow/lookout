@@ -167,7 +167,8 @@ pub(crate) fn start_send_feedback(
         // Nothing to tie it to (no account events will retract it), so let
         // it time out normally.
         toast.set_timeout(5);
-        if let Some(overlay) = state.borrow().toast_overlay.clone() {
+        let overlay = state.borrow().toast_overlay.clone();
+        if let Some(overlay) = overlay {
             overlay.add_toast(toast);
         }
         return (None, None);
@@ -187,7 +188,8 @@ pub(crate) fn start_send_feedback(
         let state = state.clone();
         toast.connect_button_clicked(move |_| request_undo_send(&state, client_token));
     }
-    if let Some(overlay) = state.borrow().toast_overlay.clone() {
+    let overlay = state.borrow().toast_overlay.clone();
+    if let Some(overlay) = overlay {
         overlay.add_toast(toast.clone());
     }
     state.borrow_mut().pending_sends.push(PendingSend {
@@ -225,7 +227,8 @@ pub(crate) fn start_schedule_feedback(
         crate::datetime_picker::format_short_time(&at.with_timezone(&chrono::Local), &now)
     ));
     let Some(account_id) = account_id else {
-        if let Some(overlay) = state.borrow().toast_overlay.clone() {
+        let overlay = state.borrow().toast_overlay.clone();
+        if let Some(overlay) = overlay {
             overlay.add_toast(toast);
         }
         return (Some(at), None);
@@ -250,7 +253,8 @@ pub(crate) fn start_schedule_feedback(
             state.borrow_mut().pending_sends.retain(|p| p.client_token != client_token || p.undo_requested);
         });
     }
-    if let Some(overlay) = state.borrow().toast_overlay.clone() {
+    let overlay = state.borrow().toast_overlay.clone();
+    if let Some(overlay) = overlay {
         overlay.add_toast(toast.clone());
     }
     state.borrow_mut().pending_sends.push(PendingSend {
@@ -467,7 +471,11 @@ pub(crate) fn refresh_outbox_ui(state: &Rc<RefCell<UiState>>) {
         fill_outbox_page(state, &page);
     }
     if count_changed {
-        if let Some(refresh) = state.borrow().folder_tree_refresh.clone() {
+        // An if-let scrutinee's RefCell guard can live through its body.
+        // The folder refresh itself mutably borrows UiState, so snapshot the
+        // callback in its own statement before invoking it.
+        let refresh = state.borrow().folder_tree_refresh.clone();
+        if let Some(refresh) = refresh {
             refresh();
         }
     }

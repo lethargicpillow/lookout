@@ -38,6 +38,33 @@ fn outbox_banner_names_failed_then_scheduled_then_waiting() {
     assert_eq!(outbox_banner_text(&[&outbox_item(3, later, false)], now).as_deref(), Some("1 scheduled message"));
 }
 
+#[test]
+fn outbox_count_refresh_releases_state_before_rebuilding_folders() {
+    let state = test_state(Vec::new());
+    let account = AccountId("outbox-test".into());
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let weak = Rc::downgrade(&state);
+    state.borrow_mut().folder_tree_refresh = Some(Rc::new({
+        let observed = observed.clone();
+        move || {
+            let state = weak.upgrade().unwrap();
+            // The real rebuild mutably borrows state to update its folder
+            // order. Reproduce that requirement without a GTK display.
+            let mut st = state.borrow_mut();
+            observed.borrow_mut().push(st.outbox_count);
+            st.favorite_display_order.clear();
+        }
+    }));
+    state.borrow_mut().outbox.insert(account.clone(), vec![outbox_item(1, chrono::Utc::now(), false)]);
+    refresh_outbox_ui(&state);
+    assert_eq!(*observed.borrow(), vec![1]);
+    refresh_outbox_ui(&state);
+    assert_eq!(*observed.borrow(), vec![1], "unchanged count must not rebuild");
+    state.borrow_mut().outbox.remove(&account);
+    refresh_outbox_ui(&state);
+    assert_eq!(*observed.borrow(), vec![1, 0]);
+}
+
 // --- Pane-width restore maths. Pure, so unlike the widget suites further
 // down these need no display and no `gtk_test::gtk_ready()` gate. ---
 
