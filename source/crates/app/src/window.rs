@@ -2355,9 +2355,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .vexpand(true)
         .hscrollbar_policy(gtk::PolicyType::Never)
         .build();
-    // The model's one window onto its widgets: it needs the adjustment to tell
-    // whether the user is at the top of the list when a rebuild lands, and the
-    // view to put them back there if they were (see `pin_to_top`).
+    // Preserve the viewport during metadata-only row refreshes; never
+    // navigate to the first message just because a flag or preview changed.
     message_list.attach_scroller(&message_scroller, &message_list_view);
     // Shift+F10 / the Menu key open the message context menu (item 1.17) on
     // the selection, pointing at the focused row - the keyboard's

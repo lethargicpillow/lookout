@@ -10,6 +10,7 @@
 @define-color lookout-muted #b1b4bc;
 @define-color lookout-column-header-fg #a4a7af;
 @define-color lookout-row-separator rgba(255, 255, 255, 0.09);
+@define-color lookout-message-divider #53555b;
 @define-color lookout-chip-bg rgba(77, 157, 255, 0.18);
 @define-color lookout-chip-border rgba(77, 157, 255, 0.35);
 @define-color lookout-icon-blue #79acd2;

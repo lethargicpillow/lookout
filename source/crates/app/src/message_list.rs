@@ -1352,11 +1352,8 @@ pub struct MessageListModel {
     /// always take the inline path, so no test needs a real `Worker` (an OS
     /// thread plus a tokio runtime) just to construct a model.
     worker: Option<Rc<Worker>>,
-    /// The widgets this model is rendered through, set once by `window.rs`
-    /// via `attach_scroller` right after it builds them - the only reason the
-    /// model knows about widgets at all is `apply_layout`'s stay-at-the-top
-    /// re-pin (see `pin_to_top`). `None` in every test-built model, and in a
-    /// model whose widgets haven't been wired yet; both simply skip the pin.
+    /// The viewport attached by window.rs. Metadata-only refreshes use it
+    /// to recover from a GTK scroll reset, never to force a jump to row zero.
     scroller: Rc<RefCell<Option<(gtk::ScrolledWindow, gtk::ListView)>>>,
 }
 
@@ -1373,10 +1370,13 @@ pub struct MessageListModel {
 /// `restore_selection` cost is added on top.
 const BACKGROUND_REPOPULATE_THRESHOLD: usize = 5_000;
 
-/// How far down the list still counts as "at the top" for `apply_layout`'s
-/// re-pin - roughly one row's height, so a sub-pixel residue left by kinetic
-/// scrolling (or a few pixels of overscroll) can't silently disable it.
-const AT_TOP_THRESHOLD_PX: f64 = 48.0;
+/// A metadata-only refresh must not reset the viewport. Compare identities
+/// rather than the display fingerprints (read flags and previews change).
+fn same_message_order(old: &[MessageRowKey], new: &[MessageRowKey]) -> bool {
+    old.len() == new.len() && old.iter().zip(new).all(|(a, b)|
+        a.mailbox == b.mailbox && a.uid == b.uid && a.thread_key == b.thread_key
+        && a.pinned == b.pinned && a.date == b.date)
+}
 
 impl MessageListModel {
     /// Builds a model that always computes `repopulate`'s layout inline,
@@ -1446,51 +1446,47 @@ impl MessageListModel {
         }
     }
 
-    /// Tells the model which widgets it is being rendered through, so
-    /// `apply_layout` can keep the list pinned to the top when new mail lands
-    /// while the user is already there (see `pin_to_top`). Called once, from
-    /// `window.rs`'s `build_ui`, immediately after the `ListView` and its
-    /// `ScrolledWindow` are built; a model that never gets this call behaves
-    /// exactly as it did before the pin existed.
+    /// Attach the real viewport so metadata-only rebuilds can preserve its
+    /// position instead of letting a replaced GTK row reset the scroll.
     pub fn attach_scroller(&self, scroller: &gtk::ScrolledWindow, view: &gtk::ListView) {
         *self.scroller.borrow_mut() = Some((scroller.clone(), view.clone()));
     }
 
-    /// Whether the list is currently scrolled to (or within one row of) the
-    /// top. `false` when no widgets are attached - nothing to pin, and no way
-    /// to know. Read *before* `apply_layout` splices anything, because the
-    /// splice itself is what moves the adjustment.
-    fn scroll_at_top(&self) -> bool {
-        match &*self.scroller.borrow() {
-            Some((scroller, _)) => scroller.vadjustment().value() <= AT_TOP_THRESHOLD_PX,
-            None => false,
-        }
+    fn scroll_position(&self) -> Option<f64> {
+        self.scroller.borrow().as_ref().map(|(scroller, _)| scroller.vadjustment().value())
     }
 
-    /// Puts the viewport back at row 0 after a rebuild that started there.
-    ///
-    /// `GtkListView` anchors its viewport to an *item*, not to a pixel offset:
-    /// when a rebuild splices new rows in above the anchored (focused or
-    /// selected) row, `GtkListBase` compensates by raising the scroll value so
-    /// that row stays visually still - which pushes the newly arrived mail off
-    /// the top of the view, exactly where the user was looking. `scroll_to` is
-    /// the load-bearing call here rather than a bare `set_value`: it re-points
-    /// that anchor at item 0, so the next size-allocate doesn't simply undo the
-    /// adjustment. The flags are empty on purpose - `FOCUS`/`SELECT` would move
-    /// the highlight, and the user's selected message must keep both its
-    /// highlight and the reading pane it drives. The `set_value` afterwards
-    /// covers the case where the view isn't allocated yet and so has no anchor
-    /// to move.
-    fn pin_to_top(&self) {
-        let Some((scroller, view)) = self.scroller.borrow().clone() else {
-            return;
+    /// GTK can drop its item anchor when a row object is replaced (e.g.
+    /// marking the selected message read). Preserve the pixel position only
+    /// for unchanged message order, never for a new folder/filter/sort.
+    /// Do not call scroll_to(0): selection and live refresh are not navigation.
+    fn preserve_scroll(&self, value: f64) {
+        let Some((scroller, view)) = self.scroller.borrow().clone() else { return; };
+        let adjustment = scroller.vadjustment();
+        let restore_if_reset = |adjustment: &gtk::Adjustment| {
+            if value > 1.0 && adjustment.value() <= 1.0 {
+                adjustment.set_value(value);
+            }
         };
-        // `scroll_to` on an empty model is a programming error to GTK.
-        if self.selection.n_items() == 0 {
-            return;
-        }
-        view.scroll_to(0, gtk::ListScrollFlags::empty(), None);
-        scroller.vadjustment().set_value(0.0);
+        restore_if_reset(&adjustment);
+        if value <= 1.0 || !view.is_mapped() { return; }
+        let generation = self.generation.clone();
+        let expected = generation.get();
+        let weak = scroller.downgrade();
+        // The first frame may precede the layout that resets the anchor.
+        // Check once more on the next frame, then release the callback.
+        // Never override a nonzero position chosen in the meantime.
+        let mut frames = 0;
+        view.add_tick_callback(move |_, _| {
+            if generation.get() != expected { return glib::ControlFlow::Break; }
+            let Some(scroller) = weak.upgrade() else { return glib::ControlFlow::Break; };
+            let adjustment = scroller.vadjustment();
+            if adjustment.value() <= 1.0 {
+                adjustment.set_value(value);
+            }
+            frames += 1;
+            if frames >= 2 { glib::ControlFlow::Break } else { glib::ControlFlow::Continue }
+        });
     }
 
     /// Every message the list is currently backed by, before filtering - the
@@ -1801,10 +1797,15 @@ impl MessageListModel {
             return;
         }
 
-        // Whether the user is sitting at the top of the list, read before the
-        // splices move the adjustment - see `pin_to_top` for why arriving mail
-        // otherwise lands off-screen above them.
-        let was_at_top = self.scroll_at_top();
+        // Read the viewport before GTK splices a row. Only preserve an
+        // absolute offset when the visible message identities/order match.
+        let keep_scroll = self.displayed.borrow().as_ref().is_some_and(
+            |(key, descending, shown_filter, shown_threaded, shown_focused, old_keys)| {
+                *key == sort_key && *descending == sort_descending && *shown_filter == filter
+                    && *shown_threaded == threaded && *shown_focused == focused
+                    && same_message_order(old_keys, &keys)
+            });
+        let old_scroll = if keep_scroll { self.scroll_position() } else { None };
 
         // Snapshot what the user has collapsed before anything is spliced.
         self.capture_collapsed();
@@ -1948,10 +1949,8 @@ impl MessageListModel {
 
         self.restore_selection(previous_selection, previous_single_index);
 
-        // Last, after `restore_selection`: that call can `select_item`, which
-        // moves focus and with it the anchor `pin_to_top` is correcting.
-        if was_at_top {
-            self.pin_to_top();
+        if let Some(value) = old_scroll {
+            self.preserve_scroll(value);
         }
     }
 
@@ -3001,16 +3000,9 @@ mod tests {
         assert!(thread_row.is_expanded(), "select_uid must expand the collapsed thread");
         assert_eq!(thread_target.selected_summary().map(|s| s.uid), Some(Uid(1)));
 
-        // --- New mail arriving while the user is at the top of the list puts
-        // them back at the top; arriving while they're scrolled down leaves
-        // their place alone. Own model, appended here for the same
-        // gtk::init()-once-per-process reason as the rest of this function.
-        //
-        // What these lock is the *decision* - the at-top capture taken before
-        // the splice, and the re-pin (or lack of one) after it. They can't
-        // reproduce the bug itself: an unrealized `ListView` never runs the
-        // size-allocate in which `GtkListBase` re-anchors the viewport and
-        // pushes newly spliced rows off the top.
+        // --- Never explicitly pin the list to row zero during a refresh.
+        // A metadata-only change preserves the same message identity order.
+        // The test checks the model's decision, not GTK's realized layout.
         //
         // The view is deliberately *not* made the scroller's child here. A
         // `GtkListView` inside a `GtkScrolledWindow` owns that scroller's
@@ -3031,10 +3023,16 @@ mod tests {
         scrolled.repopulate(vec![summary(3, today), summary(1, yesterday), summary(2, older)], SortKey::Date, true);
         assert_eq!(adjustment.value(), 500.0, "a rebuild must not snap a scrolled-down list to the top");
 
-        // Within one row of the top: the same rebuild pins back to 0.
+        // Even a few pixels below the top is a user-selected position.
         adjustment.set_value(10.0);
         scrolled.repopulate(vec![summary(4, today), summary(3, today), summary(1, yesterday), summary(2, older)], SortKey::Date, true);
-        assert_eq!(adjustment.value(), 0.0, "new mail arriving at the top must leave the list pinned there");
+        assert_eq!(adjustment.value(), 10.0, "refresh must never explicitly pin to row zero");
+        let old = message_row_keys(&[summary(4, today), summary(3, today)]);
+        let mut changed = summary(4, today);
+        changed.flags.insert(lookout_core::SystemFlagBit::Seen);
+        let new = message_row_keys(&[changed, summary(3, today)]);
+        assert!(same_message_order(&old, &new));
+        assert!(!same_message_order(&old, &message_row_keys(&[summary(3, today), summary(4, today)])));
 
         // A model with no widgets attached - every other test in this file,
         // and the model between construction and `attach_scroller` - must

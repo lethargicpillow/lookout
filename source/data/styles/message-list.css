@@ -36,7 +36,7 @@ button.list-header-action {
 }
 
 .message-row {
-    border-bottom: 1px solid @lookout-row-separator;
+    border-bottom: 1px solid @lookout-message-divider;
 }
 .attachment-row {
     padding: 4px 6px;
@@ -105,7 +105,7 @@ button.list-header-action {
    visible against the background image. */
 .message-thread-row {
     background-color: @lookout-thread-row-bg;
-    border-bottom: 1px solid @lookout-row-separator;
+    border-bottom: 1px solid @lookout-message-divider;
 }
 /* The participant-count badge: a pill so the number reads as a count,
    not a fourth text column. */

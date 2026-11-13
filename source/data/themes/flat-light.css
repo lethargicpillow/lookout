@@ -12,6 +12,7 @@
 @define-color lookout-muted #565b64;
 @define-color lookout-column-header-fg #404954;
 @define-color lookout-row-separator #cbd1d8;
+@define-color lookout-message-divider #b8c0ca;
 @define-color lookout-subject-bar-bg alpha(@theme_fg_color, 0.04);
 @define-color lookout-subject-bar-border #c0c7cf;
 @define-color lookout-thread-row-bg alpha(@theme_fg_color, 0.04);
