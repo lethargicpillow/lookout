@@ -126,6 +126,7 @@ pub(crate) fn open_message_window(parent: &adw::ApplicationWindow, state: &Rc<Re
         .hexpand(true)
         .vexpand(true)
         .build();
+    crate::theme::bind_page_canvas(&web_view);
     // The popped-out message body: blurred by "All text" mode like the
     // reading pane's.
     crate::privacy::mark_blur_all(&web_view);

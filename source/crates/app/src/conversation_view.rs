@@ -290,13 +290,18 @@ fn document_csp(cards: &[Card]) -> &'static str {
 /// The whole conversation document: a toolbar with the message count and
 /// Expand all / Collapse all, then every card in display order. (The
 /// subject sits in the pane's native header.)
-pub fn build_document(cards: &[Card], now: DateTime<Utc>, dark: bool) -> String {
+pub fn build_document(cards: &[Card], now: DateTime<Utc>, dark: bool, app_dark: bool) -> String {
     let mut html = String::new();
     html.push_str("<!doctype html><html><head><meta charset=\"utf-8\">");
     html.push_str(&format!("<meta http-equiv=\"Content-Security-Policy\" content=\"{}\">", document_csp(cards)));
     html.push_str("<style>");
     html.push_str(DOCUMENT_CSS);
-    html.push_str(if dark { "</style></head><body class=\"dark\">" } else { "</style></head><body>" });
+    html.push_str(match (dark, app_dark) {
+        (true, true) => "</style></head><body class=\"dark\">",
+        (true, false) => "</style></head><body class=\"dark light-app\">",
+        (false, true) => "</style></head><body>",
+        (false, false) => "</style></head><body class=\"light-app\">",
+    });
     html.push_str(&format!(
         "<div class=\"toolbar\"><span class=\"count\">{}</span><button type=\"button\" class=\"link\" data-action=\"expand-all\">Expand all</button><button type=\"button\" class=\"link\" data-action=\"collapse-all\">Collapse all</button></div>",
         if cards.len() == 1 { "1 message".to_string() } else { format!("{} messages", cards.len()) }
@@ -555,7 +560,8 @@ button.link:hover { text-decoration: underline; }
 .tile-name { max-width: 200px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tile-size { color: var(--dim); font-size: 11px; }
 iframe.body { display: block; width: 100%; height: 40px; border: 0; background: #fff; border-radius: 4px; }
-.dark iframe.body { background: #212126; }
+.dark iframe.body { background: transparent; }
+.dark.light-app iframe.body { background: #252629; }
 .loading { color: var(--dim); padding: 8px 0; }
 .actions { display: flex; gap: 6px; margin-top: 10px; }
 .actions button { background: var(--chip); border: 0; border-radius: 6px; padding: 4px 12px; cursor: pointer; }
@@ -757,12 +763,13 @@ mod tests {
         };
         let body = make_body(Some("<p>x</p>"), None);
         let plain = vec![card(member.clone(), true, Some(&body_srcdoc(&body, 0, false, false, false)))];
-        let doc = build_document(&plain, Utc::now(), false);
+        let doc = build_document(&plain, Utc::now(), false, true);
         assert!(doc.contains("script-src 'none'") && !doc.contains("default-src *"));
         assert!(doc.contains(">1 message<"));
         let trusting = vec![card(member, true, Some(&body_srcdoc(&body, 0, true, true, false)))];
-        assert!(build_document(&trusting, Utc::now(), true).contains("default-src * data: cid: blob:"));
-        assert!(build_document(&trusting, Utc::now(), true).contains("<body class=\"dark\">"));
+        assert!(build_document(&trusting, Utc::now(), true, true).contains("default-src * data: cid: blob:"));
+        assert!(build_document(&trusting, Utc::now(), true, true).contains("<body class=\"dark\">"));
+        assert!(build_document(&trusting, Utc::now(), true, false).contains("<body class=\"dark light-app\">"));
     }
 
     #[test]

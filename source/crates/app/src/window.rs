@@ -2986,6 +2986,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .hexpand(true)
         .vexpand(true)
         .build();
+    crate::theme::bind_page_canvas(&web_view);
     // The message body is text the GTK text selectors can't reach inside a
     // `WebView`, so privacy blur's "All text" mode blurs the whole view.
     crate::privacy::mark_blur_all(&web_view);

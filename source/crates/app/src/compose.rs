@@ -590,11 +590,7 @@ const DARK_VIEW_STYLE_ID: &str = "lookout-dark-view";
 /// Page appearance is a view-only property shared by every editor.
 fn sync_dark_view(web_view: &webkit::WebView) {
     let dark = crate::settings::page_dark();
-    let canvas = if dark {
-        gtk::gdk::RGBA::new(0.13, 0.13, 0.15, 1.0)
-    } else {
-        gtk::gdk::RGBA::new(1.0, 1.0, 1.0, 1.0)
-    };
+    let canvas = crate::theme::page_canvas(dark);
     web_view.set_background_color(&canvas);
     let media = if dark { "all" } else { "not all" };
     let script = format!("var el = document.getElementById('{DARK_VIEW_STYLE_ID}'); if (el) {{ el.disabled = false; el.media = '{media}'; }}");
@@ -1279,6 +1275,7 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, F
         .hardware_acceleration_policy(webkit::HardwareAccelerationPolicy::Never)
         .build();
     let web_view = Rc::new(webkit::WebView::builder().editable(true).settings(&settings).web_context(&compose_web_context()).build());
+    crate::theme::bind_page_canvas(web_view.as_ref());
     // A transparent canvas, so the pane's own (possibly translucent)
     // background shows through instead of WebKit's default white.
     web_view.set_background_color(&gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0));
