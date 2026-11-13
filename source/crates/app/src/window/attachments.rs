@@ -21,13 +21,12 @@ use super::*;
 /// A safe save-suggested name for an attachment without one: falls back to a
 /// part-number-based placeholder (the raw wire could be anything, and a
 /// filename containing `/` from a hostile header must not be fed to the save
-/// dialog as a path). `filename` is trusted when present - it's just the
-/// initial name in the dialog, which the user can change.
+/// dialog as a path). The same name is used for batch export and ZIP entries.
 pub(crate) fn attachment_display_name(part: &BodyPart) -> String {
     part.filename
         .as_deref()
         .map(|f| f.trim())
-        .filter(|f| !f.is_empty() && !f.contains('/') && !f.contains('\\'))
+        .filter(|f| !f.is_empty() && *f != "." && *f != ".." && !f.contains('/') && !f.contains('\\') && !f.chars().any(char::is_control))
         .map(str::to_string)
         .unwrap_or_else(|| format!("attachment-{}", part.part_number))
 }
@@ -414,6 +413,15 @@ pub(crate) fn attachment_preview_arrived(state: &Rc<RefCell<UiState>>, mailbox: 
 mod preview_tests {
     use super::*;
     #[test]
+    fn attachment_collision_candidates_preserve_extensions() {
+        assert_eq!(attachment_name_candidate("report.pdf", 1), "report.pdf");
+        assert_eq!(attachment_name_candidate("report.pdf", 2), "report (2).pdf");
+        assert_eq!(attachment_name_candidate("notes", 3), "notes (3)");
+        assert_eq!(attachment_name_candidate(".env", 2), ".env (2)");
+        assert_eq!(attachment_name_candidate("archive.tar.gz", 2), "archive.tar (2).gz");
+    }
+
+    #[test]
     fn preview_classification_does_not_render_active_html_or_svg() {
         assert_eq!(preview_kind("text/html", "page.html"), PreviewKind::Text);
         assert_eq!(preview_kind("application/octet-stream", "data.csv"), PreviewKind::Text);
@@ -490,20 +498,24 @@ pub(crate) fn start_attachment_fetch(state: &Rc<RefCell<UiState>>, mailbox: &Mai
 /// `used`: the part's display name, or "name (2).ext" style when it does.
 pub(crate) fn unique_attachment_name(part: &BodyPart, used: &mut HashSet<String>) -> String {
     let base = attachment_display_name(part);
-    if used.insert(base.clone()) {
-        return base;
-    }
-    let (stem, ext) = match base.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() => (stem.to_string(), format!(".{ext}")),
-        _ => (base.clone(), String::new()),
-    };
-    let mut n = 2;
+    let mut n = 1;
     loop {
-        let candidate = format!("{stem} ({n}){ext}");
+        let candidate = attachment_name_candidate(&base, n);
         if used.insert(candidate.clone()) {
             return candidate;
         }
         n += 1;
+    }
+}
+
+/// Shared naming convention for collisions in a message and on disk.
+fn attachment_name_candidate(base: &str, n: usize) -> String {
+    if n == 1 {
+        return base.to_string();
+    }
+    match base.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => format!("{stem} ({n}).{ext}"),
+        _ => format!("{base} ({n})"),
     }
 }
 
@@ -715,17 +727,41 @@ pub(crate) fn open_forward_composer(state: &Rc<RefCell<UiState>>, worker: &Rc<Wo
     );
 }
 
-/// Writes each `(name, bytes)` into `folder` (item 1.23's "Save all").
+/// Writes each attachment to a new file, never replacing existing files.
+/// Exclusive creation also handles a collision between checking a name and
+/// writing it (including simultaneous exports and existing symbolic links).
 pub(crate) async fn save_batch_to_folder(folder: &gio::File, collected: &[(String, Vec<u8>)]) -> Result<String, String> {
+    let mut renamed = 0;
     for (name, bytes) in collected {
-        folder
-            .child(name.as_str())
-            .replace_contents_bytes_future(&glib::Bytes::from(bytes.as_slice()), None, false, gio::FileCreateFlags::REPLACE_DESTINATION)
-            .await
-            .map_err(|e| e.to_string())?;
+        let mut n = 1;
+        let (file, stream) = loop {
+            let candidate = attachment_name_candidate(name, n);
+            let file = folder.child(&candidate);
+            match file.create_future(gio::FileCreateFlags::PRIVATE, glib::Priority::DEFAULT).await {
+                Ok(stream) => break (file, stream),
+                Err(e) if e.matches(gio::IOErrorEnum::Exists) => n += 1,
+                Err(e) => return Err(format!("{candidate}: {e}")),
+            }
+        };
+        if n > 1 { renamed += 1; }
+        let write_result = match stream.write_all_future(bytes.clone(), glib::Priority::DEFAULT).await {
+            Ok((_, written, None)) if written == bytes.len() => Ok(()),
+            Ok((_, _, Some(e))) | Err((_, e)) => Err(e.to_string()),
+            Ok(_) => Err("Incomplete attachment write".to_string()),
+        };
+        let close_result = stream.close_future(glib::Priority::DEFAULT).await.map_err(|e| e.to_string());
+        if let Err(e) = write_result.and(close_result) {
+            // Only remove the file created by this export, never a collision.
+            let _ = file.delete_future(glib::Priority::DEFAULT).await;
+            return Err(format!("{name}: {e}"));
+        }
     }
     let noun = if collected.len() == 1 { "attachment" } else { "attachments" };
-    Ok(format!("Saved {} {noun}", collected.len()))
+    let mut message = format!("Saved {} {noun}", collected.len());
+    if renamed > 0 {
+        message.push_str(&format!(" ({renamed} renamed to avoid overwriting existing files)"));
+    }
+    Ok(message)
 }
 
 /// Builds a zip archive of `collected` in memory and writes it to `file`
@@ -940,7 +976,20 @@ pub(crate) fn temp_attachment_path(part: &BodyPart) -> PathBuf {
 /// `discard_temp_attachment` so the file doesn't linger until exit.
 pub(crate) fn materialize_temp_attachment(state: &Rc<RefCell<UiState>>, part: &BodyPart, bytes: &[u8]) -> Result<PathBuf, String> {
     let path = temp_attachment_path(part);
-    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| e.to_string())?;
+    if let Err(e) = file.write_all(bytes) {
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return Err(e.to_string());
+    }
     state.borrow_mut().temp_attachment_files.insert(path.clone());
     Ok(path)
 }
