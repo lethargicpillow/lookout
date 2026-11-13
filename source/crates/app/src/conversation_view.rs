@@ -520,8 +520,8 @@ pub fn js_restore_scroll(y: f64) -> String {
 /// The conversation document's own look: libadwaita-like cards in light
 /// and dark, following the system scheme.
 const DOCUMENT_CSS: &str = r#"
-:root { color-scheme: light dark; --bg: #fafafb; --card: #ffffff; --fg: #1e1e20; --dim: #6b6b70; --line: rgba(0,0,0,.20); --accent: #3584e4; --chip: rgba(0,0,0,.06); --note: #fdf4d7; }
-@media (prefers-color-scheme: dark) { :root { --bg: #222226; --card: #2e2e32; --fg: #f0f0f2; --dim: #a0a0a8; --line: rgba(255,255,255,.24); --accent: #78aeed; --chip: rgba(255,255,255,.1); --note: #4a4120; } }
+:root { color-scheme: light dark; --bg: #fafafb; --card: #ffffff; --head: #f0f2f5; --head-hover: #e8ebef; --fg: #1e1e20; --dim: #6b6b70; --line: rgba(0,0,0,.20); --card-line: #b9bec6; --accent: #3584e4; --chip: rgba(0,0,0,.06); --note: #fdf4d7; }
+@media (prefers-color-scheme: dark) { :root { --bg: #222226; --card: #2e2e32; --head: #37393f; --head-hover: #41434a; --fg: #f0f0f2; --dim: #a0a0a8; --line: rgba(255,255,255,.24); --card-line: #5a5d65; --accent: #78aeed; --chip: rgba(255,255,255,.1); --note: #4a4120; } }
 html, body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; }
 body { padding: 8px 12px 16px; }
 .toolbar { display: flex; align-items: center; gap: 12px; padding: 0 4px 8px; color: var(--dim); font-size: 12px; }
@@ -529,10 +529,15 @@ body { padding: 8px 12px 16px; }
 button { font: inherit; color: inherit; }
 button.link { background: none; border: 0; padding: 0; color: var(--accent); cursor: pointer; }
 button.link:hover { text-decoration: underline; }
-.card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; margin: 0 0 12px; overflow: hidden; }
-.card.unread { box-shadow: inset 3px 0 0 var(--accent); }
-.head { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; cursor: pointer; outline: none; }
-.head:focus-visible { box-shadow: inset 0 0 0 2px var(--accent); border-radius: 10px; }
+.card { background: var(--card); border: 1px solid var(--card-line); border-radius: 8px; margin: 0 0 16px; overflow: hidden; }
+.head { display: flex; gap: 10px; align-items: center; padding: 10px 12px; cursor: pointer; outline: none; background: var(--head); }
+.head:hover { background: var(--head-hover); }
+.card.unread .head { box-shadow: inset 3px 0 0 var(--accent); }
+.head:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* A CSS-only disclosure indicator follows the existing expanded class,
+   including script-driven Expand all / Collapse all and card updates. */
+.head::after { content: ""; flex: none; width: 7px; height: 7px; border-right: 2px solid var(--dim); border-bottom: 2px solid var(--dim); transform: rotate(-45deg); margin: 0 3px 0 2px; }
+.card.expanded .head::after { transform: rotate(45deg); margin-top: -4px; }
 .avatar { flex: none; width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center; color: #fff; font-weight: 600; font-size: 12px; }
 .avatar-color-0 { background: #3584e4; } .avatar-color-1 { background: #2ec27e; } .avatar-color-2 { background: #e66100; }
 .avatar-color-3 { background: #9141ac; } .avatar-color-4 { background: #c01c28; } .avatar-color-5 { background: #1c71d8; }
@@ -546,8 +551,8 @@ button.link:hover { text-decoration: underline; }
 .date { flex: none; color: var(--dim); font-size: 12px; }
 .recipients, .preview { color: var(--dim); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .card:not(.expanded) .recipients, .card.expanded .preview { display: none; }
-.content { display: none; padding: 0 12px 10px 54px; }
-.card.expanded .content { display: block; border-top: 1px solid var(--line); padding-top: 10px; }
+.content { display: none; padding: 0 12px 12px; }
+.card.expanded .content { display: block; border-top: 1px solid var(--card-line); padding-top: 12px; }
 .note { background: var(--note); border-radius: 6px; padding: 6px 10px; margin: 0 0 8px; font-size: 12px; }
 .attachments { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px; }
 .tile { display: flex; flex-direction: column; align-items: flex-start; max-width: 220px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); cursor: pointer; }
@@ -557,7 +562,7 @@ button.link:hover { text-decoration: underline; }
 iframe.body { display: block; width: 100%; height: 40px; border: 0; background: #fff; border-radius: 4px; }
 .dark iframe.body { background: #252629; }
 .loading { color: var(--dim); padding: 8px 0; }
-.actions { display: flex; gap: 6px; margin-top: 10px; }
+.actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
 .actions button { background: var(--chip); border: 0; border-radius: 6px; padding: 4px 12px; cursor: pointer; }
 .actions button:hover:not(:disabled) { background: var(--line); }
 .actions button:disabled { opacity: .5; cursor: default; }
@@ -764,6 +769,15 @@ mod tests {
         assert!(build_document(&trusting, Utc::now(), true).contains("default-src * data: cid: blob:"));
         assert!(build_document(&trusting, Utc::now(), true).contains("<body class=\"dark\">"));
         assert!(build_document(&trusting, Utc::now(), true).contains(".dark iframe.body { background: #252629; }"));
+    }
+
+    #[test]
+    fn conversation_card_chrome_preserves_page_palette_and_disclosure_state() {
+        assert!(DOCUMENT_CSS.contains(".card.expanded .head::after"));
+        assert!(DOCUMENT_CSS.contains(".card.unread .head"));
+        assert!(DOCUMENT_CSS.contains("border-top: 1px solid var(--card-line)"));
+        assert!(DOCUMENT_CSS.contains("iframe.body { display: block; width: 100%; height: 40px; border: 0; background: #fff;"));
+        assert!(DOCUMENT_CSS.contains(".dark iframe.body { background: #252629; }"));
     }
 
     #[test]
