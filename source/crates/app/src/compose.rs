@@ -623,18 +623,15 @@ pub(crate) fn page_background_button() -> gtk::ToggleButton {
     button
 }
 
-/// A single always-visible page switch, independent of ribbon selection.
-fn compose_tabs_with_page_background(tabs: &gtk::StackSwitcher) -> gtk::Box {
+/// Keep the page switch at the right edge of the commands, like the
+/// signature editor. The inner ribbon receives only the remaining width,
+/// so its overflow controller never has to hide this fixed control.
+fn compose_commands_with_page_background(commands: &gtk::Box) -> gtk::Box {
     let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
-        .spacing(6).hexpand(true).build();
-    row.append(tabs);
-    row.append(&gtk::Box::builder().hexpand(true).build());
-    let label = gtk::Label::new(Some("Page Background"));
-    label.add_css_class("dim-label");
-    row.append(&label);
-    let button = page_background_button();
-    button.set_margin_end(6);
-    row.append(&button);
+        .spacing(6).hexpand(true).css_classes(["compose-ribbon-commands"]).build();
+    commands.set_hexpand(true);
+    row.append(commands);
+    row.append(&page_background_button());
     row
 }
 
@@ -2653,11 +2650,12 @@ pub fn build_compose_view(
     editor_stack.add_titled(options_band.root(), Some("options"), "Options");
     let tabs = gtk::StackSwitcher::builder().stack(&editor_stack).halign(gtk::Align::Start).build();
     tabs.add_css_class("compose-ribbon-tabs");
-    // Keep the page switch outside all ribbon pages and the overflow menu.
-    // The whole toolbar follows the composer between docked and pop-out.
-    editor_toolbar.append(&compose_tabs_with_page_background(&tabs));
-    let ribbon_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(4).hexpand(true).vexpand(false).css_classes(["compose-ribbon-commands"]).build();
-    editor_toolbar.append(&ribbon_row);
+    editor_toolbar.append(&tabs);
+    let ribbon_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(4).hexpand(true).vexpand(false).build();
+    // The compact page switch remains outside the scrollable command
+    // pages and overflow. Both the ribbon and the switch follow the editor
+    // when it moves between the reading pane and its own window.
+    editor_toolbar.append(&compose_commands_with_page_background(&ribbon_row));
     let editor_scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::External)
         .vscrollbar_policy(gtk::PolicyType::Never)
@@ -3422,16 +3420,18 @@ mod tests {
     }
 
     #[test]
-    fn page_background_toggle_stays_outside_compose_tabs_and_syncs_other_editors() {
+    fn page_background_toggle_stays_outside_compose_commands_and_syncs_other_editors() {
         if !crate::gtk_test::gtk_ready() { return; }
         let original = crate::settings::page_dark();
         let stack = gtk::Stack::new();
         for name in ["message", "insert", "options"] {
             stack.add_titled(&gtk::Box::new(gtk::Orientation::Vertical, 0), Some(name), name);
         }
-        let tabs = gtk::StackSwitcher::builder().stack(&stack).build();
-        let row = compose_tabs_with_page_background(&tabs);
+        let commands = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).hexpand(true).build();
+        commands.append(&stack);
+        let row = compose_commands_with_page_background(&commands);
         let button = row.last_child().unwrap().downcast::<gtk::ToggleButton>().unwrap();
+        assert_eq!(row.first_child().as_ref(), Some(commands.upcast_ref::<gtk::Widget>()));
         let other = page_background_button();
         assert_eq!(button.widget_name(), "page-background-toggle");
         for name in ["message", "insert", "options"] {
