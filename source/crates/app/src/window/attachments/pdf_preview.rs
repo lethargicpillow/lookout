@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 const MIN_ZOOM: u32 = 50;
 const MAX_ZOOM: u32 = 400;
 const DEFAULT_ZOOM: u32 = 100;
+const WHEEL_ZOOM_STEP: u32 = 10;
 const ZOOM_MARKS: [u32; 8] = [50, 100, 150, 200, 250, 300, 350, 400];
 const TOOL_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_PNG_BYTES: u64 = 64 * 1024 * 1024;
@@ -68,6 +69,19 @@ fn render_size(zoom: u32) -> u32 {
 
 fn zoom_value(value: f64) -> u32 {
     value.round().clamp(MIN_ZOOM as f64, MAX_ZOOM as f64) as u32
+}
+
+fn wheel_zoom(current: u32, dy: f64) -> u32 {
+    // Discrete wheel deltas: up enlarges, down reduces. Keep the
+    // exact intermediate percentage when the slider was used last.
+    if dy == 0.0 { return current; }
+    let steps = dy.abs().round().max(1.0).min(35.0) as u32;
+    let change = WHEEL_ZOOM_STEP * steps;
+    if dy < 0.0 {
+        current.saturating_add(change).min(MAX_ZOOM)
+    } else {
+        current.saturating_sub(change).max(MIN_ZOOM)
+    }
 }
 
 fn snap_zoom(value: f64) -> Option<f64> {
@@ -474,7 +488,7 @@ pub(super) fn show(content: &gtk::Box, bytes: &[u8]) {
     slider.set_size_request(-1, 320);
     slider.set_vexpand(true);
     slider.set_value(DEFAULT_ZOOM as f64);
-    slider.set_tooltip_text(Some("PDF zoom"));
+    slider.set_tooltip_text(Some("Document zoom (Ctrl + mouse wheel)"));
     for percent in ZOOM_MARKS {
         slider.add_mark(percent as f64, gtk::PositionType::Right, Some(&format!("{percent}%")));
     }
@@ -587,6 +601,31 @@ pub(super) fn show(content: &gtk::Box, bytes: &[u8]) {
     }
     viewport.set_cursor_from_name(Some("grab"));
     viewport.add_controller(drag);
+    // Capture above the scrolled window, before its own scrolling
+    // controller consumes the event. Ctrl+wheel shares the slider's
+    // live scaling and deferred high-resolution render.
+    let zoom_scroll = gtk::EventControllerScroll::new(
+        gtk::EventControllerScrollFlags::VERTICAL | gtk::EventControllerScrollFlags::DISCRETE,
+    );
+    zoom_scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let weak = Rc::downgrade(&preview);
+    zoom_scroll.connect_scroll(move |controller, _, dy| {
+        if !controller.current_event_state().contains(gtk::gdk::ModifierType::CONTROL_MASK) {
+            return glib::Propagation::Proceed;
+        }
+        if let Some(preview) = weak.upgrade() {
+            if preview.pages.get() > 0 && dy != 0.0 {
+                let zoom = wheel_zoom(preview.zoom.get(), dy);
+                if let Some(slider) = preview.slider.upgrade() {
+                    slider.set_value(zoom as f64);
+                }
+            }
+        }
+        // Even at the zoom limits, Ctrl+wheel must not move the page.
+        glib::Propagation::Stop
+    });
+    document.add_controller(zoom_scroll);
+
     // A new manual scroll must win over a pending zoom allocation.
     let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
     scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -613,6 +652,18 @@ mod tests {
         assert_eq!(anchor_position(0.0, 0.0, 400.0, 2000.0), 0.0);
         assert_eq!(anchor_position(1.0, 0.0, 400.0, 2000.0), 1600.0);
         assert_eq!(anchor_position(0.9, 0.0, 800.0, 400.0), 0.0);
+    }
+
+    #[test]
+    fn pdf_wheel_zoom_uses_slider_range() {
+        assert_eq!(wheel_zoom(100, -1.0), 110);
+        assert_eq!(wheel_zoom(137, 1.0), 127);
+        assert_eq!(wheel_zoom(137, -2.0), 157);
+        assert_eq!(wheel_zoom(395, -1.0), 400);
+        assert_eq!(wheel_zoom(55, 1.0), 50);
+        assert_eq!(wheel_zoom(400, -1.0), 400);
+        assert_eq!(wheel_zoom(50, 1.0), 50);
+        assert_eq!(wheel_zoom(137, 0.0), 137);
     }
 
     #[test]
