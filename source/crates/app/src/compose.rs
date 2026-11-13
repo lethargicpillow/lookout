@@ -2225,11 +2225,12 @@ pub fn build_compose_view(
     let signature_list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::Single).build();
     let signature_scroller = gtk::ScrolledWindow::builder()
         .child(&signature_list)
-        // No fixed size: the dropdown grows to fit the whole signature
-        // list, and the map handler below re-syncs its width to the field
-        // rows each time it opens. The floor only guards the pre-first-map
-        // state.
         .min_content_width(240)
+        .max_content_width(320)
+        .max_content_height(240)
+        .propagate_natural_height(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
         .build();
     // The menu's root: the scrollable signature list above, and "Manage
     // Signatures…" pinned below the list - outside the scroller - so the
@@ -2297,16 +2298,7 @@ pub fn build_compose_view(
     (rebuild_signature_menu.borrow())();
     {
         let rebuild_handle = rebuild_signature_menu.clone();
-        let signature_scroller = signature_scroller.clone();
-        let fields_group = fields_group.clone();
         signature_popover.connect_map(move |_| {
-            // Match the dropdown's width to half the composer's field rows
-            // (the To/Cc/Bcc/Subject entries): the fields group spans
-            // exactly the entries' width. Runs while the popover is
-            // mapping, before its size is measured, so the new width lands
-            // on the menu that's about to open.
-            let width = (fields_group.width() / 2).max(240);
-            signature_scroller.set_min_content_width(width);
             (rebuild_handle.borrow())();
         });
     }
@@ -2377,7 +2369,11 @@ pub fn build_compose_view(
     templates_button.set_always_show_arrow(true);
     let templates_popover = gtk::Popover::new();
     let templates_list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::Single).build();
-    let templates_scroller = gtk::ScrolledWindow::builder().child(&templates_list).min_content_width(240).build();
+    let templates_scroller = gtk::ScrolledWindow::builder()
+        .child(&templates_list).min_content_width(240).max_content_width(320)
+        .max_content_height(240).propagate_natural_height(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic).build();
     let templates_menu_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
     templates_menu_box.append(&templates_scroller);
     templates_menu_box.append(&gtk::Separator::builder().orientation(gtk::Orientation::Horizontal).build());
@@ -2434,11 +2430,7 @@ pub fn build_compose_view(
     (rebuild_templates_menu.borrow())();
     {
         let rebuild_handle = rebuild_templates_menu.clone();
-        let templates_scroller = templates_scroller.clone();
-        let fields_group = fields_group.clone();
         templates_popover.connect_map(move |_| {
-            let width = (fields_group.width() / 2).max(240);
-            templates_scroller.set_min_content_width(width);
             (rebuild_handle.borrow())();
         });
     }
