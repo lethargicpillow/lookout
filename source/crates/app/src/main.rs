@@ -72,6 +72,8 @@ mod microsoft_oauth;
 mod my_day;
 mod oauth_loopback;
 mod online_accounts;
+mod oab_decode;
+mod oab_cache;
 mod other_accounts;
 mod privacy;
 mod profile_card;
@@ -126,6 +128,14 @@ const LAUNCHER_ACTIONS: [(&str, &str); 4] = [
 ];
 
 fn main() -> glib::ExitCode {
+    let args: Vec<_> = std::env::args_os().collect();
+    if args.get(1).is_some_and(|a| a == "--import-oab") {
+        if args.len() != 4 { eprintln!("Usage: lookout --import-oab ACCOUNT_EMAIL FULL.OAB"); return glib::ExitCode::FAILURE; }
+        return match crate::oab_cache::import_for_email(&args[2].to_string_lossy(), std::path::Path::new(&args[3])) {
+            Ok((total, addressable)) => { println!("GAL imported: {total} objects, {addressable} addressable"); glib::ExitCode::SUCCESS }
+            Err(e) => { eprintln!("GAL import failed: {e}"); glib::ExitCode::FAILURE }
+        };
+    }
     // GTK3-era accessibility modules (`gail`, `atk-bridge`) sometimes linger
     // in the environment's `GTK_MODULES`; GTK4 ships AT-SPI support natively,
     // so it ignores them but warns "Not loading module ... Please try to not

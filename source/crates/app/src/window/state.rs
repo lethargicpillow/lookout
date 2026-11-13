@@ -1282,6 +1282,9 @@ pub(crate) struct UiState {
     /// already lists those separately). Built lazily on first entry and
     /// dropped when the directory configuration changes.
     pub(crate) contacts_directory_source: Option<crate::directory::DirectorySource>,
+    pub(crate) contacts_directory_offset: usize,
+    pub(crate) contacts_directory_total: usize,
+    pub(crate) contacts_directory_local: bool,
     /// The query currently in the Directory search box.
     pub(crate) contacts_directory_query: String,
     /// The live directory hits for `contacts_directory_query`.

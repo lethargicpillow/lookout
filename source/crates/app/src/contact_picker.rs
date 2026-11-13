@@ -156,8 +156,9 @@ pub fn show_contact_picker(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>, di
         builder.build()
     };
 
+    let gal_paths = crate::oab_cache::local_paths(&state, None);
     let search = gtk::SearchEntry::builder()
-        .placeholder_text("Search name or email (at least 3 characters)")
+        .placeholder_text(if gal_paths.is_empty() { "Search name or email (at least 3 characters)" } else { "Search name, email or department" })
         .margin_start(12)
         .margin_end(12)
         .margin_top(12)
@@ -232,7 +233,80 @@ pub fn show_contact_picker(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>, di
         });
     }
     (rebuild.borrow())();
-    {
+    let page_bar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).margin_start(12).margin_end(12).margin_top(6).build();
+    page_bar.set_visible(!gal_paths.is_empty());
+    let prev = gtk::Button::from_icon_name("go-previous-symbolic");
+    let next = gtk::Button::from_icon_name("go-next-symbolic");
+    let page_label = gtk::Label::new(None);
+    page_bar.append(&prev);
+    page_bar.append(&page_label);
+    page_bar.append(&next);
+    if !gal_paths.is_empty() {
+        let offset = Rc::new(std::cell::Cell::new(0usize));
+        let generation = Rc::new(std::cell::Cell::new(0u64));
+        let load: Rc<dyn Fn()> = Rc::new({
+            let search = search.clone();
+            let prev = prev.clone();
+            let next = next.clone();
+            let page_label = page_label.clone();
+            let offset = offset.clone();
+            let generation = generation.clone();
+            let directory_items = directory_items.clone();
+            let rebuild = rebuild.clone();
+            move || {
+                let query = search.text().to_string();
+                let start = offset.get();
+                let token = generation.get().wrapping_add(1);
+                generation.set(token);
+                prev.set_sensitive(false);
+                next.set_sensitive(false);
+                page_label.set_label("Loading GAL…");
+                directory_items.borrow_mut().clear();
+                (rebuild.borrow())();
+                let (tx, rx) = async_channel::bounded(1);
+                let paths = gal_paths.clone();
+                std::thread::spawn(move || {
+                    let result = crate::oab_cache::page(&paths, &query, start, crate::oab_cache::PAGE_SIZE);
+                    let _ = tx.send_blocking(result);
+                });
+                let generation = generation.clone();
+                let directory_items = directory_items.clone();
+                let rebuild = rebuild.clone();
+                let prev = prev.clone();
+                let next = next.clone();
+                let page_label = page_label.clone();
+                gtk::glib::spawn_future_local(async move {
+                    let result = rx.recv().await;
+                    if generation.get() != token { return; }
+                    match result {
+                        Ok(Ok(page)) => {
+                            let count = page.people.len();
+                            *directory_items.borrow_mut() = page.people.into_iter().map(Item::Directory).collect();
+                            page_label.set_label(&format!("GAL: {}–{} / {}", if count == 0 { 0 } else { start + 1 }, start + count, page.total));
+                            prev.set_sensitive(start > 0);
+                            next.set_sensitive(count > 0 && start + count < page.total);
+                        }
+                        _ => page_label.set_label("Could not read local GAL"),
+                    }
+                    (rebuild.borrow())();
+                });
+            }
+        });
+        search.connect_search_changed({
+            let offset = offset.clone();
+            let load = load.clone();
+            move |_| { offset.set(0); load(); }
+        });
+        for (button, forward) in [(&prev,false),(&next,true)] {
+            let offset = offset.clone();
+            let load = load.clone();
+            button.connect_clicked(move |_| {
+                offset.set(if forward { offset.get().saturating_add(crate::oab_cache::PAGE_SIZE) } else { offset.get().saturating_sub(crate::oab_cache::PAGE_SIZE) });
+                load();
+            });
+        }
+        load();
+    } else {
         let rebuild = rebuild.clone();
         let directory_items = directory_items.clone();
         search.connect_search_changed(move |entry| {
@@ -311,6 +385,7 @@ pub fn show_contact_picker(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>, di
     let heading = gtk::Label::builder().label("Address Book — Contacts and Global Address List").xalign(0.0).margin_start(12).margin_top(12).css_classes(["heading"]).build();
     root.append(&heading);
     root.append(&search);
+    root.append(&page_bar);
     root.append(&scroller);
     root.append(&action_row);
     dialog.set_child(Some(&root));

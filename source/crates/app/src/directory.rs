@@ -371,6 +371,12 @@ fn assemble_directory_source(state: &Rc<RefCell<UiState>>, account: Option<Accou
         if account.as_ref().is_some_and(|scope| scope != &id) {
             continue;
         }
+        if let Some(path) = crate::oab_cache::existing_path(&manual.id) {
+            let fallback = if config.ldap_directories.iter().any(|d| d.account_id == id) { None }
+                else { LdapDirectoryBackend::davmail(manual, keyring.clone()) };
+            backends.push(Arc::new(crate::oab_cache::Backend { path, fallback }));
+            continue;
+        }
         // An explicitly configured directory takes precedence for this
         // account, including an explicitly disabled one.
         if config.ldap_directories.iter().any(|directory| directory.account_id == id) {

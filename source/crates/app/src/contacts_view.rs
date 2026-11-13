@@ -2176,7 +2176,7 @@ fn rebuild_directory_list_ui(
         contact_list.append(&label);
     };
 
-    if query.chars().count() < crate::directory::DIRECTORY_MIN_CHARS {
+    if !state.borrow().contacts_directory_local && query.chars().count() < crate::directory::DIRECTORY_MIN_CHARS {
         clear_selection();
         show_message("Type at least three characters to search the directory");
         details_refresh();
@@ -2190,7 +2190,8 @@ fn rebuild_directory_list_ui(
     }
     if results.is_empty() {
         clear_selection();
-        show_message(&format!("No matches in the directory for “{query}”"));
+        if query.is_empty() { show_message("No directory entries available"); }
+        else { show_message(&format!("No matches in the directory for “{query}”")); }
         details_refresh();
         return;
     }
