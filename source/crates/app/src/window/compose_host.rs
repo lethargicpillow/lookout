@@ -579,8 +579,10 @@ pub(crate) fn show_composer_in_reading_pane_full(
                 );
             }
         };
+        // Publish personal contacts immediately, independently of either
+        // background lookup. Subsequent deliveries retain these rows.
+        complete(merge_contact_suggestions(Vec::new(), &carddav, &[], &carddav_lists, &prefix, 8));
         let Some(cache) = address_cache.clone() else {
-            complete(merge_contact_suggestions(Vec::new(), &carddav, &[], &carddav_lists, &prefix, 8));
             deliver_directory(Vec::new());
             return;
         };

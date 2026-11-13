@@ -314,7 +314,8 @@ impl RecipientEntry {
             (root, header, Some(flow), None)
         };
 
-        let suggestion_list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::Single).build();
+        let suggestion_list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::Single)
+            .activate_on_single_click(true).focusable(false).build();
         let scroller = gtk::ScrolledWindow::builder()
             .child(&suggestion_list)
             .propagate_natural_height(true)
@@ -329,6 +330,7 @@ impl RecipientEntry {
             // the popover appeared, so the next keystroke would go nowhere.
             // Visibility is managed by hand instead.
             .autohide(false)
+            .focusable(false)
             .has_arrow(false)
             .build();
         popover.set_parent(&entry);
@@ -582,7 +584,7 @@ impl RecipientEntry {
                 // Tab would otherwise move focus with a token half-entered
                 // (chip mode) or a completion left un-accepted (plain mode).
                 gtk::gdk::Key::Tab if !this.plain && !this.entry.text().trim().is_empty() => {
-                    this.commit_entry_text();
+                    if !this.take_selected_suggestion() { this.commit_entry_text(); }
                     glib::Propagation::Stop
                 }
                 gtk::gdk::Key::Tab if this.plain && this.popover.is_visible() => {
@@ -605,7 +607,7 @@ impl RecipientEntry {
                     glib::Propagation::Stop
                 }
                 gtk::gdk::Key::Escape if this.popover.is_visible() => {
-                    this.popover.popdown();
+                    this.dismiss_suggestions();
                     glib::Propagation::Stop
                 }
                 _ => glib::Propagation::Proceed,
@@ -622,14 +624,22 @@ impl RecipientEntry {
             });
         }
 
-        // A field that loses focus mid-token keeps the text (it still counts
-        // via `addresses()`), but the completion list must not linger over
-        // whatever the user moved on to.
+        // A focus crossing is not necessarily a departure: on X11 a
+        // non-modal popup can briefly change the active surface, and clicking
+        // a completion must be allowed to finish. Inspect settled root focus
+        // rather than immediately closing from GtkText's leave signal.
         {
-            let popover = self.popover.clone();
+            let this = self.clone();
             let focus = gtk::EventControllerFocus::new();
-            focus.connect_leave(move |_| popover.popdown());
-            self.entry.add_controller(focus);
+            focus.connect_leave(move |_| {
+                let this = this.clone();
+                glib::idle_add_local_once(move || {
+                    if !this.focus_within_completion() {
+                        this.dismiss_suggestions();
+                    }
+                });
+            });
+            self.root.add_controller(focus);
         }
     }
 
@@ -857,12 +867,30 @@ impl RecipientEntry {
         chip
     }
 
+    fn focus_within_completion(&self) -> bool {
+        // GtkRoot retains the logical focus widget even when the X11 popup
+        // momentarily changes the active native surface.
+        let Some(root) = self.entry.root() else { return false; };
+        let Some(focus) = gtk::prelude::RootExt::focus(&root) else {
+            return self.popover.is_visible();
+        };
+        focus == self.entry.clone().upcast::<gtk::Widget>()
+            || focus.is_ancestor(&self.entry)
+            || focus == self.popover.clone().upcast::<gtk::Widget>()
+            || focus.is_ancestor(&self.popover)
+    }
+
+    fn dismiss_suggestions(&self) {
+        self.suggestion_generation.set(self.suggestion_generation.get().wrapping_add(1));
+        self.popover.popdown();
+    }
+
     /// Dispatches a suggestion lookup for `prefix` and, once it answers,
     /// applies the result - unless a later keystroke has since dispatched a
     /// newer one, per `suggestion_generation`.
     fn refresh_suggestions(&self, prefix: &str) {
         let prefix = prefix.trim().to_string();
-        let generation = self.suggestion_generation.get() + 1;
+        let generation = self.suggestion_generation.get().wrapping_add(1);
         self.suggestion_generation.set(generation);
 
         let source = self.source.borrow().clone();
@@ -893,6 +921,9 @@ impl RecipientEntry {
         if self.suggestion_generation.get() != generation {
             return;
         }
+        if !self.entry.is_mapped() || !self.focus_within_completion() {
+            return;
+        }
 
         // Anything already entered is not a useful suggestion. `addresses()`
         // covers both modes: chip mode's committed tokens plus any pending
@@ -909,31 +940,42 @@ impl RecipientEntry {
             .take(MAX_SUGGESTIONS)
             .collect();
 
-        while let Some(row) = self.suggestion_list.first_child() {
-            self.suggestion_list.remove(&row);
-        }
         if matches.is_empty() {
             self.popover.popdown();
-            *self.suggestions.borrow_mut() = Vec::new();
+            self.suggestions.borrow_mut().clear();
+            while let Some(row) = self.suggestion_list.first_child() {
+                self.suggestion_list.remove(&row);
+            }
             return;
         }
-        for candidate in &matches {
-            let row = gtk::Label::builder()
-                .label(suggestion_label(candidate))
-                .xalign(0.0)
-                .margin_top(4)
-                .margin_bottom(4)
-                .margin_start(8)
-                .margin_end(8)
-                .build();
-            // Autocomplete suggestions name people/addresses: blurred by
-            // privacy mode.
-            crate::privacy::mark(&row);
-            self.suggestion_list.append(&row);
+        // Local results and the merged GAL response often contain exactly the
+        // same leading rows. Keep their GTK identities (and mouse targets).
+        let previous = self.suggestions.borrow().clone();
+        let selected = self.suggestion_list.selected_row()
+            .and_then(|row| previous.get(row.index() as usize).cloned());
+        let common = previous.iter().zip(&matches).take_while(|(a, b)| a == b).count();
+        if previous != matches {
+            while let Some(row) = self.suggestion_list.row_at_index(common as i32) {
+                self.suggestion_list.remove(&row);
+            }
+            for candidate in matches.iter().skip(common) {
+                let label = gtk::Label::builder()
+                    .label(suggestion_label(candidate))
+                    .xalign(0.0).margin_top(4).margin_bottom(4)
+                    .margin_start(8).margin_end(8).build();
+                crate::privacy::mark(&label);
+                let row = gtk::ListBoxRow::builder().child(&label)
+                    .focusable(false).focus_on_click(false).build();
+                self.suggestion_list.append(&row);
+            }
+            let selection = selected.as_ref().and_then(|candidate| matches.iter().position(|m| m == candidate))
+                .unwrap_or(0);
+            *self.suggestions.borrow_mut() = matches;
+            if let Some(row) = self.suggestion_list.row_at_index(selection as i32) {
+                self.suggestion_list.select_row(Some(&row));
+            }
         }
-        *self.suggestions.borrow_mut() = matches;
-        self.suggestion_list.unselect_all();
-        self.popover.popup();
+        if !self.popover.is_visible() { self.popover.popup(); }
     }
 
     fn move_suggestion_selection(&self, delta: i32) {
@@ -989,7 +1031,8 @@ impl RecipientEntry {
                 }
             }
         }
-        self.popover.popdown();
+        self.dismiss_suggestions();
+        self.entry.grab_focus();
         true
     }
 

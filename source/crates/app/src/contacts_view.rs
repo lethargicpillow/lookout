@@ -313,7 +313,17 @@ fn contacts_match_prefix(contact: &EmailAddress, prefix: &str) -> bool {
         return true;
     }
     let needle = prefix.to_lowercase();
-    contact.address.to_lowercase().starts_with(&needle) || contact.name.as_deref().is_some_and(|name| name.to_lowercase().starts_with(&needle))
+    contact.address.to_lowercase().starts_with(&needle) || contact.name.as_deref().is_some_and(|name| name_matches_prefix(name, &needle))
+}
+
+/// Match at the start of any name component, not just the first component.
+/// This supports surname-first Exchange display names and multi-word names.
+fn name_matches_prefix(name: &str, needle: &str) -> bool {
+    let name = name.to_lowercase();
+    name.starts_with(needle) || name.char_indices().any(|(index, _)| {
+        index > 0 && name[..index].chars().next_back().is_some_and(|c| c.is_whitespace() || c == ',')
+            && name[index..].starts_with(needle)
+    })
 }
 
 /// A contact list matches a completion prefix on its name alone - it carries
@@ -1354,7 +1364,7 @@ fn directory_matches_prefix(person: &DirectoryPerson, prefix: &str) -> bool {
         return true;
     }
     let needle = prefix.to_lowercase();
-    person.address.to_lowercase().starts_with(&needle) || person.name.as_deref().is_some_and(|name| name.to_lowercase().starts_with(&needle))
+    person.address.to_lowercase().starts_with(&needle) || person.name.as_deref().is_some_and(|name| name_matches_prefix(name, &needle))
 }
 
 /// The label a directory hit shows in the People Directory list and details
@@ -1509,8 +1519,10 @@ pub fn merge_contact_suggestions(
     limit: usize,
 ) -> Vec<crate::recipient_entry::Suggestion> {
     let mut addresses = Vec::new();
-    addresses.extend(mail_history);
+    // Stored contacts are authoritative and stay at the top when a later
+    // history/directory answer arrives.
     addresses.extend(carddav.iter().filter(|c| contacts_match_prefix(c, prefix)).cloned());
+    addresses.extend(mail_history);
     let mut merged: Vec<crate::recipient_entry::Suggestion> = dedupe_addresses(addresses, limit).into_iter().map(crate::recipient_entry::Suggestion::Address).collect();
     // Directory/GAL hits (item 4.7.1) come after stored contacts: a person the
     // user already has as a contact wins, and the directory only fills what's
@@ -3734,6 +3746,17 @@ mod tests {
     fn directory_entries_without_an_address_are_skipped() {
         let merged = merge_contact_suggestions(Vec::new(), &[], &[directory_person("No Address", "  ")], &[], "", 8);
         assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn recipient_names_match_later_name_components() {
+        let contact = EmailAddress { name: Some("Иванов Сергей Петрович".into()), address: "ivanov@example.invalid".into() };
+        assert!(contacts_match_prefix(&contact, "сер"));
+        assert!(contacts_match_prefix(&contact, "сергей пет"));
+        assert!(contacts_match_prefix(&contact, "иван"));
+        assert!(!contacts_match_prefix(&contact, "ерг"));
+        let person = directory_person("Иванов Сергей Петрович", "ivanov@example.invalid");
+        assert!(directory_matches_prefix(&person, "сер"));
     }
 
     #[test]
