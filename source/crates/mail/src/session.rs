@@ -1633,6 +1633,12 @@ pub async fn run_account_session(
     // A launch that starts already offline must not even attempt the spare
     // IDLE connection; it is spawned when the account first goes online.
     let mut idle_task = (!*offline_rx.borrow()).then(|| tokio::spawn(run_idle_supervisor(config.clone(), credentials.clone(), mailbox_rx, idle_notify_tx.clone())));
+    // A separate, ordered draft lane survives primary IMAP reconnects.
+    let draft_jobs = if davmail_saves_sent(&config.imap, &config.smtp) {
+        let (tx, rx) = async_channel::unbounded();
+        tokio::spawn(run_davmail_draft_worker(config.clone(), credentials.clone(), events.clone(), offline_rx.clone(), rx));
+        Some(tx)
+    } else { None };
 
     loop {
         // Work Offline (M-40): no network module runs while the user has
@@ -1688,6 +1694,7 @@ pub async fn run_account_session(
             &mut offline_rx,
             &mut move_ledger,
             &mut copy_ledger,
+            draft_jobs.as_ref(),
         )
         .await
         {
@@ -1945,6 +1952,7 @@ async fn connect_and_run(
     offline_rx: &mut tokio::sync::watch::Receiver<bool>,
     move_ledger: &mut MoveLedger,
     copy_ledger: &mut MoveLedger,
+    draft_jobs: Option<&async_channel::Sender<DavmailDraftJob>>,
 ) -> Result<ShutdownReason> {
     // The outer loop normally parks before calling us, but the toggle can win
     // the race between that check and this call; don't log in at all then.
@@ -2222,11 +2230,19 @@ async fn connect_and_run(
                             archive_sent_message(&mut session, &folders, &account_id, &raw).await
                         };
                         if let Some(sent_id) = sent_id { sent_to_sync.get_or_insert(sent_id); }
+                        // Publish delivery before any optional IMAP housekeeping.
+                        emit_outbox_contents(cache, events).await;
                         if let Some(draft_id) = message.draft_message_id.as_deref() {
-                            if let Err(e) = delete_draft(&mut session, &folders, &account_id, draft_id, has_uidplus).await {
-                                tracing::warn!("message sent but deleting its draft failed: {e}");
+                            if let Some(jobs) = draft_jobs {
+                                if jobs.try_send(DavmailDraftJob::Delete { folders: folders.clone(), message_id: draft_id.to_string() }).is_err() {
+                                    tracing::warn!("message sent but draft worker unavailable");
+                                }
+                            } else {
+                                if let Err(e) = delete_draft(&mut session, &folders, &account_id, draft_id, has_uidplus).await {
+                                    tracing::warn!("message sent but deleting its draft failed: {e}");
+                                }
+                                selection_moved = true;
                             }
-                            selection_moved = true;
                         }
                     }
                     Err(e) => {
@@ -3194,6 +3210,14 @@ async fn connect_and_run(
                     next_outbox_due = cache_op(cache, |c| c.next_outbox_not_before()).await.and_then(|r| r.ok()).flatten();
                 }
                 AccountCommand::SaveDraft { msg, replace } => {
+                    if let Some(jobs) = draft_jobs {
+                        let message_id = msg.message_id.clone().unwrap_or_default();
+                        tracing::debug!("send pipeline: dispatching isolated draft save");
+                        if jobs.try_send(DavmailDraftJob::Save { folders: folders.clone(), msg, replace }).is_err() {
+                            let _ = events.send(AccountEvent::DraftSaveFailed { message_id, message: "Draft worker unavailable".into() }).await;
+                        }
+                        continue;
+                    }
                     let had_drafts_folder = drafts_path(&folders, &account_id).is_some();
                     let draft_id = msg.message_id.clone().unwrap_or_default();
                     tracing::debug!(attachments = msg.attachments.len(), attachment_bytes = msg.attachments.iter().map(|a| a.bytes.len()).sum::<usize>(), "send pipeline: IMAP draft save starting");
@@ -3282,6 +3306,12 @@ async fn connect_and_run(
                     }
                 }
                 AccountCommand::DeleteDraft { message_id } => {
+                    if let Some(jobs) = draft_jobs {
+                        if jobs.try_send(DavmailDraftJob::Delete { folders: folders.clone(), message_id }).is_err() {
+                            tracing::warn!("draft worker unavailable");
+                        }
+                        continue;
+                    }
                     if let Err(e) = delete_draft(&mut session, &folders, &account_id, &message_id, has_uidplus).await {
                         tracing::warn!("draft delete failed: {e}");
                     }
@@ -6481,6 +6511,25 @@ async fn save_draft(
     replace: DraftReplace,
     has_uidplus: bool,
 ) -> Result<String> {
+    let saved = append_draft(session, folders, account_id, msg, replace).await?;
+    cleanup_draft(session, &saved, has_uidplus).await?;
+    Ok(saved.message_id)
+}
+
+struct AppendedDraft {
+    message_id: String,
+    path: String,
+    previous: Vec<Uid>,
+    source: Option<(String, Uid)>,
+}
+
+async fn append_draft(
+    session: &mut Session<SessionStream>,
+    folders: &[Mailbox],
+    account_id: &AccountId,
+    msg: ComposedMessage,
+    replace: DraftReplace,
+) -> Result<AppendedDraft> {
     let path = match drafts_path(folders, account_id) {
         Some(path) => path.to_string(),
         None => {
@@ -6520,13 +6569,85 @@ async fn save_draft(
     tracing::debug!(bytes = raw.len(), "send pipeline: IMAP APPEND starting");
     session.append(&path, Some("(\\Draft \\Seen)"), None, raw.as_slice()).await?;
     tracing::debug!("send pipeline: IMAP APPEND accepted");
-    purge_uids(session, &previous, has_uidplus).await?;
-    if let Some((source_path, uid)) = source {
-        session.select(&source_path).await?;
-        purge_uid(session, uid, has_uidplus).await?;
-        session.select(&path).await?;
+    Ok(AppendedDraft { message_id, path, previous, source })
+}
+
+async fn cleanup_draft(session: &mut Session<SessionStream>, saved: &AppendedDraft, has_uidplus: bool) -> Result<()> {
+    tracing::debug!(previous = saved.previous.len(), has_uidplus, "send pipeline: draft cleanup starting");
+    purge_uids(session, &saved.previous, has_uidplus).await?;
+    if let Some((source_path, uid)) = &saved.source {
+        session.select(source_path).await?;
+        purge_uid(session, *uid, has_uidplus).await?;
+        session.select(&saved.path).await?;
     }
-    Ok(message_id)
+    tracing::debug!("send pipeline: draft cleanup completed");
+    Ok(())
+}
+
+enum DavmailDraftJob {
+    Save { folders: Vec<Mailbox>, msg: Box<ComposedMessage>, replace: DraftReplace },
+    Delete { folders: Vec<Mailbox>, message_id: String },
+}
+
+/// Serial draft work on disposable IMAP connections. APPEND confirmation is
+/// independent of old-copy cleanup; delete after SMTP follows earlier saves.
+async fn run_davmail_draft_worker(
+    config: AccountConfig,
+    credentials: std::sync::Arc<dyn CredentialProvider>,
+    events: async_channel::Sender<AccountEvent>,
+    offline: tokio::sync::watch::Receiver<bool>,
+    jobs: async_channel::Receiver<DavmailDraftJob>,
+) {
+    while let Ok(job) = jobs.recv().await {
+        match job {
+            DavmailDraftJob::Save { folders, msg, replace } => {
+                let message_id = msg.message_id.clone().unwrap_or_default();
+                if *offline.borrow() {
+                    let _ = events.send(AccountEvent::DraftSaveFailed { message_id, message: "Account offline".into() }).await;
+                    continue;
+                }
+                let upload = tokio::time::timeout(Duration::from_secs(120), async {
+                    let credential = credentials.imap_credential().await.map_err(Error::LoginFailed)?;
+                    let (mut session, caps) = login(&config, credential).await?;
+                    let saved = append_draft(&mut session, &folders, &config.account_id, *msg, replace).await?;
+                    Ok::<_, Error>((session, caps.has_uidplus, saved))
+                }).await;
+                match upload {
+                    Ok(Ok((mut session, has_uidplus, saved))) => {
+                        tracing::debug!("send pipeline: isolated IMAP draft saved");
+                        let _ = events.send(AccountEvent::DraftSaved { message_id: saved.message_id.clone() }).await;
+                        match tokio::time::timeout(Duration::from_secs(15), cleanup_draft(&mut session, &saved, has_uidplus)).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => tracing::warn!("DavMail draft cleanup failed: {e}"),
+                            Err(_) => tracing::warn!("DavMail draft cleanup timed out"),
+                        }
+                    }
+                    failure => {
+                        let detail = match failure {
+                            Ok(Err(e)) => e.to_string(),
+                            Err(_) => "IMAP draft upload timed out".into(),
+                            _ => unreachable!(),
+                        };
+                        tracing::warn!("DavMail draft save failed: {detail}");
+                        let _ = events.send(AccountEvent::DraftSaveFailed { message_id, message: detail }).await;
+                    }
+                }
+            }
+            DavmailDraftJob::Delete { folders, message_id } => {
+                if *offline.borrow() { continue; }
+                let result = tokio::time::timeout(Duration::from_secs(20), async {
+                    let credential = credentials.imap_credential().await.map_err(Error::LoginFailed)?;
+                    let (mut session, caps) = login(&config, credential).await?;
+                    delete_draft(&mut session, &folders, &config.account_id, &message_id, caps.has_uidplus).await
+                }).await;
+                match result {
+                    Ok(Ok(())) => tracing::debug!("send pipeline: isolated draft deleted"),
+                    Ok(Err(e)) => tracing::warn!("DavMail draft delete failed: {e}"),
+                    Err(_) => tracing::warn!("DavMail draft delete timed out"),
+                }
+            }
+        }
+    }
 }
 
 /// Deletes the draft stored under `message_id` from the account's Drafts
