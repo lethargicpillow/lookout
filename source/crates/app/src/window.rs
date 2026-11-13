@@ -4616,18 +4616,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     });
     command_band.group("Move", |group| {
         group.menu(&move_button, themed_icon_name(&["folder-move-symbolic", "go-jump-symbolic"]), "Move to");
-        group.menu(&rules_button, "emblem-system-symbolic", "Rules");
+        group.small_menu(&rules_button, "emblem-system-symbolic", "Rules");
     });
-    let (pin_icon, flag_icon, mark_read_icon) = command_band.group("Categories", |group| {
-        // The large commands first, so the Classic layout stacks Pin and
-        // Snooze in a column after them.
+    let (pin_icon, flag_icon, mark_read_icon) = command_band.group("Tags", |group| {
+        // Keep Read prominent; the remaining state/organization actions
+        // occupy the classic three-slot columns.
         let read = group.button(
             &mark_read_button,
             themed_icon_name(&["mail-mark-unread-symbolic", "mail-unread-symbolic", "emblem-ok-symbolic"]),
             "Read",
         );
-        group.menu(&categorize_button, themed_icon_name(&["tag-symbolic", "mail-mark-important-symbolic"]), "Categorize");
-        let flag = group.split(&flag_button, follow_up_icon_name(false), "Flag");
+        group.small_menu(&categorize_button, themed_icon_name(&["tag-symbolic", "mail-mark-important-symbolic"]), "Categorize");
+        let flag = group.small_split(&flag_button, follow_up_icon_name(false), "Flag");
         let pin = group.small_button(&pin_button, pin_icon_name(false), "Pin");
         group.small_button(&snooze_button, "appointment-soon-symbolic", "Snooze");
         (pin, flag, read)
@@ -4890,21 +4890,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let overview_pane_toggle = gtk::ToggleButton::builder().icon_name("x-office-calendar-symbolic").build();
     overview_pane_toggle.set_tooltip_text(Some("Calendar overview"));
     overview_pane_toggle.set_active(true);
-    // View ▸ Messages ▾ (UX-22, item 1.7): Outlook's "Show as conversations /
-    // individual messages" plus the conversation reading pane's order. Both
-    // drive stateful `win.` actions whose handlers (wired below, once the
-    // message list exists) persist to GSettings and mirror Config →
-    // Appearance's rows.
-    let messages_menu = gio::Menu::new();
+    // View: separate conversation organization from list layout. Both
+    // keep using the existing stateful actions and persisted settings.
+    let conversations_menu = gio::Menu::new();
     let organization_section = gio::Menu::new();
     organization_section.append(Some("Show as conversations"), Some("win.message-organization('conversations')"));
     organization_section.append(Some("Show as individual messages"), Some("win.message-organization('messages')"));
-    messages_menu.append_section(None, &organization_section);
+    conversations_menu.append_section(None, &organization_section);
     let order_section = gio::Menu::new();
     for (value, label) in crate::settings::CONVERSATION_ORDERS.iter().zip(crate::settings::CONVERSATION_ORDER_LABELS) {
         order_section.append(Some(label), Some(&format!("win.conversation-order('{value}')")));
     }
-    messages_menu.append_section(Some("Conversation reading pane"), &order_section);
+    conversations_menu.append_section(Some("Conversation reading pane"), &order_section);
     // View ▸ Messages ▸ Message layout: Automatic (Outlook's width rule),
     // Three-line, or Single-line. Forcing a layout is useful on a narrow
     // window (to try the columns) or a wide one (to keep the taller rows).
@@ -4912,14 +4909,38 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     for style in crate::window::sort::ListStyle::ALL {
         layout_section.append(Some(style.label()), Some(&format!("win.message-layout('{}')", style.code())));
     }
-    messages_menu.append_section(Some("Message layout"), &layout_section);
-    let messages_button = gtk::MenuButton::builder()
-        .icon_name(themed_icon_name(&["mail-unread-symbolic", "mail-read-symbolic", "mail-message-new-symbolic"]))
-        .tooltip_text("Messages")
-        .css_classes(["flat"])
-        .valign(gtk::Align::Center)
-        .menu_model(&messages_menu)
+    let layout_button = gtk::MenuButton::builder()
+        .tooltip_text("Change View")
+        .menu_model(&layout_section)
         .build();
+    let conversations_button = gtk::MenuButton::builder()
+        .tooltip_text("Conversations")
+        .menu_model(&conversations_menu)
+        .build();
+    // Use the same appearance row and its existing apply handler, so this
+    // ribbon menu and Settings cannot disagree about preview length.
+    let preview_menu = gio::Menu::new();
+    for (lines, label) in ["Off", "1 Line", "2 Lines", "3 Lines"].into_iter().enumerate() {
+        preview_menu.append(Some(label), Some(&format!("win.message-preview('{lines}')")));
+    }
+    let preview_button = gtk::MenuButton::builder()
+        .tooltip_text("Message Preview")
+        .menu_model(&preview_menu)
+        .build();
+    let preview_action = gio::SimpleAction::new_stateful(
+        "message-preview",
+        Some(glib::VariantTy::STRING),
+        &crate::settings::preview_lines(settings.get_int(crate::settings::LAYOUT_PREVIEW_LINES)).to_string().to_variant(),
+    );
+    {
+        let row = config_view.preview_lines_row.clone();
+        preview_action.connect_activate(move |action, parameter| {
+            let Some(lines) = parameter.and_then(|p| p.str()).and_then(|s| s.parse::<i32>().ok()) else { return };
+            let lines = crate::settings::preview_lines(lines);
+            action.set_state(&lines.to_string().to_variant());
+            row.set_selected(lines as u32);
+        });
+    }
     let message_organization_action = gio::SimpleAction::new_stateful(
         "message-organization",
         Some(glib::VariantTy::STRING),
@@ -4975,26 +4996,22 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     }
     let icon_style_button = gtk::MenuButton::builder().tooltip_text("Icons").menu_model(&icon_style_menu).build();
     let view_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
+    view_band.group("Current View", |group| {
+        group.menu(&layout_button, "view-list-symbolic", "Change View");
+        group.small_menu(&preview_button, "format-justify-left-symbolic", "Message Preview");
+        group.small_menu(&density_button, "view-continuous-symbolic", "Density");
+    });
+    view_band.group("Messages", |group| {
+        group.menu(&conversations_button, "mail-unread-symbolic", "Conversations");
+    });
     view_band.group("Layout", |group| {
-        group.toggle(&folder_pane_toggle, "folder-symbolic", "Folder pane");
-        group.menu(
+        group.small_toggle(&folder_pane_toggle, "folder-symbolic", "Folder pane");
+        group.small_menu(
             &reading_pane_button,
             themed_icon_name(&["view-dual-symbolic", "sidebar-show-right-symbolic", "view-paged-symbolic"]),
             "Reading pane",
         );
-        group.menu(
-            &density_button,
-            themed_icon_name(&["view-list-symbolic", "view-continuous-symbolic", "format-justify-fill-symbolic"]),
-            "Density",
-        );
-        group.toggle(&overview_pane_toggle, "x-office-calendar-symbolic", "Calendar overview");
-    });
-    view_band.group("Messages", |group| {
-        group.menu(
-            &messages_button,
-            themed_icon_name(&["mail-unread-symbolic", "mail-read-symbolic", "mail-message-new-symbolic"]),
-            "Messages",
-        );
+        group.small_toggle(&overview_pane_toggle, "x-office-calendar-symbolic", "Calendar overview");
     });
     view_band.group("Arrangement", |group| {
         group.menu(&arrange_by_button, "view-sort-ascending-symbolic", "Arrange By");
@@ -5027,8 +5044,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         group.button(&send_receive_tab_button, "view-refresh-symbolic", "Send/Receive All Folders");
     });
     send_receive_band.group("Accounts", |group| {
-        group.button(&add_account_button, "list-add-symbolic", "Add Account");
-        group.button(&account_settings_button, "preferences-system-symbolic", "Account Settings");
+        group.small_button(&add_account_button, "list-add-symbolic", "Add Account");
+        group.small_button(&account_settings_button, "preferences-system-symbolic", "Account Settings");
     });
     // Work Offline (M-40): the app-wide switch, in Outlook's Send / Receive
     // ▸ Preferences group. The title-bar indicator and the Mail banner offer
@@ -6360,6 +6377,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     window.add_action(&density_action);
     window.add_action(&message_organization_action);
     window.add_action(&message_layout_action);
+    window.add_action(&preview_action);
     window.add_action(&conversation_order_action);
     window.add_action(&task_sort_action);
     window.add_action(&task_group_action);
@@ -8820,8 +8838,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let state = state.clone();
         let row_display_registry = row_display_registry.clone();
         let row_display = row_display.clone();
+        let preview_action = preview_action.clone();
         config_view.preview_lines_row.connect_selected_notify(move |row| {
-            let lines = row.selected() as i32;
+            let lines = crate::settings::preview_lines(row.selected() as i32);
+            preview_action.set_state(&lines.to_string().to_variant());
             state.borrow().settings.set_int(crate::settings::LAYOUT_PREVIEW_LINES, lines);
             let display = RowDisplay {
                 preview_lines: lines,
