@@ -1895,8 +1895,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let Some(summary) = bound.borrow().clone() else { return; };
                 move_messages_to_role(&state, &message_list, &[summary], MailboxRole::Trash);
             });
-                }
-            });
         }
         {
             let state = state_clone.clone();
