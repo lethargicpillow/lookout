@@ -707,6 +707,15 @@ pub(crate) fn show_composer_in_reading_pane_full(
         open_contact_picker,
         on_pop_out,
         on_send_started,
+        {
+            let state = state.clone();
+            let account_id = account_id.clone();
+            Rc::new(move |token| {
+                if let (Some(account_id), Some(token)) = (account_id.as_ref(), token) {
+                    take_pending_send(&state, account_id, 0, Some(token));
+                }
+            })
+        },
         // Scheduling on a Microsoft 365 account with Graph access goes
         // server-side through Exchange (item 5.5 / C-08) so it goes out even
         // with Lookout closed; otherwise this returns false and the local
