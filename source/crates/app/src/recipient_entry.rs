@@ -2,11 +2,9 @@
 //! chip rather than a run of comma-separated text, with completions offered
 //! from the account's address book as you type.
 //!
-//! Built from stock widgets held in a plain struct rather than a `glib`
-//! subclass, matching `MessageListModel` (see the note in `message_list.rs`):
-//! the app crate has no GObject subclassing anywhere, and this needs none.
-//! Chips are recreated from the canonical address list on every change, the
-//! same repopulate-from-truth approach the message list uses.
+//! The field state is a plain Rust struct. The composer uses a small
+//! height-for-width GTK widget for its inline chips and stretchy editor.
+//! Calendar fields retain the stock FlowBox.
 //!
 //! A contact list picked from the address book lands as a single chip showing
 //! the list's name, with a `+` toggle that expands it to its member chips
@@ -183,11 +181,10 @@ pub struct RecipientEntry {
     /// this is the title row above the chips; in plain mode there is no
     /// separate title row, so it's `root` itself.
     header: gtk::Box,
-    /// Wraps committed chips onto further lines as they accumulate.
-    /// The calendar also keeps its text entry in this flow; the composer
-    /// uses a separate expanding text row beneath the chips.
-    /// `None` in plain mode, which has no chips to wrap.
+    /// Calendar chips and trailing editor.
     flow: Option<gtk::FlowBox>,
+    /// Composer chips and trailing editor, in one height-for-width surface.
+    compose_layout: Option<crate::recipient_layout::InlineRecipients>,
     entry: gtk::Text,
     /// Chip mode: whether pills are rendered, with `tokens` as the
     /// canonical committed list. Plain mode: a single line of raw text -
@@ -230,43 +227,13 @@ impl RecipientEntry {
     /// A chip-mode field: each recipient is a removable pill. Used by the
     /// calendar event editor's attendees field.
     pub fn new(title: &str) -> Self {
-        Self::build(title, false)
+        Self::build(title, false, false)
     }
 
-    /// Composer variant: a full-width text editor, with committed chips
-    /// in a wrapping flow above it. GtkFlowBox does not allocate its spare
-    /// width to an expanding child, so the text editor must not live inside
-    /// it (even when the flow contains only that editor).
+    /// Outlook-style: the editor follows the last chip and fills the
+    /// remaining width, wrapping only when the line runs out of room.
     pub fn new_compose(title: &str) -> Self {
-        let this = Self::build(title, false);
-        let flow = this.flow.as_ref().expect("chip mode");
-        this.root.remove(flow);
-
-        let wrapper = this.entry.parent().and_downcast::<gtk::FlowBoxChild>()
-            .expect("entry flow wrapper");
-        wrapper.set_child(None::<&gtk::Widget>);
-        flow.remove(&wrapper);
-        flow.set_hexpand(true);
-        flow.set_halign(gtk::Align::Fill);
-        flow.set_row_spacing(2);
-        flow.set_column_spacing(3);
-        flow.add_css_class("compose-chip-flow");
-        flow.set_visible(false);
-
-        this.entry.set_width_request(-1);
-        this.entry.set_hexpand(true);
-        this.entry.set_halign(gtk::Align::Fill);
-        this.entry.set_placeholder_text(None);
-        this.entry.add_css_class("compose-address-input");
-
-        let surface = gtk::Box::builder().orientation(gtk::Orientation::Vertical)
-            .spacing(2).hexpand(true).halign(gtk::Align::Fill)
-            .css_classes(["compose-address-surface"]).build();
-        surface.append(flow);
-        surface.append(&this.entry);
-        this.header.set_hexpand(true);
-        this.header.append(&surface);
-        this
+        Self::build(title, false, true)
     }
 
     /// A plain-line field: recipients are raw comma-separated text, no
@@ -275,13 +242,13 @@ impl RecipientEntry {
     /// chip mode now (UX-42).
     #[cfg(test)]
     pub fn new_plain(title: &str) -> Self {
-        Self::build(title, true)
+        Self::build(title, true, false)
     }
 
-    fn build(title: &str, plain: bool) -> Self {
+    fn build(title: &str, plain: bool, compose: bool) -> Self {
         let entry = gtk::Text::builder().hexpand(true).width_request(120).build();
 
-        let (root, header, flow) = if plain {
+        let (root, header, flow, compose_layout) = if plain {
             let root = gtk::Box::builder()
                 .orientation(gtk::Orientation::Horizontal)
                 .spacing(6)
@@ -296,7 +263,27 @@ impl RecipientEntry {
             }
             root.append(&entry);
             let header = root.clone();
-            (root, header, None)
+            (root, header, None, None)
+        } else if compose {
+            entry.set_width_request(-1);
+            entry.set_placeholder_text(None);
+            entry.add_css_class("compose-address-input");
+            let surface = crate::recipient_layout::InlineRecipients::new(&entry);
+            surface.add_css_class("compose-address-surface");
+            surface.set_hexpand(true);
+            surface.set_halign(gtk::Align::Fill);
+            let header = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
+                .spacing(6).hexpand(true).build();
+            if !title.is_empty() {
+                let label = gtk::Label::builder().label(title).valign(gtk::Align::Start).build();
+                crate::privacy::mark_ui(&label);
+                header.append(&label);
+            }
+            header.append(&surface);
+            let root = gtk::Box::builder().orientation(gtk::Orientation::Vertical)
+                .css_classes(["recipient-field"]).hexpand(true).build();
+            root.append(&header);
+            (root, header, None, Some(surface))
         } else {
             let header = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
             // An empty title is omitted: the compose To row labels itself via
@@ -324,7 +311,7 @@ impl RecipientEntry {
                 .build();
             root.append(&header);
             root.append(&flow);
-            (root, header, Some(flow))
+            (root, header, Some(flow), None)
         };
 
         let suggestion_list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::Single).build();
@@ -350,6 +337,7 @@ impl RecipientEntry {
             root,
             header,
             flow,
+            compose_layout,
             entry,
             plain,
             tokens: Rc::new(RefCell::new(Vec::new())),
@@ -685,46 +673,36 @@ impl RecipientEntry {
     /// the list is a handful of items, and rebuilding keeps the widgets and
     /// the canonical list impossible to desynchronise. Chip mode only.
     fn rebuild_chips(&self) {
-        let Some(flow) = &self.flow else { return };
-        // Drop every child but the one wrapping the text entry - it's the
-        // only `gtk::Text` in the flow, which is what identifies it.
-        let mut child = flow.first_child();
-        while let Some(widget) = child {
-            let next = widget.next_sibling();
-            let holds_entry = widget.downcast_ref::<gtk::FlowBoxChild>().and_then(|c| c.child()).is_some_and(|c| c.is::<gtk::Text>());
-            if !holds_entry {
-                flow.remove(&widget);
-            }
-            child = next;
-        }
-        // In the calendar the entry stays at the end of the flow. In the
-        // composer only chips are in the flow, and the text stays in its
-        // own full-width row. Expanded lists contribute member chips.
+        if self.plain { return; }
         let chips = self.tokens.borrow().clone();
-        let mut position = 0i32;
+        let mut widgets: Vec<gtk::Widget> = Vec::new();
         for (index, chip) in chips.iter().enumerate() {
             match chip {
-                Chip::Address(token) => {
-                    let widget = self.build_address_chip(index, token);
-                    flow.insert(&widget, position);
-                    position += 1;
-                }
+                Chip::Address(token) => widgets.push(self.build_address_chip(index, token).upcast()),
                 Chip::List { name, members, expanded } => {
-                    let widget = self.build_list_chip(index, name, members, *expanded);
-                    flow.insert(&widget, position);
-                    position += 1;
+                    widgets.push(self.build_list_chip(index, name, members, *expanded).upcast());
                     if *expanded {
                         for (member_index, member) in members.iter().enumerate() {
-                            let widget = self.build_list_member_chip(index, member_index, member);
-                            flow.insert(&widget, position);
-                            position += 1;
+                            widgets.push(self.build_list_member_chip(index, member_index, member).upcast());
                         }
                     }
                 }
             }
         }
-        if flow.has_css_class("compose-chip-flow") {
-            flow.set_visible(flow.first_child().is_some());
+        if let Some(layout) = &self.compose_layout {
+            layout.replace_chips(&self.entry, &widgets);
+        } else if let Some(flow) = &self.flow {
+            let mut child = flow.first_child();
+            while let Some(widget) = child {
+                let next = widget.next_sibling();
+                let holds_entry = widget.downcast_ref::<gtk::FlowBoxChild>()
+                    .and_then(|c| c.child()).is_some_and(|c| c.is::<gtk::Text>());
+                if !holds_entry { flow.remove(&widget); }
+                child = next;
+            }
+            for (position, widget) in widgets.iter().enumerate() {
+                flow.insert(widget, position as i32);
+            }
         }
     }
 
@@ -1149,23 +1127,20 @@ mod tests {
     fn compose_input_and_chips_share_the_expanding_address_surface() {
         if !crate::gtk_test::gtk_ready() { return; }
         let field = RecipientEntry::new_compose("");
-        let flow = field.flow.as_ref().unwrap();
-        let surface = field.entry.parent().and_downcast::<gtk::Box>().unwrap();
+        let surface = field.compose_layout.as_ref().unwrap();
         assert!(surface.has_css_class("compose-address-surface"));
         assert!(surface.property::<bool>("hexpand"));
-        assert!(field.entry.property::<bool>("hexpand"));
-        assert_eq!(field.entry.halign(), gtk::Align::Fill);
         assert_eq!(surface.parent().unwrap(), field.header.clone().upcast::<gtk::Widget>());
-        assert_eq!(flow.parent().unwrap(), surface.clone().upcast::<gtk::Widget>());
-        assert_eq!(surface.last_child().unwrap(), field.entry.clone().upcast::<gtk::Widget>());
-        assert!(!flow.is_visible());
+        let editor = field.entry.clone().upcast::<gtk::Widget>();
+        assert_eq!(editor.parent().unwrap(), surface.clone().upcast::<gtk::Widget>());
+        assert_eq!(surface.first_child().unwrap(), editor);
         field.set_from_text("ada@x.com, bob@y.com");
-        assert!(flow.is_visible());
-        assert_eq!(surface.last_child().unwrap(), field.entry.clone().upcast::<gtk::Widget>());
+        assert_eq!(surface.last_child().unwrap(), editor);
+        assert_ne!(surface.first_child().unwrap(), editor);
         assert_eq!(field.addresses(), vec!["ada@x.com", "bob@y.com"]);
         field.set_from_text("");
-        assert!(flow.first_child().is_none());
-        assert!(!flow.is_visible());
+        assert_eq!(surface.first_child().unwrap(), editor);
+        assert_eq!(surface.last_child().unwrap(), editor);
         assert!(field.addresses().is_empty());
     }
 

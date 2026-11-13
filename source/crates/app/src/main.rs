@@ -82,6 +82,7 @@ mod profile_card;
 mod quick_steps;
 mod quick_steps_view;
 mod recipient_entry;
+mod recipient_layout;
 mod recurrence;
 mod reminders;
 mod reply_with_meeting;
