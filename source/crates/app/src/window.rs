@@ -11863,16 +11863,25 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             // category, where the global signature list lives.
             state.borrow_mut().manage_signatures = Some({
                 let state = state.clone();
+                let window = window.downgrade();
                 let refresh_hook = refresh_hook.clone();
                 Rc::new(move |anchor, account| {
-                    let (config, accounts, selected) = {
+                    let (parent, config, accounts, selected) = {
                         let st = state.borrow();
+                        let parent = anchor.clone().downcast::<gtk::Window>().ok()
+                            .or_else(|| anchor.root().and_downcast::<gtk::Window>())
+                            .or_else(|| st.compose_popout_window.as_ref().map(|(_, win)| win.clone().upcast()))
+                            .or_else(|| window.upgrade().map(|win| win.upcast()));
                         let accounts = st.accounts.iter().map(|(id, h)| (id.clone(), h.email.clone())).collect();
                         let selected = account.or_else(|| st.accounts.keys().next().cloned());
-                        (st.app_config.clone(), accounts, selected)
+                        (parent, st.app_config.clone(), accounts, selected)
+                    };
+                    let Some(parent) = parent else {
+                        tracing::warn!("signature manager: no composer window available");
+                        return;
                     };
                     let refresh = refresh_hook.borrow().clone();
-                    crate::signatures::show_manager(anchor, config, accounts, selected, refresh);
+                    crate::signatures::show_manager(parent.upcast_ref(), config, accounts, selected, refresh);
                 })
             });
             // The ribbon's Send / Receive ▸ Account Settings opens the same.
