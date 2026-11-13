@@ -2281,15 +2281,25 @@ impl Cache {
     /// fetch and this write) - the caller only logs it, since a missing
     /// preview for a message that no longer exists needs no reconciliation.
     pub fn update_previews(&self, mailbox_id: &MailboxId, previews: &HashMap<Uid, String>, mentions: &HashMap<Uid, bool>) -> Result<bool> {
+        self.update_previews_inner(mailbox_id, None, previews, mentions)
+    }
+
+    /// A separate preview connection can outlive a mailbox recreation.
+    /// Refuse to patch a recycled UID from that connection.
+    pub fn update_previews_for_validity(&self, mailbox_id: &MailboxId, uidvalidity: UidValidity, previews: &HashMap<Uid, String>, mentions: &HashMap<Uid, bool>) -> Result<bool> {
+        self.update_previews_inner(mailbox_id, Some(uidvalidity), previews, mentions)
+    }
+
+    fn update_previews_inner(&self, mailbox_id: &MailboxId, uidvalidity: Option<UidValidity>, previews: &HashMap<Uid, String>, mentions: &HashMap<Uid, bool>) -> Result<bool> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let mut all_found = true;
         {
-            let mut select = tx.prepare("SELECT data FROM messages WHERE mailbox_id = ?1 AND uid = ?2")?;
+            let mut select = tx.prepare("SELECT data FROM messages WHERE mailbox_id = ?1 AND uid = ?2 AND (?3 IS NULL OR uidvalidity = ?3)")?;
             let mut update = tx.prepare("UPDATE messages SET data = ?1 WHERE mailbox_id = ?2 AND uid = ?3")?;
             let uids: HashSet<&Uid> = previews.keys().chain(mentions.keys()).collect();
             for uid in uids {
-                let mut rows = select.query_map(rusqlite::params![mailbox_id.0, uid.0], |row| row.get::<_, String>(0))?;
+                let mut rows = select.query_map(rusqlite::params![mailbox_id.0, uid.0, uidvalidity.map(|v| v.0)], |row| row.get::<_, String>(0))?;
                 let Some(data) = rows.next().transpose()? else {
                     all_found = false;
                     continue;
