@@ -628,6 +628,12 @@ fn fill_overview(container: &gtk::Box, entry: &ContactsListEntry, actions: &Cont
         container.append(&info_value(&format_contact_date(birthday)));
         any = true;
     }
+    let office = crate::contacts_view::contact_office(card);
+    if !office.trim().is_empty() {
+        container.append(&section_heading("Office"));
+        container.append(&info_value(office));
+        any = true;
+    }
     if !any {
         container.append(&empty_label("No contact details yet"));
     }
@@ -679,6 +685,7 @@ fn fill_contact_info(container: &gtk::Box, card: &VCard) {
     block(container, "Emails", card.emails.iter().map(|email| email.address.clone()).collect(), &mut any);
     block(container, "Phones", card.telephones.iter().map(|phone| phone.number.clone()).collect(), &mut any);
     block(container, "Addresses", card.addresses.iter().map(format_address).collect(), &mut any);
+    block(container, "Office", vec![crate::contacts_view::contact_office(card).to_string()], &mut any);
     block(container, "Websites", card.urls.clone(), &mut any);
     block(container, "Instant messaging", card.impp.iter().map(|im| im.uri.clone()).collect(), &mut any);
     if let Some(birthday) = card.birthday {
@@ -697,10 +704,8 @@ fn fill_contact_info(container: &gtk::Box, card: &VCard) {
     block(
         container,
         "Custom fields",
-        card.other.iter().map(|property| {
-            let label = if property.name.eq_ignore_ascii_case("X-MS-OFFICELOCATION") { "Office" } else { &property.name };
-            format!("{label}: {}", property.value.trim())
-        }).collect(),
+        card.other.iter().filter(|p| !p.name.eq_ignore_ascii_case(crate::contacts_view::LEGACY_OFFICE_PROPERTY))
+            .map(|property| format!("{}: {}", property.name, property.value.trim())).collect(),
         &mut any,
     );
     if let Some(note) = &card.note {

@@ -1442,12 +1442,7 @@ fn directory_person_seed_with_details(person: &DirectoryPerson, details: &crate:
         let org = card.organization.get_or_insert_with(|| vec![String::new()]);
         org.push(department.into());
     }
-    let office = details.office.trim();
-    if !office.is_empty() {
-        card.other.push(lookout_core::OtherProperty {
-            name: "X-MS-OFFICELOCATION".into(), params: Vec::new(), value: office.into(),
-        });
-    }
+    set_contact_office(&mut card, &details.office);
     for (number, kind) in [(&details.business_phone, "work"), (&details.mobile_phone, "cell")] {
         if !number.trim().is_empty() {
             card.telephones.push(lookout_core::TelephoneField {
@@ -1456,6 +1451,53 @@ fn directory_person_seed_with_details(person: &DirectoryPerson, details: &crate:
         }
     }
     card
+}
+
+/// DavMail maps ADR;TYPE=work's extended component to Exchange
+/// roomnumber (PR_OFFICE_LOCATION, 0x3A19). Retain legacy cards on read.
+pub(crate) const LEGACY_OFFICE_PROPERTY: &str = "X-MS-OFFICELOCATION";
+
+pub(crate) fn is_work_address(address: &lookout_core::AddressField) -> bool {
+    address.types.iter().any(|t| t.eq_ignore_ascii_case("work"))
+}
+
+pub(crate) fn contact_office(card: &VCard) -> &str {
+    card.addresses.iter().find(|a| is_work_address(a) && !a.extended.trim().is_empty())
+        .map(|a| a.extended.as_str())
+        .or_else(|| card.other.iter().find(|p| p.name.eq_ignore_ascii_case(LEGACY_OFFICE_PROPERTY)).map(|p| p.value.as_str()))
+        .unwrap_or("")
+}
+
+pub(crate) fn empty_work_address() -> lookout_core::AddressField {
+    lookout_core::AddressField {
+        types: vec!["work".into()], po_box: String::new(), extended: String::new(),
+        street: String::new(), locality: String::new(), region: String::new(),
+        postal_code: String::new(), country: String::new(), label: None,
+    }
+}
+
+pub(crate) fn address_has_postal_data(a: &lookout_core::AddressField) -> bool {
+    [&a.po_box, &a.street, &a.locality, &a.region, &a.postal_code, &a.country]
+        .iter().any(|v| !v.trim().is_empty()) || a.label.as_ref().is_some_and(|v| !v.trim().is_empty())
+}
+
+pub(crate) fn set_contact_office(card: &mut VCard, office: &str) {
+    let office = office.trim();
+    // Prefer an existing work address with an office; otherwise the first work
+    // address. Do not replace postal fields or add a second work ADR.
+    let target = card.addresses.iter().position(|a| is_work_address(a) && !a.extended.trim().is_empty())
+        .or_else(|| card.addresses.iter().position(is_work_address));
+    if let Some(index) = target {
+        card.addresses[index].extended = office.into();
+        if office.is_empty() && !address_has_postal_data(&card.addresses[index]) {
+            card.addresses.remove(index);
+        }
+    } else if !office.is_empty() {
+        let mut address = empty_work_address();
+        address.extended = office.into();
+        card.addresses.push(address);
+    }
+    card.other.retain(|p| !p.name.eq_ignore_ascii_case(LEGACY_OFFICE_PROPERTY));
 }
 
 pub fn merge_contact_suggestions(
@@ -3871,10 +3913,30 @@ mod tests {
         let card = VCard::parse(&card.serialize()).unwrap();
         assert_eq!(card.name.as_ref().unwrap().given, "Иван");
         assert_eq!(card.name.as_ref().unwrap().family, "Иванов");
-        assert_eq!(card.organization.unwrap(), vec!["Company", "Lab"]);
+        assert_eq!(card.organization.as_ref().unwrap(), &vec!["Company", "Lab"]);
         assert_eq!(card.telephones[0].types, vec!["work"]);
         assert_eq!(card.telephones[1].types, vec!["cell"]);
-        assert_eq!(card.other.iter().find(|p| p.name == "X-MS-OFFICELOCATION").unwrap().value, "101");
+        assert_eq!(contact_office(&card), "101");
+        assert!(card.other.iter().all(|p| p.name != LEGACY_OFFICE_PROPERTY));
+        assert_eq!(card.addresses[0].types, vec!["work"]);
+        assert_eq!(card.addresses[0].extended, "101");
+    }
+
+    #[test]
+    fn office_round_trip_preserves_work_address_and_migrates_legacy() {
+        let mut card = VCard::parse("BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Test\r\nADR;TYPE=work:;;Main Street;City;;12345;Country\r\nX-MS-OFFICELOCATION:Old office\r\nEND:VCARD\r\n").unwrap();
+        assert_eq!(contact_office(&card), "Old office");
+        set_contact_office(&mut card, "New office");
+        let serialized = card.serialize();
+        let mut restored = VCard::parse(&serialized).unwrap();
+        assert_eq!(contact_office(&restored), "New office");
+        assert_eq!(restored.addresses.len(), 1);
+        assert_eq!(restored.addresses[0].street, "Main Street");
+        assert_eq!(restored.addresses[0].postal_code, "12345");
+        assert!(restored.other.iter().all(|p| p.name != LEGACY_OFFICE_PROPERTY));
+        set_contact_office(&mut restored, "");
+        assert_eq!(contact_office(&restored), "");
+        assert_eq!(restored.addresses[0].street, "Main Street");
     }
 
     #[test]

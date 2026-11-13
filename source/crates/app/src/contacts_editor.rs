@@ -72,7 +72,7 @@ pub struct ContactEditorPrefill<'a> {
 /// The type choices for a dynamic email/phone row.
 const FIELD_TYPES: [&str; 3] = ["work", "home", "other"];
 const PHONE_TYPES: [&str; 4] = ["work", "home", "other", "cell"];
-const OFFICE_PROPERTY: &str = "X-MS-OFFICELOCATION";
+use crate::contacts_view::{address_has_postal_data, contact_office, is_work_address, set_contact_office, LEGACY_OFFICE_PROPERTY};
 
 /// One dynamic email/phone/address row: its text entries, type dropdown and
 /// remove button, kept by identity so rows can be removed and read back
@@ -85,6 +85,7 @@ struct FieldRow {
     /// The row's optional second entry: an address's city, or a custom
     /// property's value; `None` for email/phone/URL/IM rows.
     city_entry: Option<gtk::Entry>,
+    original_address: Option<AddressField>,
     dropdown: gtk::DropDown,
     remove: gtk::Button,
 }
@@ -118,6 +119,7 @@ fn build_typed_field_row(initial: &str, initial_type: Option<&str>, choices: &[&
         boxed,
         entry,
         city_entry: None,
+        original_address: None,
         dropdown,
         remove,
     }
@@ -146,6 +148,7 @@ fn build_address_row(street: &str, city: &str) -> FieldRow {
         boxed,
         entry: street_entry,
         city_entry: Some(city_entry),
+        original_address: None,
         dropdown,
         remove,
     }
@@ -185,6 +188,7 @@ fn build_custom_row(name: &str, value: &str) -> FieldRow {
         boxed,
         entry: name_entry,
         city_entry: Some(value_entry),
+        original_address: None,
         dropdown,
         remove,
     }
@@ -327,7 +331,7 @@ pub fn build_contact_form(seed: Option<&VCard>, books: Option<&[(String, String)
         }
         org_row.set_text(card.organization.as_ref().and_then(|org| org.first()).map(String::as_str).unwrap_or(""));
         department_row.set_text(card.organization.as_ref().and_then(|org| org.get(1)).map(String::as_str).unwrap_or(""));
-        office_row.set_text(card.other.iter().find(|p| p.name.eq_ignore_ascii_case(OFFICE_PROPERTY)).map(|p| p.value.as_str()).unwrap_or(""));
+        office_row.set_text(contact_office(card));
         title_row.set_text(card.title.as_deref().unwrap_or(""));
         file_as_row.set_text(card.file_as.as_deref().unwrap_or(""));
         if let Some(birthday) = card.birthday {
@@ -360,7 +364,11 @@ pub fn build_contact_form(seed: Option<&VCard>, books: Option<&[(String, String)
             phones.borrow_mut().push(row);
         }
         for address in &card.addresses {
-            let row = build_address_row(address.street.as_str(), address.locality.as_str());
+            // An office-only work ADR is represented by the dedicated Office
+            // input, not an extra empty street/city row.
+            if is_work_address(address) && !address_has_postal_data(address) { continue; }
+            let mut row = build_address_row(address.street.as_str(), address.locality.as_str());
+            row.original_address = Some(address.clone());
             wire_remove(&row, &addresses, &addresses_box);
             addresses_box.append(&row.boxed);
             addresses.borrow_mut().push(row);
@@ -378,7 +386,7 @@ pub fn build_contact_form(seed: Option<&VCard>, books: Option<&[(String, String)
             ims.borrow_mut().push(row);
         }
         for property in &card.other {
-            if property.name.eq_ignore_ascii_case(OFFICE_PROPERTY) { continue; }
+            if property.name.eq_ignore_ascii_case(LEGACY_OFFICE_PROPERTY) { continue; }
             let row = build_custom_row(&property.name, &property.value);
             wire_remove(&row, &customs, &customs_box);
             customs_box.append(&row.boxed);
@@ -646,20 +654,15 @@ pub fn build_contact_form(seed: Option<&VCard>, books: Option<&[(String, String)
         for row in addresses.borrow().iter() {
             let street = row.entry.text().trim().to_string();
             let city = row.city_entry.as_ref().map(|entry| entry.text().trim().to_string()).unwrap_or_default();
-            if street.is_empty() && city.is_empty() {
-                continue;
-            }
-            addresses_out.push(AddressField {
-                types: Vec::new(),
-                po_box: String::new(),
-                extended: String::new(),
-                street,
-                locality: city,
-                region: String::new(),
-                postal_code: String::new(),
-                country: String::new(),
-                label: None,
+            let mut address = row.original_address.clone().unwrap_or_else(|| AddressField {
+                types: Vec::new(), po_box: String::new(), extended: String::new(),
+                street: String::new(), locality: String::new(), region: String::new(),
+                postal_code: String::new(), country: String::new(), label: None,
             });
+            address.street = street;
+            address.locality = city;
+            if !address_has_postal_data(&address) && address.extended.trim().is_empty() { continue; }
+            addresses_out.push(address);
         }
         card.addresses = addresses_out;
 
@@ -713,13 +716,8 @@ pub fn build_contact_form(seed: Option<&VCard>, books: Option<&[(String, String)
                 .unwrap_or_default();
             other_out.push(OtherProperty { name, params, value });
         }
-        let office = office_row.text().trim().to_string();
-        if !office.is_empty() {
-            let params = original_custom.iter().find(|p| p.name.eq_ignore_ascii_case(OFFICE_PROPERTY))
-                .map(|p| p.params.clone()).unwrap_or_default();
-            other_out.push(OtherProperty { name: OFFICE_PROPERTY.into(), params, value: office });
-        }
         card.other = other_out;
+        set_contact_office(&mut card, office_row.text().as_str());
 
         card.categories = groups_row.text().split(',').map(str::trim).filter(|part| !part.is_empty()).map(str::to_string).collect();
 
