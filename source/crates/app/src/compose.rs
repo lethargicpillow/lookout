@@ -621,15 +621,33 @@ pub(crate) fn page_background_button() -> gtk::ToggleButton {
     button
 }
 
-/// Native text-only editors and previews use the same page palette.
+/// Keep the native editor's original palette when it already matches the
+/// requested page appearance. Override colours only for a mismatched scheme.
+fn apply_plain_page_theme(view: &gtk::TextView, dark: bool) {
+    view.remove_css_class("lookout-page-dark");
+    view.remove_css_class("lookout-page-light");
+    if dark != adw::StyleManager::default().is_dark() {
+        view.add_css_class(if dark { "lookout-page-dark" } else { "lookout-page-light" });
+    }
+}
+
 pub(crate) fn bind_plain_page_theme(view: &gtk::TextView) {
     let weak = view.downgrade();
     crate::settings::observe_page_dark(move |dark| {
         let Some(view) = weak.upgrade() else { return false };
-        view.remove_css_class("lookout-page-dark");
-        view.remove_css_class("lookout-page-light");
-        view.add_css_class(if dark { "lookout-page-dark" } else { "lookout-page-light" });
+        apply_plain_page_theme(&view, dark);
         true
+    });
+    let manager = adw::StyleManager::default();
+    let weak = view.downgrade();
+    let handler = manager.connect_dark_notify(move |_| {
+        if let Some(view) = weak.upgrade() {
+            apply_plain_page_theme(&view, crate::settings::page_dark());
+        }
+    });
+    let handler = Cell::new(Some(handler));
+    view.connect_destroy(move |_| {
+        if let Some(handler) = handler.take() { manager.disconnect(handler); }
     });
 }
 

@@ -6,10 +6,10 @@
     font-feature-settings: 'tnum';
 }
 
-/* Page appearance is independent of the chrome's colour scheme. */
+/* Only a page whose scheme differs from the native theme needs an override. */
 textview.lookout-page-dark,
 textview.lookout-page-dark text {
-    background-color: #212126;
+    background-color: #252629;
     color: #f0f0f2;
     caret-color: #f0f0f2;
 }
