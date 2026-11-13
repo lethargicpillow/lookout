@@ -623,12 +623,16 @@ pub(crate) fn page_background_button() -> gtk::ToggleButton {
     button
 }
 
-/// Pin the page switch between the expanding command area and the app
-/// theme control. The overflow controller reserves its width separately.
-fn append_compose_page_background(row: &gtk::Box) -> gtk::ToggleButton {
-    let button = page_background_button();
-    row.append(&button);
-    button
+/// One fixed ribbon group for the independent page and application themes.
+/// Both commands use the same ribbon layout and stay outside More.
+fn compose_theme_band(style: &crate::ribbon::RibbonStyle) -> (crate::ribbon::RibbonBand, gtk::ToggleButton) {
+    let band = crate::ribbon::RibbonBand::new(style, &[]);
+    let page = band.group("Light / Dark", |group| {
+        let page = group.page_theme_switch();
+        group.theme_switch_named("App");
+        page
+    });
+    (band, page)
 }
 
 /// Only the formatting strip scrolls; the page switch remains accessible
@@ -2660,11 +2664,9 @@ pub fn build_compose_view(
         .child(&editor_stack)
         .build();
     ribbon_row.append(&editor_scroller);
-    let page_switch = append_compose_page_background(&ribbon_row);
     let more = gtk::MenuButton::builder().icon_name("view-more-symbolic").tooltip_text("More commands").build();
     let more_band = crate::ribbon::RibbonBand::new(&ribbon_style, &[]);
-    let theme_band = crate::ribbon::RibbonBand::new(&ribbon_style, &[]);
-    theme_band.standalone().theme_switch();
+    let (theme_band, _) = compose_theme_band(&ribbon_style);
     ribbon_row.append(theme_band.root());
     more_band.standalone().menu(&more, "view-more-symbolic", "More");
     ribbon_row.append(more_band.root());
@@ -2678,8 +2680,7 @@ pub fn build_compose_view(
     popover.set_child(Some(&overflow_scroller));
     more.set_popover(Some(&popover));
     let overflow = crate::ribbon::RibbonOverflow::new(&ribbon_style, &more, &overflow_box, &extras, &separator, &more_band);
-    overflow.set_layout_band(&theme_band);
-    overflow.reserve_fixed_widget(&page_switch);
+    overflow.reserve_fixed_widget(theme_band.root());
     overflow.add_band(&editor_band);
     overflow.add_band(&insert_band);
     overflow.add_band(&options_band);
@@ -3424,19 +3425,31 @@ mod tests {
         }
         let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).hexpand(true).build();
         row.append(&stack);
-        let button = append_compose_page_background(&row);
-        let app_theme = gtk::Button::new();
+        let style = crate::ribbon::RibbonStyle::new(crate::ribbon::RibbonMode::Classic);
+        let (band, button) = compose_theme_band(&style);
         let more = gtk::MenuButton::new();
-        row.append(&app_theme);
+        row.append(band.root());
         row.append(&more);
-        assert_eq!(button.prev_sibling().as_ref(), Some(stack.upcast_ref::<gtk::Widget>()));
-        assert_eq!(button.next_sibling().as_ref(), Some(app_theme.upcast_ref::<gtk::Widget>()));
+        assert_eq!(band.root().prev_sibling().as_ref(), Some(stack.upcast_ref::<gtk::Widget>()));
+        assert_eq!(band.root().next_sibling().as_ref(), Some(more.upcast_ref::<gtk::Widget>()));
+        let app_theme = button.next_sibling().unwrap().downcast::<gtk::Button>().unwrap();
+        let group_row = button.parent().unwrap();
+        assert_eq!(app_theme.parent().as_ref(), Some(&group_row));
+        let group = group_row.parent().unwrap();
+        let caption = group.last_child().unwrap().downcast::<gtk::Label>().unwrap();
+        assert_eq!(caption.label().as_str(), "Light / Dark");
+        for (control, expected) in [(button.upcast_ref::<gtk::Button>(), "Page"), (&app_theme, "App")] {
+            let content = control.child().unwrap();
+            let label = content.last_child().unwrap().downcast::<gtk::Label>().unwrap();
+            assert_eq!(label.label().as_str(), expected);
+        }
         let other = page_background_button();
         assert_eq!(button.widget_name(), "page-background-toggle");
         for name in ["message", "insert", "options"] {
             stack.set_visible_child_name(name);
             assert!(button.is_visible());
-            assert_eq!(button.parent().as_ref(), Some(row.upcast_ref::<gtk::Widget>()));
+            assert_eq!(button.parent().as_ref(), Some(&group_row));
+            assert_eq!(band.root().parent().as_ref(), Some(row.upcast_ref::<gtk::Widget>()));
         }
         button.set_active(!original);
         assert_eq!(crate::settings::page_dark(), !original);
