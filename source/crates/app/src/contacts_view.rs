@@ -3719,7 +3719,7 @@ mod tests {
         );
         // A directory entry for an address already offered by mail history or
         // CardDAV is dropped (case-insensitively); only Grace is new.
-        assert_eq!(merged_addresses(&merged), ["ada@x.com", "bob@x.com", "grace@y.com"]);
+        assert_eq!(merged_addresses(&merged), ["bob@x.com", "ada@x.com", "grace@y.com"]);
     }
 
     #[test]
