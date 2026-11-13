@@ -635,6 +635,39 @@ fn compose_theme_band(style: &crate::ribbon::RibbonStyle) -> (crate::ribbon::Rib
     (band, page)
 }
 
+/// The compact Message ribbon panel: two selectors over five frequent
+/// commands. The remaining formatting commands have their own Format Text tab.
+fn compose_basic_text_block(font_family: &gtk::DropDown, font_size: &gtk::DropDown, commands: [&gtk::Button; 5]) -> gtk::Box {
+    let block = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical).spacing(2).homogeneous(true)
+        .vexpand(false).valign(gtk::Align::Fill).halign(gtk::Align::Start)
+        .css_classes(["compose-format-block"]).build();
+    let top = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
+        .spacing(2).valign(gtk::Align::Center).build();
+    let bottom = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
+        .spacing(2).homogeneous(true).valign(gtk::Align::Center).build();
+    for (selector, width) in [(font_family, 112), (font_size, 64)] {
+        selector.set_size_request(width, -1);
+        selector.set_hexpand(selector == font_family);
+        selector.set_halign(gtk::Align::Fill);
+        selector.set_valign(gtk::Align::Center);
+        selector.add_css_class("compose-format-select");
+        top.append(selector);
+    }
+    for button in commands {
+        button.add_css_class("compose-format-button");
+        button.add_css_class("flat");
+        button.set_width_request(28);
+        button.set_halign(gtk::Align::Fill);
+        button.set_valign(gtk::Align::Center);
+        button.set_vexpand(false);
+        bottom.append(button);
+    }
+    block.append(&top);
+    block.append(&bottom);
+    block
+}
+
 /// Only the formatting strip scrolls; the page switch remains accessible
 /// even in a narrow signature or template editor.
 pub(crate) fn editor_format_toolbar(strip: &gtk::Box) -> gtk::Box {
@@ -1445,12 +1478,12 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, F
         });
     }
 
-    // These commands belong to the composer's compact Basic Text panel.
+    // These commands belong to the composer's Format Text ribbon.
     // Drive the existing size selector so its value and editing command
     // stay in step; at either end a click is a no-op.
-    let font_grow = gtk::Button::from_icon_name("format-font-size-larger-symbolic");
+    let font_grow = gtk::Button::from_icon_name(crate::window::themed_icon_name(&["format-font-size-larger-symbolic", "zoom-in-symbolic"]));
     font_grow.set_tooltip_text(Some("Increase font size"));
-    let font_shrink = gtk::Button::from_icon_name("format-font-size-smaller-symbolic");
+    let font_shrink = gtk::Button::from_icon_name(crate::window::themed_icon_name(&["format-font-size-smaller-symbolic", "zoom-out-symbolic"]));
     font_shrink.set_tooltip_text(Some("Decrease font size"));
     for (button, delta) in [(&font_grow, 1i32), (&font_shrink, -1i32)] {
         let size = font_size.clone();
@@ -2536,6 +2569,7 @@ pub fn build_compose_view(
     let editor_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
     let insert_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
     let options_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
+    let format_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
     let format = &format_controls;
     // Real clipboard commands for both HTML and plain-text editing.
     // Outlook's Clipboard: a full-height Paste, Cut/Copy beside it.
@@ -2573,77 +2607,31 @@ pub fn build_compose_view(
             }
         }
     });
-    // Outlook arranges independent compact rows rather than a shared grid:
-    // selectors/size/list commands above, character/colour/paragraph below.
+    // Match the original compact Message-tab layout, rather than
+    // stretching the entire formatting toolset into Basic Text.
     editor_band.group("Basic Text", |group| {
-        let block = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical).spacing(2).homogeneous(true)
-            .vexpand(false).valign(gtk::Align::Fill).halign(gtk::Align::Start)
-            .css_classes(["compose-format-block"]).build();
-        let top = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
-            .spacing(2).valign(gtk::Align::Center).build();
-        let bottom = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
-            .spacing(2).valign(gtk::Align::Center).build();
-
-        for (selector, width) in [(&format.font_family, 112), (&format.font_size, 64)] {
-            selector.set_size_request(width, -1);
-            selector.set_hexpand(false);
-            selector.set_halign(gtk::Align::Fill);
-            selector.set_valign(gtk::Align::Center);
-            selector.add_css_class("compose-format-select");
-            top.append(selector);
-        }
-        let append = |row: &gtk::Box, button: &gtk::Button| {
-            button.add_css_class("compose-format-button");
-            button.add_css_class("flat");
-            button.set_width_request(28);
-            button.set_halign(gtk::Align::Center);
-            button.set_valign(gtk::Align::Center);
-            button.set_vexpand(false);
-            row.append(button);
-        };
-        let divider = |row: &gtk::Box| {
-            let line = gtk::Separator::new(gtk::Orientation::Vertical);
-            line.add_css_class("compose-format-divider");
-            row.append(&line);
-        };
-        for button in [&format.font_grow, &format.font_shrink] {
-            append(&top, button);
-        }
-        divider(&top);
-        for button in [&format.bullets, &format.numbering] {
-            append(&top, button);
-        }
-        divider(&top);
-        append(&top, &format.clear_formatting);
-
-        for button in [&format.bold, &format.italic, &format.underline, &format.strikethrough] {
-            append(&bottom, button);
-        }
-        divider(&bottom);
-        append(&bottom, &format.highlight);
-        format.color.set_size_request(-1, -1);
-        format.color.set_valign(gtk::Align::Center);
-        format.color.set_vexpand(false);
-        format.color.add_css_class("compose-format-color");
+        group.widget(&compose_basic_text_block(&format.font_family, &format.font_size,
+            [&format.bold, &format.italic, &format.underline, &format.align_left, &format.bullets]));
+    });
+    format_band.group("Font", |group| {
+        group.small_button(&format.font_grow, crate::window::themed_icon_name(&["format-font-size-larger-symbolic", "zoom-in-symbolic"]), "Increase Size");
+        group.small_button(&format.font_shrink, crate::window::themed_icon_name(&["format-font-size-smaller-symbolic", "zoom-out-symbolic"]), "Decrease Size");
+        group.small_button(&format.strikethrough, "format-text-strikethrough-symbolic", "Strikethrough");
+        group.small_button(&format.clear_formatting, "edit-clear-all-symbolic", "Clear Formatting");
+        group.small_button(&format.highlight, crate::window::themed_icon_name(&["format-text-highlight-symbolic", "document-edit-symbolic"]), "Highlight");
         let color = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
-            .spacing(2).valign(gtk::Align::Center).build();
-        let color_icon = gtk::Image::from_icon_name(crate::window::themed_icon_name(&["format-text-color-symbolic", "format-text-bold-symbolic"]));
-        color_icon.set_tooltip_text(Some("Text color"));
-        color.append(&color_icon);
+            .spacing(4).valign(gtk::Align::Center).build();
+        color.append(&gtk::Label::new(Some("Text Color")));
         color.append(&format.color);
-        bottom.append(&color);
-        divider(&bottom);
-        for button in [&format.align_left, &format.align_center, &format.align_right, &format.justify] {
-            append(&bottom, button);
-        }
-        divider(&bottom);
-        for button in [&format.outdent, &format.indent] {
-            append(&bottom, button);
-        }
-        block.append(&top);
-        block.append(&bottom);
-        group.widget(&block);
+        group.widget(&color);
+    });
+    format_band.group("Paragraph", |group| {
+        group.small_button(&format.numbering, "list-number-symbolic", "Numbering");
+        group.small_button(&format.align_center, "format-justify-center-symbolic", "Center");
+        group.small_button(&format.align_right, "format-justify-right-symbolic", "Align Right");
+        group.small_button(&format.justify, "format-justify-fill-symbolic", "Justify");
+        group.small_button(&format.outdent, "format-indent-less-symbolic", "Decrease Indent");
+        group.small_button(&format.indent, "format-indent-more-symbolic", "Increase Indent");
     });
     editor_band.group("Names", |group| {
         let address_book = gtk::Button::new();
@@ -2710,6 +2698,7 @@ pub fn build_compose_view(
     editor_stack.add_titled(editor_band.root(), Some("message"), "Message");
     editor_stack.add_titled(insert_band.root(), Some("insert"), "Insert");
     editor_stack.add_titled(options_band.root(), Some("options"), "Options");
+    editor_stack.add_titled(format_band.root(), Some("format-text"), "Format Text");
     let tabs = gtk::StackSwitcher::builder().stack(&editor_stack).halign(gtk::Align::Start).build();
     tabs.add_css_class("compose-ribbon-tabs");
     editor_toolbar.append(&tabs);
@@ -2746,6 +2735,7 @@ pub fn build_compose_view(
     overflow.add_band(&editor_band);
     overflow.add_band(&insert_band);
     overflow.add_band(&options_band);
+    overflow.add_band(&format_band);
     overflow.attach(&ribbon_row, &editor_stack);
     // Keep the controller alive for this editor's lifetime.
     popover.connect_show(move |_| overflow.sync_sections());
@@ -3478,11 +3468,33 @@ mod tests {
     }
 
     #[test]
+    fn basic_text_has_two_selectors_and_five_commands_in_order() {
+        if !crate::gtk_test::gtk_ready() { return; }
+        let family = gtk::DropDown::from_strings(&["sans-serif"]);
+        let size = gtk::DropDown::from_strings(&["12 pt"]);
+        let buttons = ["Bold", "Italic", "Underline", "Align Left", "Bullets"].map(gtk::Button::with_label);
+        let block = compose_basic_text_block(&family, &size, [&buttons[0], &buttons[1], &buttons[2], &buttons[3], &buttons[4]]);
+        let top = block.first_child().unwrap();
+        let bottom = block.last_child().unwrap();
+        assert_eq!(top.first_child().as_ref(), Some(family.upcast_ref::<gtk::Widget>()));
+        assert_eq!(top.last_child().as_ref(), Some(size.upcast_ref::<gtk::Widget>()));
+        assert_eq!(family.next_sibling().as_ref(), Some(size.upcast_ref::<gtk::Widget>()));
+        assert!(size.next_sibling().is_none());
+        let mut child = bottom.first_child();
+        for button in &buttons {
+            assert_eq!(child.as_ref(), Some(button.upcast_ref::<gtk::Widget>()));
+            child = button.next_sibling();
+        }
+        assert!(child.is_none());
+        assert!(top.next_sibling().as_ref() == Some(&bottom));
+    }
+
+    #[test]
     fn page_background_toggle_stays_outside_compose_commands_and_syncs_other_editors() {
         if !crate::gtk_test::gtk_ready() { return; }
         let original = crate::settings::page_dark();
         let stack = gtk::Stack::new();
-        for name in ["message", "insert", "options"] {
+        for name in ["message", "insert", "options", "format-text"] {
             stack.add_titled(&gtk::Box::new(gtk::Orientation::Vertical, 0), Some(name), name);
         }
         let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).hexpand(true).build();
@@ -3507,7 +3519,7 @@ mod tests {
         }
         let other = page_background_button();
         assert_eq!(button.widget_name(), "page-background-toggle");
-        for name in ["message", "insert", "options"] {
+        for name in ["message", "insert", "options", "format-text"] {
             stack.set_visible_child_name(name);
             assert!(button.is_visible());
             assert_eq!(button.parent().as_ref(), Some(&group_row));
