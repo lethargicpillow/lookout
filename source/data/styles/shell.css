@@ -14,9 +14,6 @@ paned > separator {
     background-color: @lookout-dim;
 }
 
-.reading-pane-transparent {
-    background-color: transparent;
-}
 .card-flush-end {
     border-top-right-radius: 0;
     border-bottom-right-radius: 0;
@@ -26,8 +23,18 @@ paned > separator {
     border-bottom-left-radius: 0;
 }
 .seamless-paned > separator {
-    min-width: 6px;
-    min-height: 6px;
+    min-width: 5px;
+    min-height: 5px;
+    background-color: @lookout-pane-bg;
+}
+.seamless-paned.horizontal > separator {
+    border-left: 1px solid @lookout-panel-border;
+}
+.seamless-paned.vertical > separator {
+    border-top: 1px solid @lookout-panel-border;
+}
+.seamless-paned > separator:hover {
+    background-color: alpha(@accent_bg_color, 0.28);
 }
 .window-toolbars-background {
     background-color: @lookout-toolbar-band;
@@ -72,11 +79,13 @@ paned > separator {
     background-color: @accent_bg_color;
 }
 
-/* Main workspace: the stack provides its outer 6px gutter; the actual
-   draggable separators provide the internal 6px gaps. All workspace
-   surfaces use the same corner treatment without per-card margins. */
+/* The main workplaces are a single flat surface divided by hairlines.
+   Scope this to workspace panes; dialogs and inner content cards keep their
+   own styling. Use the shared theme token in all color schemes. */
 .workspace-pane.card,
 .workspace-pane.calendar-main-background {
-    border-radius: 6px;
-    border: 1px solid @lookout-panel-border;
+    background-color: @lookout-pane-bg;
+    border-radius: 0;
+    border: none;
+    box-shadow: none;
 }

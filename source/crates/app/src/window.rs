@@ -3444,8 +3444,49 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     }
     message_page.append(&follow_up_banner);
     reading_stack.add_named(&message_page, Some("message"));
-    let reading_empty = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let reading_empty = gtk::Box::builder().orientation(gtk::Orientation::Vertical)
+        .hexpand(true).vexpand(true).build();
+    let reading_prompt = gtk::Box::builder().orientation(gtk::Orientation::Vertical)
+        .halign(gtk::Align::Center).valign(gtk::Align::Center)
+        .hexpand(true).vexpand(true).spacing(12).css_classes(["dim-label"])
+        .margin_start(16).margin_end(16).build();
+    let reading_prompt_icon = gtk::Image::from_icon_name("mail-unread-symbolic");
+    reading_prompt_icon.set_pixel_size(40);
+    reading_prompt.append(&reading_prompt_icon);
+    let reading_prompt_label = gtk::Label::builder().label("Select a message to read")
+        .wrap(true).max_width_chars(30).justify(gtk::Justification::Center).build();
+    crate::privacy::mark_ui(&reading_prompt_label);
+    reading_prompt.append(&reading_prompt_label);
+    reading_empty.append(&reading_prompt);
     reading_stack.add_named(&reading_empty, Some("empty"));
+    // "empty" also serves as the blank inter-frame during message changes.
+    // Delay the prompt until a real empty state settles; keep the existing
+    // stack names and WebKit reveal/crossfade protocol unchanged.
+    {
+        let generation = Rc::new(Cell::new(0u64));
+        let weak_state = Rc::downgrade(&state);
+        let prompt = reading_prompt.downgrade();
+        reading_stack.connect_notify_local(Some("visible-child-name"), move |stack, _| {
+            let token = generation.get().wrapping_add(1);
+            generation.set(token);
+            let Some(prompt_widget) = prompt.upgrade() else { return; };
+            prompt_widget.set_visible(false);
+            if stack.visible_child_name().as_deref() != Some("empty") { return; }
+            let generation = generation.clone();
+            let stack = stack.downgrade();
+            let prompt = prompt.clone();
+            let weak_state = weak_state.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
+                if generation.get() != token { return; }
+                let (Some(stack), Some(prompt), Some(state)) =
+                    (stack.upgrade(), prompt.upgrade(), weak_state.upgrade()) else { return; };
+                if stack.visible_child_name().as_deref() == Some("empty")
+                    && state.try_borrow().is_ok_and(|st| st.rendered_message.is_none()) {
+                    prompt.set_visible(true);
+                }
+            });
+        });
+    }
     // A separate page from "empty" (which several call sites already treat
     // as a true blank state) - "nothing selected" and "several messages
     // deliberately selected" are different states to the user even though
@@ -3785,33 +3826,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     let reading_card = card_section(&reading_pane_box);
 
-    // Keep the reading pane's card fully transparent while it's showing the
-    // "no message selected" placeholder, so the window background image
-    // shows straight through with no card tint - matching `.folder-pane`'s
-    // translucency, but taken all the way to zero alpha since there's no
-    // content to read against here. Driven off the stack's own signal
-    // (rather than each `set_visible_child_name` call site) so every path
-    // that flips back to "empty" - initial state above, `render_body`'s
-    // fallback, and the reset on account disconnect - is covered for free.
-    let update_reading_card_transparency = {
-        let reading_card = reading_card.clone();
-        move |stack: &gtk::Stack| {
-            if stack.visible_child_name().as_deref() == Some("empty") {
-                reading_card.add_css_class("reading-pane-transparent");
-            } else {
-                reading_card.remove_css_class("reading-pane-transparent");
-            }
-        }
-    };
-    update_reading_card_transparency(&reading_stack);
-    reading_stack.connect_notify_local(Some("visible-child-name"), move |stack, _| {
-        update_reading_card_transparency(stack);
-    });
-
-    // --- Resizable panes: folders | (messages | reading), each its own
-    // rounded card. `resize_start_child(false)` keeps the sidebar-like
-    // panes from silently growing when the window resizes; the reading
-    // pane absorbs the extra space.
+    // Work surfaces share a flat theme background, including the empty
+    // reading pane. Only their draggable dividers mark the boundaries.
+    // Keep the sidebar widths stable when the window changes size; the
+    // reading pane absorbs the extra space.
     // The reading pane sits to the right of the message list by default, but
     // the user can dock it below (Outlook's "Reading pane: Bottom"); then this
     // paned is vertical - messages on top, reading pane below - so its split
@@ -3913,9 +3931,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // it (nav_rail included).
     root_stack.set_hhomogeneous(false);
     root_stack.set_vhomogeneous(false);
-    // The workspace owns the outside gutter. Paned separators alone own
-    // the gaps inside it, so card margins cannot add a second gap.
-    const WORKSPACE_GUTTER: i32 = 6;
+    // Keep a narrow edge gutter; the paned separators own internal
+    // boundaries and remain draggable without separate card outlines.
+    const WORKSPACE_GUTTER: i32 = 2;
     root_stack.set_margin_start(WORKSPACE_GUTTER);
     root_stack.set_margin_end(WORKSPACE_GUTTER);
     root_stack.set_margin_top(WORKSPACE_GUTTER);
@@ -6515,7 +6533,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         gtk::Orientation::Vertical => window_height,
                         _ => window_width,
                     };
-                    let pct = settings.get_double(key);
+                    // Preserve every saved user extent. Only never-set mail
+                    // panes receive the Outlook-style initial proportions.
+                    let stored_pct = settings.get_double(key);
+                    let pct = if stored_pct > 0.0 { stored_pct } else {
+                        match key {
+                            crate::settings::PANE_FOLDER_WIDTH_PCT => 13.0,
+                            crate::settings::PANE_MESSAGE_LIST_WIDTH_PCT => 35.0,
+                            _ => stored_pct,
+                        }
+                    };
                     let paned_extent = paned_axis_extent(paned);
                     // A paned's own allocation lags the window's, and by a lot:
                     // a window already reporting its full maximized width can
