@@ -625,7 +625,7 @@ pub(crate) fn page_background_button() -> gtk::ToggleButton {
 
 /// One fixed ribbon group for the independent page and application themes.
 /// Both commands use the same ribbon layout and stay outside More.
-fn compose_theme_band(style: &crate::ribbon::RibbonStyle) -> (crate::ribbon::RibbonBand, gtk::ToggleButton) {
+fn compose_theme_band(style: &crate::ribbon::RibbonStyle) -> (crate::ribbon::RibbonBand, gtk::Button) {
     let band = crate::ribbon::RibbonBand::new(style, &[]);
     let page = band.group("Light / Dark", |group| {
         let page = group.page_theme_switch();
@@ -3438,7 +3438,7 @@ mod tests {
         let group = group_row.parent().unwrap();
         let caption = group.last_child().unwrap().downcast::<gtk::Label>().unwrap();
         assert_eq!(caption.label().as_str(), "Light / Dark");
-        for (control, expected) in [(button.upcast_ref::<gtk::Button>(), "Page"), (&app_theme, "App")] {
+        for (control, expected) in [(&button, "Page"), (&app_theme, "App")] {
             let content = control.child().unwrap();
             let label = content.last_child().unwrap().downcast::<gtk::Label>().unwrap();
             assert_eq!(label.label().as_str(), expected);
@@ -3451,12 +3451,15 @@ mod tests {
             assert_eq!(button.parent().as_ref(), Some(&group_row));
             assert_eq!(band.root().parent().as_ref(), Some(row.upcast_ref::<gtk::Widget>()));
         }
-        button.set_active(!original);
+        assert!(!button.is::<gtk::ToggleButton>());
+        button.emit_clicked();
         assert_eq!(crate::settings::page_dark(), !original);
         assert_eq!(other.is_active(), !original);
+        assert_eq!(button.tooltip_text().as_deref(), Some(if !original { "Switch page to light background" } else { "Switch page to dark background" }));
         other.set_active(original);
-        assert_eq!(button.is_active(), original);
         assert_eq!(crate::settings::page_dark(), original);
+        assert_eq!(button.tooltip_text().as_deref(), Some(if original { "Switch page to light background" } else { "Switch page to dark background" }));
+        assert!(!button.state_flags().contains(gtk::StateFlags::CHECKED));
     }
 
     #[test]

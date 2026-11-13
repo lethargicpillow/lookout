@@ -455,19 +455,23 @@ impl RibbonGroup {
         });
     }
 
-    /// Dress the shared page toggle exactly like the app theme command.
-    pub(crate) fn page_theme_switch(&self) -> gtk::ToggleButton {
-        let button = crate::compose::page_background_button();
-        let icon = self.toggle(&button, "display-brightness-symbolic", "Page");
+    /// The page theme is a command, like App, not a latched ribbon button.
+    pub(crate) fn page_theme_switch(&self) -> gtk::Button {
+        let button = gtk::Button::new();
+        button.set_widget_name("page-background-toggle");
+        button.connect_clicked(|_| crate::settings::set_page_dark(!crate::settings::page_dark()));
+        let icon = self.button(&button, "display-brightness-symbolic", "Page");
         let weak_image = icon.image.downgrade();
+        let weak_button = button.downgrade();
         crate::settings::observe_page_dark(move |dark| {
-            let Some(image) = weak_image.upgrade() else { return false };
+            let (Some(image), Some(button)) = (weak_image.upgrade(), weak_button.upgrade()) else { return false };
             let name = if dark {
                 crate::window::themed_icon_name(&["weather-clear-symbolic", "display-brightness-symbolic"])
             } else {
                 crate::window::themed_icon_name(&["weather-clear-night-symbolic", "night-light-symbolic", "weather-clear-symbolic"])
             };
             image.set_icon_name(Some(name));
+            button.set_tooltip_text(Some(if dark { "Switch page to light background" } else { "Switch page to dark background" }));
             true
         });
         button
