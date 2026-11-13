@@ -1476,7 +1476,7 @@ impl MessageListModel {
         // The first frame may precede the layout that resets the anchor.
         // Check once more on the next frame, then release the callback.
         // Never override a nonzero position chosen in the meantime.
-        let mut frames = 0;
+        let frames = Cell::new(0u8);
         view.add_tick_callback(move |_, _| {
             if generation.get() != expected { return glib::ControlFlow::Break; }
             let Some(scroller) = weak.upgrade() else { return glib::ControlFlow::Break; };
@@ -1484,8 +1484,8 @@ impl MessageListModel {
             if adjustment.value() <= 1.0 {
                 adjustment.set_value(value);
             }
-            frames += 1;
-            if frames >= 2 { glib::ControlFlow::Break } else { glib::ControlFlow::Continue }
+            frames.set(frames.get() + 1);
+            if frames.get() >= 2 { glib::ControlFlow::Break } else { glib::ControlFlow::Continue }
         });
     }
 
