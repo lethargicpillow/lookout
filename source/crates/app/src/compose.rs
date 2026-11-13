@@ -1817,6 +1817,7 @@ pub fn build_compose_view(
     open_contact_picker: crate::contact_picker::ContactPickerOpener,
     on_pop_out: Option<Rc<dyn Fn(PopOutHandle)>>,
     on_send_started: SendStarted,
+    on_send_queue_failed: Rc<dyn Fn(Option<u64>)>,
     // Server-side schedule send (item 5.5 / C-08): returns true when the
     // message was scheduled through Exchange (so nothing goes in the local
     // outbox), false to fall back to it.
@@ -2758,13 +2759,16 @@ pub fn build_compose_view(
     {
         let autosave = autosave.clone();
         let closed = closed.clone();
+        let sending = sending.clone();
         glib::spawn_future_local(async move {
             loop {
                 glib::timeout_future(DRAFT_AUTOSAVE_INTERVAL).await;
                 if closed.get() {
                     break;
                 }
-                autosave.attempt(false).await;
+                if !sending.get() {
+                    autosave.attempt(false).await;
+                }
             }
         });
     }
@@ -3064,7 +3068,6 @@ pub fn build_compose_view(
         let in_reply_to = prefill.in_reply_to;
         let references = prefill.references;
         let calendar_part = prefill.calendar_part.clone();
-        let prefill_body_text = prefill.body.clone().unwrap_or_default();
         let autosave = autosave.clone();
         let draft_message_id = draft_message_id.clone();
         let closed = closed.clone();
@@ -3074,6 +3077,7 @@ pub fn build_compose_view(
         let high_importance_toggle = high_importance_toggle.clone();
         let low_importance_toggle = low_importance_toggle.clone();
         let on_send_started = on_send_started.clone();
+        let on_send_queue_failed = on_send_queue_failed.clone();
         // The Send button anchors the attachment-reminder dialog (item 1.19);
         // cloned before the closure captures it by move.
         let send_button_for_reminder = send_button.clone();
@@ -3111,7 +3115,6 @@ pub fn build_compose_view(
             let body_view = body_view.clone();
             let rich_web_view = rich_web_view.clone();
             let subject = subject_row.text().to_string();
-            let prefill_body_text = prefill_body_text.clone();
             let autosave = autosave.clone();
             let draft_message_id = draft_message_id.clone();
             let cmd_tx = cmd_tx.clone();
@@ -3130,11 +3133,14 @@ pub fn build_compose_view(
             let sending = sending.clone();
             let on_done = on_done.clone();
             let on_send_started = on_send_started.clone();
+            let on_send_queue_failed = on_send_queue_failed.clone();
             let on_schedule_send = on_schedule_send.clone();
             // The Send button anchors the attachment-reminder dialog (item
             // 1.19); cloned because the async block captures it by move.
             let send_button_for_dialog = send_button_for_reminder.clone();
             glib::spawn_future_local(async move {
+                tracing::debug!(attachments = attachments.borrow().len(), rich, "compose send: started");
+                autosave.status_label.set_label("Preparing message…");
                 // A scheduled message waits in Drafts until it goes out, as
                 // in new Outlook (UX-45): save it now so the Drafts copy is
                 // current and `draft_queued` names it for the outbox to
@@ -3149,8 +3155,11 @@ pub fn build_compose_view(
                     // through WebKit; if that fails (e.g. the page hasn't
                     // finished loading yet) fall back to the prefill body so a
                     // Send click can never silently drop the message.
-                    match read_content(&rich_web_view).await {
-                        Some(content) => {
+                    let editor = read_content(&rich_web_view);
+                    let deadline = glib::timeout_future(std::time::Duration::from_secs(15));
+                    futures_util::pin_mut!(editor, deadline);
+                    match futures_util::future::select(editor, deadline).await {
+                        futures_util::future::Either::Left((Some(content), _)) => {
                             let text = content.text.trim().to_string();
                             // A body that's purely an inserted image (no
                             // surrounding text) has no visible text at all -
@@ -3164,7 +3173,13 @@ pub fn build_compose_view(
                                 (text, Some(html), content.images)
                             }
                         }
-                        None => (prefill_body_text, None, vec![]),
+                        _ => {
+                            tracing::warn!("compose send: editor read failed or timed out; message not queued");
+                            autosave.status_label.set_label("Could not read message — try Send again");
+                            sending.set(false);
+                            send_button_for_dialog.set_sensitive(true);
+                            return;
+                        }
                     }
                 } else {
                     let buffer = body_view.buffer();
@@ -3243,14 +3258,32 @@ pub fn build_compose_view(
                         return;
                     }
                 }
+                tracing::debug!(attachments = msg.attachments.len(), attachment_bytes = msg.attachments.iter().map(|a| a.bytes.len()).sum::<usize>(), "compose send: message prepared");
+                // Account commands must never block the GTK thread. A closed
+                // receiver is a failed handoff, not a successful Send.
+                if cmd_tx.is_closed() {
+                    autosave.status_label.set_label("Mail account unavailable — message not sent");
+                    sending.set(false);
+                    send_button_for_dialog.set_sensitive(true);
+                    return;
+                }
                 let (not_before, client_token) = on_send_started(&msg, schedule);
-                let _ = cmd_tx.send_blocking(AccountCommand::SendMessage {
+                if cmd_tx.send(AccountCommand::SendMessage {
                     message: Box::new(msg),
                     not_before,
                     client_token,
-                });
+                }).await.is_err() {
+                    tracing::warn!("compose send: account command channel closed");
+                    on_send_queue_failed(client_token);
+                    autosave.status_label.set_label("Mail account unavailable — message not sent");
+                    sending.set(false);
+                    send_button_for_dialog.set_sensitive(true);
+                    return;
+                }
+                tracing::debug!("compose send: command accepted; closing editor");
                 closed.set(true);
                 on_done();
+                tracing::debug!("compose send: editor closed");
             });
         });
         {
