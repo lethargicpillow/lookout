@@ -483,6 +483,7 @@ impl RibbonGroup {
     }
 
     /// Dress a libadwaita split button (a main action plus its `▾` menu).
+    #[cfg(test)]
     pub(crate) fn split(&self, button: &adw::SplitButton, icon: &str, label: &str) -> RibbonIcon {
         self.dress_split(button, icon, label, RibbonSize::Large)
     }
