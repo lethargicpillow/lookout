@@ -295,6 +295,10 @@ pub fn show_add_account_dialog(
     let name_entry = gtk::Entry::builder().placeholder_text("Display name").build();
     let email_entry = gtk::Entry::builder().placeholder_text("name@example.com").build();
 
+    let oab_entry = gtk::Entry::builder().placeholder_text("https://exchange.example/OAB/GUID/oab.xml").hexpand(true).build();
+    if let Some(account) = existing.as_ref() {
+        if let Some(url) = app_config.borrow().oab_urls.get(&account.id) { oab_entry.set_text(url); }
+    }
     let imap_host_entry = gtk::Entry::builder().placeholder_text("imap.example.com").build();
     let imap_port_spin = gtk::SpinButton::with_range(1.0, 65535.0, 1.0);
     imap_port_spin.set_value(993.0);
@@ -419,6 +423,13 @@ pub fn show_add_account_dialog(
     row += 1;
     smtp_password_box.append(&smtp_password_entry);
     form.attach(&smtp_password_box, 1, row, 3, 1);
+    row += 1;
+
+    form.attach(&field_label("Exchange OAB URL"), 0, row, 1, 1);
+    form.attach(&oab_entry, 1, row, 3, 1);
+    row += 1;
+    let oab_hint = gtk::Label::builder().label("Optional: full HTTPS manifest URL for DavMail GAL automatic updates. Uses the saved IMAP password. Clear to disable.").wrap(true).halign(gtk::Align::Start).css_classes(["dim-label"]).build();
+    form.attach(&oab_hint, 1, row, 3, 1);
     row += 1;
 
     let error_label = gtk::Label::builder().halign(gtk::Align::Start).css_classes(["error"]).wrap(true).visible(false).build();
@@ -559,6 +570,10 @@ pub fn show_add_account_dialog(
             // With "same server" on, SMTP is a copy of IMAP, so only IMAP's
             // problems are worth reporting.
             let mut problems = account_problems(&account, !same_server);
+            let oab_url = oab_entry.text().trim().to_string();
+            if !oab_url.is_empty() && (davmail_accounts(&account).is_none() || !crate::oab_sync::valid_url(&oab_url)) {
+                problems.push("OAB requires a local DavMail account and a full HTTPS oab.xml URL");
+            }
             // Blank passwords are only allowed when editing (keep the stored
             // secrets); a new account must set them.
             if imap_password.is_empty() && existing.is_none() {
@@ -618,7 +633,12 @@ pub fn show_add_account_dialog(
                 let Ok(result) = result_rx.recv().await else { return };
                 match result {
                     Ok(()) => {
-                        app_config.borrow_mut().upsert_other_account(account.clone());
+                        {
+                            let mut config = app_config.borrow_mut();
+                            config.upsert_other_account(account.clone());
+                            if oab_url.is_empty() { config.oab_urls.remove(&account.id); }
+                            else { config.oab_urls.insert(account.id.clone(), oab_url); }
+                        }
                         crate::app_config::save(&app_config.borrow());
                         dialog.close();
                         on_saved(&account_id);

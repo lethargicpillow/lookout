@@ -300,6 +300,9 @@ pub struct AppConfig {
     pub folder_role_overrides: Vec<FolderRoleOverride>,
     pub webcal_subscriptions: Vec<WebcalSubscription>,
     pub other_accounts: Vec<OtherAccount>,
+    /// Opt-in HTTPS OAB manifest URL per manual DavMail account. No secrets.
+    #[serde(default)]
+    pub oab_urls: std::collections::HashMap<String, String>,
     /// Shared mailboxes added by address (item 5.6 / M-42), each borrowing a
     /// parent Microsoft 365 account's OAuth token and Graph consent.
     #[serde(default)]

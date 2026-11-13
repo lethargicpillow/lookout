@@ -74,6 +74,7 @@ mod oauth_loopback;
 mod online_accounts;
 mod oab_decode;
 mod oab_cache;
+mod oab_sync;
 mod other_accounts;
 mod privacy;
 mod profile_card;

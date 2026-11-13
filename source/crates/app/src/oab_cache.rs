@@ -45,6 +45,10 @@ pub(crate) fn import_for_email(email: &str, file: &Path) -> Result<(usize, usize
         .filter(|a| a.email.eq_ignore_ascii_case(email) || a.imap_username.eq_ignore_ascii_case(email))
         .filter(|a| crate::other_accounts::davmail_accounts(a).is_some()).collect();
     if matches.len() != 1 { return Err("Expected exactly one configured DavMail account matching that email/login".into()); }
+    import_for_account(&matches[0].id, file, None)
+}
+
+pub(crate) fn import_for_account(account_id: &str, file: &Path, fingerprint: Option<&str>) -> Result<(usize, usize), String> {
     let bytes = std::fs::read(file).map_err(|e| e.to_string())?;
     let book = crate::oab_decode::decode(&bytes)?;
     tracing::debug!(properties = book.properties.len(), populated_properties = book.present_counts.len(), records = book.declared_records, "Decoded OAB schema");
@@ -55,11 +59,11 @@ pub(crate) fn import_for_email(email: &str, file: &Path) -> Result<(usize, usize
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
     }
-    let path = path_for(&matches[0].id);
+    let path = path_for(account_id);
     let count = book.contacts.len();
     let addressable = book.contacts.iter().filter(|c| !c.smtp.trim().is_empty()).count();
     if count == 0 || addressable == 0 { return Err("Refusing to replace GAL with an empty book".into()); }
-    write_book(&path, &book).map_err(|e| e.to_string())?;
+    write_book_with_fingerprint(&path, &book, fingerprint).map_err(|e| e.to_string())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -68,7 +72,17 @@ pub(crate) fn import_for_email(email: &str, file: &Path) -> Result<(usize, usize
     Ok((count, addressable))
 }
 
+pub(crate) fn fingerprint(account_id: &str) -> Option<String> {
+    let conn = Connection::open_with_flags(path_for(account_id), OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    conn.query_row("SELECT fingerprint FROM gal_sync LIMIT 1", [], |r| r.get(0)).ok()
+}
+
+#[cfg(test)]
 fn write_book(path: &Path, book: &crate::oab_decode::Book) -> rusqlite::Result<()> {
+    write_book_with_fingerprint(path, book, None)
+}
+
+fn write_book_with_fingerprint(path: &Path, book: &crate::oab_decode::Book, fingerprint: Option<&str>) -> rusqlite::Result<()> {
     let mut conn = Connection::open(path)?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     let tx = conn.transaction()?;
@@ -82,7 +96,11 @@ fn write_book(path: &Path, book: &crate::oab_decode::Book) -> rusqlite::Result<(
           sort_name TEXT NOT NULL, search_text TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS gal_sort ON gal(sort_name,smtp);
-        DELETE FROM gal; DELETE FROM gal_meta;")?;
+        CREATE TABLE IF NOT EXISTS gal_sync (fingerprint TEXT NOT NULL);
+        DELETE FROM gal; DELETE FROM gal_meta; DELETE FROM gal_sync;")?;
+    if let Some(value) = fingerprint {
+        tx.execute("INSERT INTO gal_sync VALUES (?1)", [value])?;
+    }
     tx.execute("INSERT INTO gal_meta VALUES (?1,?2)", params![book.serial, book.declared_records])?;
     {
         let mut stmt = tx.prepare("INSERT INTO gal VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)")?;

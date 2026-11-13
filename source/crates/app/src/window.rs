@@ -8348,6 +8348,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         contacts_directory_search_entry.connect_search_changed(move |entry| run_directory_search(&entry.text()));
     }
     refresh_contacts_ui(None);
+    crate::oab_sync::start(state.clone(), worker.clone(), run_directory_search.clone());
     // The Filter/Sort ▾ menu (UX-65), rebuilt on each open so the category
     // list is always current. Sort writes the shared "File contacts as"
     // preference; the filters live on `contacts_filter_options` and repaint
@@ -10790,6 +10791,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     {
                         let app_config = state.borrow().app_config.clone();
                         app_config.borrow_mut().other_accounts.retain(|a| a.id != account_id.0);
+                        app_config.borrow_mut().oab_urls.remove(&account_id.0);
                         crate::app_config::save(&app_config.borrow());
                     }
                     calendar_state.borrow_mut().calendar_cache_slots.remove(&account_id);
