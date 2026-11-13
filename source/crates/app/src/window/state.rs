@@ -412,13 +412,20 @@ pub(crate) struct RowDisplayRefs {
 /// single ellipsized line, and 2-3 wrap and cap the label at that many lines.
 pub(crate) fn apply_preview_lines(label: &gtk::Label, lines: i32) {
     let lines = crate::settings::preview_lines(lines);
+    // The row's vertical GtkBox spaces its visible children, not the
+    // grandchildren. Hide the whole preview line when disabled so there is
+    // no phantom inter-line gap. Other callers may use a bare label.
+    if let Some(parent) = label.parent().filter(|parent| parent.has_css_class("message-preview-line")) {
+        parent.set_visible(lines > 0);
+    }
+    label.set_visible(lines > 0);
     if lines <= 0 {
-        label.set_visible(false);
         return;
     }
-    label.set_visible(true);
-    label.set_wrap(true);
-    label.set_single_line_mode(false);
+    // One line must have a width-independent height. Wrapping is only
+    // meaningful when the user explicitly requests two or three lines.
+    label.set_wrap(lines > 1);
+    label.set_single_line_mode(lines == 1);
     label.set_lines(lines);
 }
 
