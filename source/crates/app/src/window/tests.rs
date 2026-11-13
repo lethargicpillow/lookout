@@ -3060,6 +3060,35 @@ fn row_display_applies_select_mode_sender_images_preview_lines_and_layout() {
 }
 
 #[test]
+fn preview_line_visibility_and_wrapping_follow_selected_density() {
+    if !crate::gtk_test::gtk_ready() {
+        return;
+    }
+    let preview = gtk::Label::new(Some("A long message preview"));
+    let line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    line.add_css_class("message-preview-line");
+    line.append(&preview);
+
+    apply_preview_lines(&preview, 0);
+    assert!(!line.is_visible());
+    assert!(!preview.is_visible());
+
+    apply_preview_lines(&preview, 1);
+    assert!(line.is_visible() && preview.is_visible());
+    assert!(!preview.wraps());
+    assert!(preview.is_single_line_mode());
+
+    apply_preview_lines(&preview, 3);
+    assert!(preview.wraps());
+    assert!(!preview.is_single_line_mode());
+    assert_eq!(preview.lines(), 3);
+
+    apply_preview_lines(&preview, 1);
+    assert!(!preview.wraps());
+    assert!(preview.is_single_line_mode());
+}
+
+#[test]
 fn people_sidebar_lists_desktop_books_read_only() {
     if !crate::gtk_test::gtk_ready() {
         return;
