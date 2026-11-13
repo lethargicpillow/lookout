@@ -1120,20 +1120,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // `single_cells` so the header's column chooser can hide it.
         use crate::message_columns::MessageColumn;
         let mut single_cells: Vec<(MessageColumn, gtk::Widget)> = Vec::new();
-        let single_label = |chars: i32, align_end: bool| {
-            let label = gtk::Label::builder()
-                .xalign(if align_end { 1.0 } else { 0.0 })
-                .hexpand(false)
-                .ellipsize(gtk::pango::EllipsizeMode::End)
-                .width_chars(chars)
-                .build();
-            if chars > 0 {
-                // Cap the natural width at the cell's width, or a long value
-                // would widen the cell and push the following columns out of
-                // line with the header.
-                label.set_max_width_chars(chars);
-            }
-            label
+        let single_label = |_chars: i32, align_end: bool| {
+            // The column model owns the width. A label's natural character
+            // width must not push the boundary past the user's drag position.
+            gtk::Label::builder().xalign(if align_end { 1.0 } else { 0.0 })
+                .hexpand(true).ellipsize(gtk::pango::EllipsizeMode::End)
+                .width_chars(0).max_width_chars(0).build()
         };
 
         let single_importance_icon = gtk::Image::builder()
@@ -1410,16 +1402,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         thread_leading.append(&thread_single_toggle);
 
         let mut thread_single_cells: Vec<(MessageColumn, gtk::Widget)> = Vec::new();
-        let thread_single_label = |chars: i32, align_end: bool| {
-            let label = gtk::Label::builder()
-                .xalign(if align_end { 1.0 } else { 0.0 })
-                .ellipsize(gtk::pango::EllipsizeMode::End)
-                .width_chars(chars)
-                .build();
-            if chars > 0 {
-                label.set_max_width_chars(chars);
-            }
-            label
+        let thread_single_label = |_chars: i32, align_end: bool| {
+            gtk::Label::builder().xalign(if align_end { 1.0 } else { 0.0 })
+                .hexpand(true).ellipsize(gtk::pango::EllipsizeMode::End)
+                .width_chars(0).max_width_chars(0).build()
         };
 
         let thread_single_importance_icon = gtk::Image::builder()
@@ -1968,6 +1954,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             });
         }
 
+        column_state_for_setup.register_cells(&single_cells);
+        column_state_for_setup.register_cells(&thread_single_cells);
         unsafe {
             list_item.set_data(
                 "row-widgets",

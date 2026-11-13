@@ -29,6 +29,79 @@ use crate::message_columns::{self, MessageColumn, ROW_LEADING_WIDTH};
 use crate::message_list::SortKey;
 use crate::settings::SettingsStore;
 
+/// A single model for header and row widths. Subject takes the remaining
+/// space; dragging either of its boundaries changes an adjacent fixed column.
+/// A narrow pane can temporarily compress preferences without overwriting them.
+type ColumnWidths = Vec<(MessageColumn, i32)>;
+
+fn minimum_width(column: MessageColumn) -> i32 {
+    match column {
+        MessageColumn::Importance => 24,
+        MessageColumn::Attachment => 28,
+        MessageColumn::From | MessageColumn::To => 60,
+        MessageColumn::Subject => message_columns::SUBJECT_MIN_WIDTH,
+        MessageColumn::Received => 56,
+        MessageColumn::Size => 48,
+    }
+}
+
+fn lookup_width(widths: &ColumnWidths, column: MessageColumn) -> i32 {
+    widths.iter().find(|(c, _)| *c == column).map(|(_, w)| *w)
+        .unwrap_or_else(|| if column.expands() { minimum_width(column) } else { column.width() })
+}
+
+fn set_preferred(widths: &mut ColumnWidths, column: MessageColumn, width: i32) {
+    if column.expands() { return; }
+    let width = width.clamp(minimum_width(column), 4096);
+    if let Some((_, current)) = widths.iter_mut().find(|(c, _)| *c == column) {
+        *current = width;
+    } else {
+        widths.push((column, width));
+    }
+}
+
+fn parse_widths(values: &[String]) -> ColumnWidths {
+    let mut widths = Vec::new();
+    for value in values {
+        let Some((id, width)) = value.split_once('=') else { continue; };
+        let (Some(column), Ok(width)) = (MessageColumn::from_id(id), width.parse::<i32>()) else { continue; };
+        if width > 0 { set_preferred(&mut widths, column, width); }
+    }
+    widths
+}
+
+fn fitted_widths(visible: &[MessageColumn], preferred: &ColumnWidths, pane_width: i32) -> ColumnWidths {
+    let mut widths: ColumnWidths = visible.iter().map(|&column| {
+        let width = if column.expands() { minimum_width(column) } else { lookup_width(preferred, column) };
+        (column, width)
+    }).collect();
+    let overhead = message_columns::ROW_LEADING_WIDTH + message_columns::ROW_TRAILING_MARGIN
+        + message_columns::COLUMN_SPACING * visible.len().saturating_sub(1) as i32;
+    if pane_width <= 0 { return widths; }
+    let mut excess = (overhead + widths.iter().map(|(_, w)| *w).sum::<i32>() - pane_width).max(0);
+    for column in [MessageColumn::Size, MessageColumn::Received, MessageColumn::To, MessageColumn::From,
+        MessageColumn::Attachment, MessageColumn::Importance] {
+        if let Some((_, width)) = widths.iter_mut().find(|(c, _)| *c == column) {
+            let shrink = excess.min((*width - minimum_width(column)).max(0));
+            *width -= shrink;
+            excess -= shrink;
+        }
+    }
+    let slack = (pane_width - overhead - widths.iter().map(|(_, w)| *w).sum::<i32>()).max(0);
+    if let Some((_, width)) = widths.iter_mut().find(|(c, _)| c.expands()) {
+        *width += slack;
+    }
+    widths
+}
+
+fn boundary_sizes(left: MessageColumn, right: MessageColumn, start: (i32, i32), delta: i32) -> (i32, i32) {
+    let low = minimum_width(left) - start.0;
+    let high = start.1 - minimum_width(right);
+    if low > high { return start; }
+    let delta = delta.clamp(low, high);
+    (start.0 + delta, start.1 - delta)
+}
+
 /// The list's column configuration, shared by the header and every row.
 ///
 /// `configured` is what the user chose (Outlook's default until they change
@@ -44,6 +117,10 @@ pub(crate) struct ColumnState {
     /// The width last fitted against, so a configuration change can re-fit
     /// without waiting for a resize.
     width: Rc<Cell<i32>>,
+    preferred: Rc<RefCell<ColumnWidths>>,
+    effective: Rc<RefCell<ColumnWidths>>,
+    // Weak handles to recycled row cells; resizing updates them in place.
+    row_cells: Rc<RefCell<Vec<(MessageColumn, glib::WeakRef<gtk::Widget>)>>>,
 }
 
 impl ColumnState {
@@ -55,12 +132,17 @@ impl ColumnState {
         } else {
             message_columns::DEFAULT_SENT_COLUMNS.to_vec()
         };
+        let preferred = parse_widths(&settings.get_strv(crate::settings::MAIL_LIST_COLUMN_WIDTHS));
+        let effective = fitted_widths(&configured, &preferred, 0);
         ColumnState {
             visible: Rc::new(RefCell::new(configured.clone())),
             configured: Rc::new(RefCell::new(configured)),
             sent_configured: Rc::new(RefCell::new(sent_configured)),
             sent_view: Rc::new(Cell::new(false)),
             width: Rc::new(Cell::new(0)),
+            preferred: Rc::new(RefCell::new(preferred)),
+            effective: Rc::new(RefCell::new(effective)),
+            row_cells: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -106,13 +188,7 @@ impl ColumnState {
     /// the band the columns fit into does any work.
     pub(crate) fn fit_width(&self, width: i32) -> bool {
         self.width.set(width);
-        let fitted = message_columns::columns_for_width(&self.configured().borrow(), width);
-        let mut visible = self.visible.borrow_mut();
-        if *visible == fitted {
-            return false;
-        }
-        *visible = fitted;
-        true
+        self.refit()
     }
 
     /// Adds or removes one column, persists the new order, and re-fits to the
@@ -131,28 +207,85 @@ impl ColumnState {
         // order, and Outlook's default is that order minus To.
         let all = MessageColumn::ALL;
         configured.sort_by_key(|candidate| all.iter().position(|value| value == candidate).unwrap_or(usize::MAX));
-        settings.set_strv(self.settings_key(), message_columns::columns_to_ids(&configured));
+        let ids = message_columns::columns_to_ids(&configured);
         drop(configured);
+        settings.set_strv(self.settings_key(), ids);
         self.refit()
     }
 
-    /// Restores Outlook's default columns and persists them.
+    /// Restores the active profile's default columns and shared widths.
     pub(crate) fn reset(&self, settings: &SettingsStore) -> bool {
         let mut configured = self.configured().borrow_mut();
         *configured = self.default_columns().to_vec();
-        settings.set_strv(self.settings_key(), message_columns::columns_to_ids(&configured));
+        let ids = message_columns::columns_to_ids(&configured);
         drop(configured);
-        self.refit()
+        settings.set_strv(self.settings_key(), ids);
+        let widths_changed = !self.preferred.borrow().is_empty();
+        self.preferred.borrow_mut().clear();
+        self.save_widths(settings);
+        self.refit() || widths_changed
     }
 
     fn refit(&self) -> bool {
-        let fitted = message_columns::columns_for_width(&self.configured().borrow(), self.width.get());
-        let mut visible = self.visible.borrow_mut();
-        if *visible == fitted {
-            return false;
+        let fitted = if self.width.get() <= 0 { self.configured().borrow().clone() }
+            else { message_columns::columns_for_width(&self.configured().borrow(), self.width.get()) };
+        let changed = {
+            let mut visible = self.visible.borrow_mut();
+            if *visible == fitted { false } else { *visible = fitted; true }
+        };
+        self.update_effective(changed);
+        changed
+    }
+
+    fn update_effective(&self, visible_changed: bool) {
+        let fitted = fitted_widths(&self.visible.borrow(), &self.preferred.borrow(), self.width.get());
+        let changed = {
+            let mut effective = self.effective.borrow_mut();
+            if *effective == fitted { false } else { *effective = fitted; true }
+        };
+        if changed || visible_changed { self.apply_registered_cells(); }
+    }
+
+    fn effective_width(&self, column: MessageColumn) -> i32 {
+        lookup_width(&self.effective.borrow(), column)
+    }
+
+    fn cell_width(&self, column: MessageColumn) -> i32 {
+        if column.expands() { minimum_width(column) } else { self.effective_width(column) }
+    }
+
+    fn resize_boundary(&self, left: MessageColumn, right: MessageColumn, start: (i32, i32), delta: i32) {
+        let (left_width, right_width) = boundary_sizes(left, right, start, delta);
+        {
+            let mut preferred = self.preferred.borrow_mut();
+            set_preferred(&mut preferred, left, left_width);
+            set_preferred(&mut preferred, right, right_width);
         }
-        *visible = fitted;
-        true
+        self.update_effective(false);
+    }
+
+    fn save_widths(&self, settings: &SettingsStore) {
+        let values = self.preferred.borrow().iter().map(|(column, width)| format!("{}={width}", column.id())).collect();
+        settings.set_strv(crate::settings::MAIL_LIST_COLUMN_WIDTHS, values);
+    }
+
+    pub(crate) fn register_cells(&self, cells: &[(MessageColumn, gtk::Widget)]) {
+        {
+            let mut registered = self.row_cells.borrow_mut();
+            registered.retain(|(_, weak)| weak.upgrade().is_some());
+            registered.extend(cells.iter().map(|(column, cell)| (*column, cell.downgrade())));
+        }
+        apply_cell_visibility(cells, self);
+    }
+
+    fn apply_registered_cells(&self) {
+        let cells: Vec<_> = {
+            let mut registered = self.row_cells.borrow_mut();
+            registered.retain(|(_, weak)| weak.upgrade().is_some());
+            registered.iter().filter_map(|(column, weak)| weak.upgrade().map(|cell| (*column, cell))).collect()
+        };
+        // No RefCell guard is held while GTK may emit a synchronous signal.
+        apply_cell_visibility(&cells, self);
     }
 }
 
@@ -259,9 +392,10 @@ impl ColumnHeader {
         }
         self.parts.buttons.borrow_mut().clear();
 
-        for column in self.parts.state.visible() {
+        let visible = self.parts.state.visible();
+        for (index, &column) in visible.iter().enumerate() {
             let caret = gtk::Image::builder().icon_name("pan-down-symbolic").pixel_size(6).visible(false).build();
-            let content = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(3).hexpand(column.expands()).build();
+            let content = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(3).hexpand(true).build();
             // The icon-only columns (importance, attachment) use the same
             // glyphs as the rows; a word would not fit their width.
             let icon_name = match column {
@@ -276,12 +410,12 @@ impl ColumnHeader {
                 // Cap the label's natural width to its cell, so a button with
                 // a long word cannot widen the column and shift the ones after
                 // it away from the row cells.
-                let max_chars = if column.expands() { 40 } else { ((column.width() - 10) / 7).max(4) };
                 let label = gtk::Label::builder()
                     .label(column.label())
                     .ellipsize(gtk::pango::EllipsizeMode::End)
-                    .max_width_chars(max_chars)
-                    .hexpand(column.expands())
+                    .width_chars(0)
+                    .max_width_chars(0)
+                    .hexpand(true)
                     .build();
                 if matches!(column, MessageColumn::Received | MessageColumn::Size) {
                     label.set_xalign(1.0);
@@ -296,8 +430,8 @@ impl ColumnHeader {
                 .css_classes(["flat", "message-column-header-button"])
                 .tooltip_text(format!("Sort by {}", column.label()))
                 .hexpand(column.expands())
-                .halign(if column.expands() { gtk::Align::Fill } else { gtk::Align::Start })
-                .width_request(if column.expands() { 0 } else { column.width() })
+                .halign(gtk::Align::Fill)
+                .width_request(self.parts.state.cell_width(column))
                 .focusable(true)
                 .build();
             button.update_property(&[gtk::accessible::Property::Label(column.label())]);
@@ -324,7 +458,50 @@ impl ColumnHeader {
                 button.add_controller(gesture);
             }
 
-            cells.append(&button);
+            // The handle is an overlay, not another column: it does not
+            // alter the cell's measured width or the header/row alignment.
+            let wrapper = gtk::Overlay::builder().child(&button).hexpand(column.expands()).build();
+            if let Some(&next) = visible.get(index + 1) {
+                let handle = gtk::Box::builder().width_request(8)
+                    .halign(gtk::Align::End).valign(gtk::Align::Fill)
+                    .css_classes(["message-column-resize-handle"])
+                    .tooltip_text("Drag to resize columns").build();
+                handle.set_cursor_from_name(Some("col-resize"));
+                wrapper.add_overlay(&handle);
+                wrapper.set_measure_overlay(&handle, false);
+                let drag = gtk::GestureDrag::new();
+                drag.set_button(gtk::gdk::BUTTON_PRIMARY);
+                let start = Rc::new(Cell::new(None::<(i32, i32)>));
+                {
+                    let weak = Rc::downgrade(self);
+                    let start = start.clone();
+                    drag.connect_drag_begin(move |gesture, _, _| {
+                        let Some(header) = weak.upgrade() else { return; };
+                        start.set(Some((header.parts.state.effective_width(column), header.parts.state.effective_width(next))));
+                        gesture.set_state(gtk::EventSequenceState::Claimed);
+                    });
+                }
+                {
+                    let weak = Rc::downgrade(self);
+                    let start = start.clone();
+                    drag.connect_drag_update(move |_, dx, _| {
+                        let (Some(header), Some(initial)) = (weak.upgrade(), start.get()) else { return; };
+                        header.parts.state.resize_boundary(column, next, initial, dx.round() as i32);
+                        header.update_button_widths();
+                    });
+                }
+                {
+                    let weak = Rc::downgrade(self);
+                    drag.connect_drag_end(move |_, _, _| {
+                        start.set(None);
+                        if let Some(header) = weak.upgrade() {
+                            header.parts.state.save_widths(&header.parts.settings);
+                        }
+                    });
+                }
+                handle.add_controller(drag);
+            }
+            cells.append(&wrapper);
             self.parts.buttons.borrow_mut().push(ColumnButton { column, button, caret });
         }
         self.refresh(self.parts.sort.get().0, self.parts.sort.get().1);
@@ -353,12 +530,22 @@ impl ColumnHeader {
         }
     }
 
-    /// Re-fits the visible columns to a new list width; a change rebuilds the
-    /// header and asks the window to refresh the rows.
+    fn update_button_widths(&self) {
+        let buttons: Vec<_> = self.parts.buttons.borrow().iter().map(|entry| (entry.column, entry.button.clone())).collect();
+        for (column, button) in buttons {
+            let width = self.parts.state.cell_width(column);
+            if button.width_request() != width { button.set_width_request(width); }
+        }
+    }
+
+    /// Re-fit on pane resize. Only a change of visible columns rebuilds the
+    /// header; width-only changes update the same live widgets.
     pub(crate) fn set_width(self: &Rc<Self>, width: i32) {
         if self.parts.state.fit_width(width) {
             self.rebuild();
             (self.parts.on_columns_changed)();
+        } else {
+            self.update_button_widths();
         }
     }
 
@@ -466,15 +653,15 @@ pub(crate) fn column_cell(column: MessageColumn) -> gtk::Box {
         .hexpand(column.expands())
         .build();
     cell.add_css_class("message-single-cell");
-    if !column.expands() {
-        cell.set_width_request(column.width());
-    }
+    cell.set_width_request(if column.expands() { minimum_width(column) } else { column.width() });
     cell
 }
 
 /// Applies the state's visible set to one row's cells (message or thread).
 pub(crate) fn apply_cell_visibility(cells: &[(MessageColumn, gtk::Widget)], state: &ColumnState) {
     for (column, cell) in cells {
+        let width = state.cell_width(*column);
+        if cell.width_request() != width { cell.set_width_request(width); }
         cell.set_visible(state.is_visible(*column));
     }
 }
@@ -499,7 +686,28 @@ mod tests {
             sent_view: Rc::new(Cell::new(false)),
             visible: Rc::new(RefCell::new(DEFAULT_COLUMNS.to_vec())),
             width: Rc::new(Cell::new(0)),
+            preferred: Rc::new(RefCell::new(Vec::new())),
+            effective: Rc::new(RefCell::new(fitted_widths(&DEFAULT_COLUMNS, &Vec::new(), 0))),
+            row_cells: Rc::new(RefCell::new(Vec::new())),
         }
+    }
+
+    #[test]
+    fn drag_boundary_preserves_total_and_saved_widths_survive_narrowing() {
+        let state = state();
+        state.fit_width(1200);
+        let from = MessageColumn::From;
+        let subject = MessageColumn::Subject;
+        let start = (state.effective_width(from), state.effective_width(subject));
+        state.resize_boundary(from, subject, start, 100);
+        assert_eq!(state.effective_width(from), start.0 + 100);
+        assert_eq!(state.effective_width(subject), start.1 - 100);
+        state.fit_width(500);
+        assert!(state.effective_width(from) < start.0 + 100);
+        state.fit_width(1200);
+        assert_eq!(state.effective_width(from), start.0 + 100);
+        assert_eq!(boundary_sizes(from, subject, (170, 100), 999), (180, 90));
+        assert_eq!(lookup_width(&parse_widths(&["from=240".into(), "unknown=80".into(), "size=-1".into()]), from), 240);
     }
 
     fn ids(state: &ColumnState) -> Vec<&'static str> {

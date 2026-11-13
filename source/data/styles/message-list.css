@@ -131,6 +131,7 @@ button.list-header-action {
    have none). */
 button.message-column-header-button {
     padding: 0 1px;
+    min-width: 0;
     min-height: 22px;
     border-radius: 4px;
 }
@@ -160,4 +161,13 @@ button.message-thread-toggle {
     min-width: 22px;
     min-height: 22px;
     padding: 0;
+}
+
+/* A narrow hit area overlays the right edge without taking table width. */
+.message-column-resize-handle {
+    border-right: 1px solid @lookout-row-separator;
+}
+.message-column-resize-handle:hover {
+    background-color: alpha(@accent_bg_color, 0.22);
+    border-right-color: @accent_bg_color;
 }

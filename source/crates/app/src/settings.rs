@@ -117,6 +117,8 @@ pub const MAIL_FILTERS: &str = "mail-filters";
 pub const MAIL_LIST_COLUMNS: &str = "mail-list-columns";
 /// A separate column set for Sent Items; empty uses the recipient-first default.
 pub const MAIL_SENT_LIST_COLUMNS: &str = "mail-sent-list-columns";
+/// Per-column preferred widths in logical pixels, shared across mail profiles.
+pub const MAIL_LIST_COLUMN_WIDTHS: &str = "mail-list-column-widths";
 /// How the message list lays its rows out (M-07 / UX-27): `auto` picks the
 /// single-line columnar layout when the reading pane is bottom/off or the list
 /// is wide enough; `three-line` and `single-line` force one.
@@ -398,6 +400,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(MAIL_FILTERS, Value::Strv(Vec::new()));
     map.insert(MAIL_LIST_COLUMNS, Value::Strv(Vec::new()));
     map.insert(MAIL_SENT_LIST_COLUMNS, Value::Strv(Vec::new()));
+    map.insert(MAIL_LIST_COLUMN_WIDTHS, Value::Strv(Vec::new()));
     map.insert(MAIL_LIST_STYLE, Value::String("auto".into()));
     map.insert(MAIL_SEARCH_SCOPE, Value::String("all".into()));
     map.insert(CALENDAR_SEARCH_SCOPE, Value::String("all".into()));
