@@ -1862,7 +1862,7 @@ pub fn build_compose_view(
         let button = gtk::Button::builder()
             .label(format!("{label}…"))
             .width_request(56)
-            .valign(gtk::Align::Start)
+            .valign(gtk::Align::Fill)
             .tooltip_text(format!("Select {label} recipients from address book"))
             .css_classes(["compose-picker-button"])
             .build();
