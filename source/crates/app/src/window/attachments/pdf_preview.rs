@@ -1,8 +1,8 @@
 //! Read-only PDF preview using system Poppler utilities. All subprocess and
 //! filesystem work runs off the GTK thread; no shell or embedded browser.
 
-use gtk::{glib, prelude::*};
-use std::cell::Cell;
+use gtk::{glib, prelude::*, subclass::prelude::*};
+use std::cell::{Cell, RefCell};
 use std::fs;
 use std::io::Read;
 use std::os::unix::fs::DirBuilderExt;
@@ -12,9 +12,12 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const ZOOM: [u32; 5] = [75, 100, 125, 150, 200];
+const MIN_ZOOM: u32 = 50;
+const MAX_ZOOM: u32 = 400;
+const DEFAULT_ZOOM: u32 = 100;
+const ZOOM_MARKS: [u32; 8] = [50, 100, 150, 200, 250, 300, 350, 400];
 const TOOL_TIMEOUT: Duration = Duration::from_secs(20);
-const MAX_PNG_BYTES: u64 = 24 * 1024 * 1024;
+const MAX_PNG_BYTES: u64 = 64 * 1024 * 1024;
 
 struct Scratch(PathBuf);
 impl Scratch {
@@ -59,8 +62,83 @@ fn page_count(info: &str) -> Option<u32> {
         .and_then(|value| value.trim().parse::<u32>().ok()).filter(|n| *n > 0)
 }
 
-fn render_size(zoom: usize) -> u32 {
-    900 * ZOOM[zoom.min(ZOOM.len() - 1)] / 100
+fn render_size(zoom: u32) -> u32 {
+    900 * zoom.clamp(MIN_ZOOM, MAX_ZOOM) / 100
+}
+
+fn zoom_value(value: f64) -> u32 {
+    value.round().clamp(MIN_ZOOM as f64, MAX_ZOOM as f64) as u32
+}
+
+fn snap_zoom(value: f64) -> Option<f64> {
+    ZOOM_MARKS.iter().copied().map(f64::from)
+        .find(|mark| (value - mark).abs() <= 2.0)
+}
+
+fn scaled_dimension(pixels: i32, source_zoom: u32, target_zoom: u32) -> i32 {
+    ((pixels as f64 * target_zoom as f64 / source_zoom.max(1) as f64).round() as i32).max(1)
+}
+
+// A texture's intrinsic dimensions must not determine its GTK layout:
+// the same raster is drawn immediately at every slider position, including
+// zooming down, until Poppler supplies a sharper raster at the final zoom.
+mod canvas_imp {
+    use super::*;
+
+    #[derive(Default)]
+    pub struct PageCanvas {
+        pub texture: RefCell<Option<gtk::gdk::Texture>>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for PageCanvas {
+        const NAME: &'static str = "LookoutPdfPageCanvas";
+        type Type = super::PageCanvas;
+        type ParentType = gtk::Widget;
+    }
+
+    impl ObjectImpl for PageCanvas {}
+    impl WidgetImpl for PageCanvas {
+        fn snapshot(&self, snapshot: &gtk::Snapshot) {
+            let widget = self.obj();
+            if let Some(texture) = self.texture.borrow().as_ref() {
+                snapshot.append_texture(texture, &gtk::graphene::Rect::new(
+                    0.0, 0.0, widget.width() as f32, widget.height() as f32,
+                ));
+            }
+        }
+    }
+}
+
+glib::wrapper! {
+    pub struct PageCanvas(ObjectSubclass<canvas_imp::PageCanvas>)
+        @extends gtk::Widget,
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
+}
+
+impl PageCanvas {
+    fn new() -> Self { glib::Object::builder().build() }
+
+    fn clear(&self) {
+        self.imp().texture.replace(None);
+        self.set_visible(false);
+        self.queue_draw();
+    }
+
+    fn set_texture(&self, texture: gtk::gdk::Texture) {
+        self.imp().texture.replace(Some(texture));
+        self.queue_draw();
+    }
+
+    fn resize_for_zoom(&self, source: u32, target: u32) {
+        if let Some(texture) = self.imp().texture.borrow().as_ref() {
+            self.set_size_request(
+                scaled_dimension(texture.width(), source, target),
+                scaled_dimension(texture.height(), source, target),
+            );
+            self.queue_draw();
+        }
+    }
 }
 
 struct Rendered {
@@ -68,7 +146,7 @@ struct Rendered {
     pages: u32,
 }
 
-fn render_page(bytes: &[u8], page: u32, zoom: usize, known_pages: u32) -> Result<Rendered, String> {
+fn render_page(bytes: &[u8], page: u32, zoom: u32, known_pages: u32) -> Result<Rendered, String> {
     let scratch = Scratch::new().map_err(|_| "Could not create a private PDF preview directory.".to_string())?;
     let input = scratch.0.join("attachment.pdf");
     fs::write(&input, bytes).map_err(|_| "Could not prepare PDF preview.".to_string())?;
@@ -110,9 +188,9 @@ struct Preview {
     bytes: Arc<Vec<u8>>,
     page: Cell<u32>,
     pages: Cell<u32>,
-    zoom: Cell<usize>,
+    zoom: Cell<u32>,
     busy: Cell<bool>,
-    picture: glib::WeakRef<gtk::Picture>,
+    picture: glib::WeakRef<PageCanvas>,
     counter: glib::WeakRef<gtk::Label>,
     status: glib::WeakRef<gtk::Label>,
     previous: glib::WeakRef<gtk::Button>,
@@ -120,7 +198,7 @@ struct Preview {
     slider: glib::WeakRef<gtk::Scale>,
     zoom_label: glib::WeakRef<gtk::Label>,
     zoom_revision: Cell<u64>,
-    rendered_zoom: Cell<Option<usize>>,
+    rendered_zoom: Cell<Option<u32>>,
     retry: glib::WeakRef<gtk::Button>,
 }
 impl Preview {
@@ -132,7 +210,7 @@ impl Preview {
                 self.page.get(), if known { self.pages.get().to_string() } else { "…".into() }));
         }
         if let Some(label) = self.zoom_label.upgrade() {
-            label.set_text(&format!("{}%", ZOOM[self.zoom.get()]));
+            label.set_text(&format!("{}%", self.zoom.get()));
         }
         if let Some(slider) = self.slider.upgrade() {
             // Do not interrupt a drag when rendering starts. Changes are
@@ -151,9 +229,16 @@ impl Preview {
     }
 
     fn request_zoom(self: &Rc<Self>, value: f64) {
-        let zoom = value.round().clamp(0.0, (ZOOM.len() - 1) as f64) as usize;
+        let zoom = zoom_value(value);
         if self.zoom.replace(zoom) == zoom { return; }
+        if let (Some(picture), Some(source)) = (self.picture.upgrade(), self.rendered_zoom.get()) {
+            picture.resize_for_zoom(source, zoom);
+        }
         self.controls();
+        self.schedule_render();
+    }
+
+    fn schedule_render(self: &Rc<Self>) {
         let revision = self.zoom_revision.get().wrapping_add(1);
         self.zoom_revision.set(revision);
         let weak = Rc::downgrade(self);
@@ -171,11 +256,12 @@ impl Preview {
     fn begin(self: &Rc<Self>) {
         if self.busy.replace(true) { return; }
         self.controls();
+        // Keep the last raster visible while refining its resolution.
+        // Only a first load or a page change needs the loading placeholder.
         if let Some(label) = self.status.upgrade() {
             label.set_text("Rendering PDF page…");
-            label.set_visible(true);
+            label.set_visible(self.rendered_zoom.get().is_none());
         }
-        if let Some(picture) = self.picture.upgrade() { picture.set_visible(false); }
         if let Some(retry) = self.retry.upgrade() { retry.set_visible(false); }
         let bytes = self.bytes.clone();
         let (page, zoom, pages) = (self.page.get(), self.zoom.get(), self.pages.get());
@@ -194,17 +280,14 @@ impl Preview {
         });
     }
 
-    fn finish(self: &Rc<Self>, rendered_zoom: usize, result: Result<Rendered, String>) {
+    fn finish(self: &Rc<Self>, rendered_zoom: u32, result: Result<Rendered, String>) {
         self.busy.set(false);
         if self.picture.upgrade().is_none() { return; }
-        // A slider change during a render supersedes that result. Never
-        // present a stale zoom or launch concurrent Poppler subprocesses.
+        // A completed raster is still useful at the current zoom even if
+        // the slider moved while Poppler was running. Display it scaled to
+        // the current target, then coalesce the next high-resolution render.
         if let Ok(rendered) = &result {
             self.pages.set(rendered.pages);
-        }
-        if self.zoom.get() != rendered_zoom {
-            self.begin();
-            return;
         }
         let (Some(picture), Some(status), Some(retry)) =
             (self.picture.upgrade(), self.status.upgrade(), self.retry.upgrade()) else { return; };
@@ -216,21 +299,24 @@ impl Preview {
         match result {
             Ok(texture) => {
                 self.rendered_zoom.set(Some(rendered_zoom));
-                picture.set_paintable(Some(&texture));
-                picture.set_size_request(texture.width(), texture.height());
+                picture.set_texture(texture);
+                picture.resize_for_zoom(rendered_zoom, self.zoom.get());
                 picture.set_visible(true);
                 status.set_visible(false);
                 retry.set_visible(false);
             }
             Err(message) => {
-                self.rendered_zoom.set(None);
-                picture.set_visible(false);
+                // A failed refinement must not blank a readable page.
+                // Leave its previous raster intact, with a Retry action.
                 status.set_text(&message);
                 status.set_visible(true);
                 retry.set_visible(true);
             }
         }
         self.controls();
+        if self.zoom.get() != rendered_zoom {
+            self.schedule_render();
+        }
     }
 }
 
@@ -263,9 +349,7 @@ pub(super) fn show(content: &gtk::Box, bytes: &[u8]) {
     status.set_margin_start(12);
     status.set_margin_end(12);
     status.set_can_target(false);
-    let picture = gtk::Picture::new();
-    picture.set_can_shrink(false);
-    picture.set_content_fit(gtk::ContentFit::Contain);
+    let picture = PageCanvas::new();
     picture.set_halign(gtk::Align::Center);
     picture.set_valign(gtk::Align::Start);
     crate::privacy::mark_blur_all(&picture);
@@ -279,17 +363,30 @@ pub(super) fn show(content: &gtk::Box, bytes: &[u8]) {
     body.append(&gtk::Separator::new(gtk::Orientation::Vertical));
 
     let zoom_rail = gtk::Box::builder().orientation(gtk::Orientation::Vertical)
-        .spacing(8).margin_start(8).margin_end(8).valign(gtk::Align::Center).build();
-    let slider = gtk::Scale::with_range(gtk::Orientation::Vertical, 0.0, (ZOOM.len() - 1) as f64, 1.0);
+        .spacing(8).margin_start(8).margin_end(8).margin_top(24).margin_bottom(24)
+        .valign(gtk::Align::Fill).vexpand(true).build();
+    let slider = gtk::Scale::with_range(gtk::Orientation::Vertical, MIN_ZOOM as f64, MAX_ZOOM as f64, 1.0);
     slider.set_inverted(true);
     slider.set_draw_value(false);
     slider.set_digits(0);
-    slider.set_size_request(-1, 220);
-    slider.set_value(1.0);
+    slider.set_size_request(-1, 320);
+    slider.set_vexpand(true);
+    slider.set_value(DEFAULT_ZOOM as f64);
     slider.set_tooltip_text(Some("PDF zoom"));
-    for (index, percent) in ZOOM.iter().enumerate() {
-        slider.add_mark(index as f64, gtk::PositionType::Right, Some(&format!("{percent}%")));
+    for percent in ZOOM_MARKS {
+        slider.add_mark(percent as f64, gtk::PositionType::Right, Some(&format!("{percent}%")));
     }
+    // Snap only direct pointer jumps, not arrow-key increments, so users
+    // can still move in exact one-percent steps around every marked value.
+    slider.connect_change_value(|scale, scroll, value| {
+        if scroll == gtk::ScrollType::Jump {
+            if let Some(mark) = snap_zoom(value) {
+                scale.set_value(mark);
+                return glib::Propagation::Stop;
+            }
+        }
+        glib::Propagation::Proceed
+    });
     let zoom_label = gtk::Label::new(Some("100%"));
     zoom_rail.append(&slider);
     zoom_rail.append(&zoom_label);
@@ -298,7 +395,7 @@ pub(super) fn show(content: &gtk::Box, bytes: &[u8]) {
 
     let preview = Rc::new(Preview {
         bytes: Arc::new(bytes.to_vec()), page: Cell::new(1), pages: Cell::new(0),
-        zoom: Cell::new(1), busy: Cell::new(false),
+        zoom: Cell::new(DEFAULT_ZOOM), busy: Cell::new(false),
         picture: picture.downgrade(), counter: counter.downgrade(), status: status.downgrade(),
         previous: previous.downgrade(), next: next.downgrade(),
         slider: slider.downgrade(), zoom_label: zoom_label.downgrade(),
@@ -316,6 +413,8 @@ pub(super) fn show(content: &gtk::Box, bytes: &[u8]) {
                 _ => return,
             }
             if action != 2 {
+                preview.rendered_zoom.set(None);
+                if let Some(picture) = preview.picture.upgrade() { picture.clear(); }
                 if let Some(scroller) = scroller.upgrade() {
                     let adjustment = scroller.vadjustment();
                     adjustment.set_value(adjustment.lower());
@@ -341,9 +440,18 @@ mod tests {
         assert_eq!(page_count("Pages: 0"), None);
         assert_eq!(page_count("Pages: invalid"), None);
         assert_eq!(page_count("Title: no page count"), None);
-        assert_eq!(render_size(0), 675);
-        assert_eq!(render_size(1), 900);
-        assert_eq!(render_size(4), 1800);
-        assert_eq!(render_size(usize::MAX), 1800);
+        assert_eq!(render_size(0), 450);
+        assert_eq!(render_size(50), 450);
+        assert_eq!(render_size(100), 900);
+        assert_eq!(render_size(137), 1233);
+        assert_eq!(render_size(400), 3600);
+        assert_eq!(render_size(u32::MAX), 3600);
+        assert_eq!(zoom_value(137.4), 137);
+        assert_eq!(snap_zoom(99.0), Some(100.0));
+        assert_eq!(snap_zoom(103.0), None);
+        assert_eq!(snap_zoom(399.0), Some(400.0));
+        assert_eq!(scaled_dimension(900, 100, 50), 450);
+        assert_eq!(scaled_dimension(900, 100, 400), 3600);
+        assert_eq!(scaled_dimension(3600, 400, 137), 1233);
     }
 }
