@@ -359,14 +359,10 @@ impl RecipientEntry {
         *self.person_card.borrow_mut() = Some(hook);
     }
 
-    /// Appends a widget after the entry, right-aligned by the entry's
-    /// `hexpand`. The composer uses this for the To row's To/Cc/Bcc buttons.
+    /// Prepends a widget before the recipient input. The composer uses
+    /// this for the To/Cc/Bcc address-book buttons.
     pub fn add_header_prefix(&self, widget: &impl IsA<gtk::Widget>) {
         self.header.prepend(widget);
-    }
-
-    pub fn add_header_suffix(&self, widget: &impl IsA<gtk::Widget>) {
-        self.header.append(widget);
     }
 
     /// Replaces the field's contents from a comma-separated string - how

@@ -43,48 +43,13 @@ const DRAFT_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(30);
 ///   pops the composer back in only while it's still alive, and just closes
 ///   the window once Send or Cancel has already finished the session.
 ///
-/// The window layer also relocates the header row's Cancel, Send, From and
-/// receipt-toggle widgets into the pop-out window's title bar (`top_row` is
-/// where they normally live, so they can be returned on pop-back-in); the
-/// widgets keep their click/state handlers across the move, since they're
-/// the same widgets.
-///
-/// While the composer is embedded in the reading pane the editor toolbar
-/// lives in the main window's action bar (see `ComposeActionBar` in
-/// `window.rs`); `editor_toolbar` is the toolbar itself and `toolbar_anchor`
-/// the widget it normally follows in the composer column (the attachment
-/// flow), so the window layer can return the toolbar to the composer on
-/// pop-out and lift it back out on pop-back-in.
+/// The complete editor remains intact during a move. Only its toolbar is
+/// reparented separately when the editor is embedded in the main window.
 pub struct PopOutHandle {
     pub widget: gtk::Box,
-    /// The compose editor's toolbar row (attach, plain/rich toggle, and the
-    /// rich-text formatting buttons). Relocated into the composer by the
-    /// pop-out handler and back into the action bar by the pop-back-in
-    /// handler (see `ComposeActionBar` in `window.rs`).
     pub editor_toolbar: gtk::Box,
-    /// The composer-column widget the editor toolbar sits directly after -
-    /// the anchor for re-inserting the toolbar into the composer on pop-out.
-    pub toolbar_anchor: gtk::Widget,
-    pub cancel_button: gtk::Button,
     pub close_button: gtk::Button,
     pub dock_button: gtk::Button,
-    pub send_button: gtk::Button,
-    pub from_dropdown: gtk::DropDown,
-    pub read_receipt_toggle: gtk::ToggleButton,
-    /// The delivery-receipt toggle (C-07), which rides with the read-receipt
-    /// toggle into the pop-out window's title bar.
-    pub delivery_receipt_toggle: gtk::ToggleButton,
-    /// "View in Light Mode", which rides with the read-receipt toggle.
-    pub light_view_button: gtk::ToggleButton,
-    /// The composer's own header row, which the widgets above are removed
-    /// from while popped out and restored to on pop-back-in.
-    pub top_row: gtk::Box,
-    /// The header row's title and draft-status labels. While popped out the
-    /// whole row is hidden (the window's title bar duplicates the title), so
-    /// the status label is relocated into the title bar; both are restored
-    /// to the header row on pop-back-in.
-    pub title_label: gtk::Label,
-    pub status_label: gtk::Label,
     pub moving: Rc<Cell<bool>>,
     pub popped_out: Rc<Cell<bool>>,
     pub done: Rc<Cell<bool>>,
@@ -3273,17 +3238,8 @@ pub fn build_compose_view(
         let popped_out = popped_out.clone();
         let closed = closed.clone();
         let content = content.clone();
-        let top_row = top_row.clone();
-        let title_label = title_label.clone();
-        let status_label = status_label.clone();
-        let cancel_button = cancel_button.clone();
         let close_button = close_button.clone();
         let dock_button = dock_button.clone();
-        let send_button = send_button.clone();
-        let from_dropdown = from_dropdown.clone();
-        let read_receipt_toggle = read_receipt_toggle.clone();
-        let delivery_receipt_toggle = delivery_receipt_toggle.clone();
-        let light_view_button = light_view_button.clone();
         let editor_toolbar = editor_toolbar.clone();
         pop_out_button.connect_clicked(move |_| {
             if popped_out.get() {
@@ -3294,18 +3250,8 @@ pub fn build_compose_view(
             on_pop_out(PopOutHandle {
                 widget: content.clone(),
                 editor_toolbar: editor_toolbar.clone(),
-                toolbar_anchor: top_row.clone().into(),
-                cancel_button: cancel_button.clone(),
                 close_button: close_button.clone(),
                 dock_button: dock_button.clone(),
-                send_button: send_button.clone(),
-                from_dropdown: from_dropdown.clone(),
-                read_receipt_toggle: read_receipt_toggle.clone(),
-                delivery_receipt_toggle: delivery_receipt_toggle.clone(),
-                light_view_button: light_view_button.clone(),
-                top_row: top_row.clone(),
-                title_label: title_label.clone(),
-                status_label: status_label.clone(),
                 moving: moving.clone(),
                 popped_out: popped_out.clone(),
                 done: closed.clone(),
