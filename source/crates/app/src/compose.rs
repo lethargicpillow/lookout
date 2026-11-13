@@ -2333,106 +2333,95 @@ pub fn build_compose_view(
         });
     }
 
-    // --- My Templates menu (item 2.10 / C-17): like the signature menu, a
-    // button dropping down the global template list, one row per template
-    // inserting its snippet at the cursor - the HTML form in rich mode, the
-    // plain text in text mode - with a "Manage Templates…" row pinned at the
-    // bottom. Rebuilt every time the popover opens; disabled while no templates
-    // exist.
-    let templates_image = gtk::Image::from_icon_name("edit-copy-symbolic");
-    let templates_button = gtk::MenuButton::builder()
-        .child(&templates_image)
-        .css_classes(["flat"])
-        .tooltip_text("Insert a template")
-        .build();
-    templates_button.set_always_show_arrow(true);
-    let templates_popover = gtk::Popover::new();
-    templates_popover.set_autohide(true);
-    let templates_list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::Single).build();
-    let templates_scroller = gtk::ScrolledWindow::builder()
-        .child(&templates_list).min_content_width(240).max_content_width(320)
-        .max_content_height(240).propagate_natural_height(true)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vscrollbar_policy(gtk::PolicyType::Automatic).build();
-    let templates_menu_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
-    templates_menu_box.append(&templates_scroller);
-    templates_menu_box.append(&gtk::Separator::builder().orientation(gtk::Orientation::Horizontal).build());
-    let manage_templates_label = gtk::Label::builder()
-        .label("Manage Templates…")
-        .xalign(0.0)
-        .margin_start(10)
-        .margin_end(10)
-        .margin_top(3)
-        .margin_bottom(3)
-        .build();
-    crate::privacy::mark_ui(&manage_templates_label);
-    let manage_templates_button = gtk::Button::builder().css_classes(["flat"]).build();
-    manage_templates_button.set_child(Some(&manage_templates_label));
+    // Templates use the same embedded picker as Signature. A native
+    // GtkPopover can remain above another application on XWayland.
+    let templates_button = gtk::Button::builder().icon_name("edit-copy-symbolic")
+        .css_classes(["flat"]).tooltip_text("Insert or manage templates").build();
     {
+        let templates_source = templates_source.clone();
         let manage_templates = manage_templates.clone();
-        let templates_popover = templates_popover.clone();
-        manage_templates_button.connect_clicked(move |_| {
-            templates_popover.popdown();
-            if let Some(manage) = &manage_templates {
-                manage();
-            }
-        });
-    }
-    templates_menu_box.append(&manage_templates_button);
-    templates_popover.set_child(Some(&templates_menu_box));
-    templates_button.set_popover(Some(&templates_popover));
-
-    let rebuild_templates_menu: Rc<RefCell<Box<dyn Fn()>>> = Rc::new(RefCell::new(Box::new(|| {})));
-    {
-        let templates_source = templates_source.clone();
-        let templates_list = templates_list.clone();
-        let templates_button = templates_button.clone();
-        *rebuild_templates_menu.borrow_mut() = Box::new(move || {
-            while let Some(child) = templates_list.first_child() {
-                templates_list.remove(&child);
-            }
-            let templates = templates_source();
-            templates_button.set_sensitive(!templates.is_empty());
-            for template in &templates {
-                let label = gtk::Label::builder()
-                    .label(&template.name)
-                    .xalign(0.0)
-                    .ellipsize(gtk::pango::EllipsizeMode::End)
-                    .margin_start(10)
-                    .margin_end(10)
-                    .margin_top(6)
-                    .margin_bottom(6)
-                    .build();
-                templates_list.append(&label);
-            }
-        });
-    }
-    (rebuild_templates_menu.borrow())();
-    {
-        let rebuild_handle = rebuild_templates_menu.clone();
-        templates_popover.connect_map(move |_| {
-            (rebuild_handle.borrow())();
-        });
-    }
-    // One activation handler for the whole list, like the signature menu: the
-    // index is resolved against the *current* template list at click time.
-    {
-        let templates_source = templates_source.clone();
-        let templates_popover = templates_popover.clone();
         let rich_web_view = rich_web_view.clone();
         let body_view = body_view.clone();
         let rich_toggle = rich_toggle.clone();
-        templates_list.connect_row_activated(move |_, row| {
-            let index = row.index() as usize;
-            templates_popover.popdown();
+        templates_button.connect_clicked(move |button| {
+            let Some(parent) = button.root().and_downcast::<gtk::Window>()
+                .or_else(|| body_view.root().and_downcast::<gtk::Window>()) else { return };
+            // Resolve the owning window before closing a collapsed group.
+            let mut ancestor = button.parent();
+            let mut popovers = Vec::new();
+            while let Some(widget) = ancestor {
+                ancestor = widget.parent();
+                if let Ok(popover) = widget.downcast::<gtk::Popover>() { popovers.push(popover); }
+            }
+            for popover in popovers { popover.popdown(); }
+
             let templates = templates_source();
-            let Some(template) = templates.get(index) else { return };
-            if rich_toggle.is_active() {
-                // Same `document.execCommand('insertHTML')` path as the
-                // signature menu, which restores focus and keeps the caret.
-                let html_json = serde_json::to_string(&template.html).unwrap_or_else(|_| "\"\"".to_string());
-                let script = format!(
-                    r#"(function () {{
+            let dialog = adw::Dialog::builder().title("Templates")
+                .content_width(340).content_height(250).build();
+            let toolbar = adw::ToolbarView::new();
+            toolbar.add_top_bar(&adw::HeaderBar::new());
+            let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical)
+                .spacing(8).margin_top(12).margin_bottom(12).margin_start(12).margin_end(12).build();
+            let list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None)
+                .activate_on_single_click(true).css_classes(["boxed-list"]).build();
+            let scroller = gtk::ScrolledWindow::builder().child(&list)
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .vscrollbar_policy(gtk::PolicyType::Automatic)
+                .propagate_natural_height(true).max_content_height(200).vexpand(true).build();
+            for template in &templates {
+                let label = gtk::Label::builder().label(&template.name).xalign(0.0)
+                    .ellipsize(gtk::pango::EllipsizeMode::End)
+                    .margin_start(12).margin_end(12).margin_top(8).margin_bottom(8).build();
+                crate::privacy::mark_content(&label);
+                list.append(&label);
+            }
+            if templates.is_empty() {
+                list.set_placeholder(Some(&gtk::Label::new(Some("No templates yet"))));
+            }
+            content.append(&scroller);
+            let manage_button = gtk::Button::with_label("Manage Templates…");
+            manage_button.set_sensitive(manage_templates.is_some());
+            content.append(&manage_button);
+            toolbar.set_content(Some(&content));
+            dialog.set_child(Some(&toolbar));
+
+            enum Choice { Insert(MailTemplate), Manage }
+            let choice = Rc::new(RefCell::new(None::<Choice>));
+            {
+                let choice = choice.clone();
+                let dialog = dialog.downgrade();
+                list.connect_row_activated(move |_, row| {
+                    if let Some(template) = templates.get(row.index() as usize) {
+                        *choice.borrow_mut() = Some(Choice::Insert(template.clone()));
+                        if let Some(dialog) = dialog.upgrade() { dialog.close(); }
+                    }
+                });
+            }
+            {
+                let choice = choice.clone();
+                let dialog = dialog.downgrade();
+                manage_button.connect_clicked(move |_| {
+                    *choice.borrow_mut() = Some(Choice::Manage);
+                    if let Some(dialog) = dialog.upgrade() { dialog.close(); }
+                });
+            }
+            let manage_templates = manage_templates.clone();
+            let rich_web_view = rich_web_view.clone();
+            let body_view = body_view.clone();
+            let rich_toggle = rich_toggle.clone();
+            dialog.connect_closed(move |_| {
+                let selected = choice.borrow_mut().take();
+                let template = match selected {
+                    Some(Choice::Insert(template)) => template,
+                    Some(Choice::Manage) => {
+                        if let Some(manage) = &manage_templates { manage(); }
+                        return;
+                    }
+                    None => return,
+                };
+                if rich_toggle.is_active() {
+                    let html_json = serde_json::to_string(&template.html).unwrap_or_else(|_| "\"\"".to_string());
+                    let script = format!(r#"(function () {{
                         document.body.focus();
                         var sel = window.getSelection();
                         if (!sel || sel.rangeCount === 0) {{
@@ -2443,15 +2432,16 @@ pub fn build_compose_view(
                             sel.addRange(range);
                         }}
                         document.execCommand('insertHTML', false, {html_json});
-                    }})()"#
-                );
-                let web_view = rich_web_view.clone();
-                glib::spawn_future_local(async move {
-                    let _ = web_view.evaluate_javascript_future(&script, None, None).await;
-                });
-            } else {
-                body_view.buffer().insert_at_cursor(&template.text);
-            }
+                    }})()"#);
+                    let web_view = rich_web_view.clone();
+                    glib::spawn_future_local(async move {
+                        let _ = web_view.evaluate_javascript_future(&script, None, None).await;
+                    });
+                } else {
+                    body_view.buffer().insert_at_cursor(&template.text);
+                }
+            });
+            dialog.present(Some(&parent));
         });
     }
     // --- The composer's command ribbon. The controls were built above; the
@@ -2573,7 +2563,7 @@ pub fn build_compose_view(
         group.small_button(&signature_button, signature_icon, "Signature");
     });
     insert_band.group("Insert", |group| {
-        group.menu(&templates_button, "edit-copy-symbolic", "Templates");
+        group.button(&templates_button, "edit-copy-symbolic", "Templates");
         group.small_button(&format.table, "view-grid-symbolic", "Table");
         group.small_button(&format.image, "insert-image-symbolic", "Picture");
         group.small_menu(&format.emoji, "face-smile-symbolic", "Emoji");
