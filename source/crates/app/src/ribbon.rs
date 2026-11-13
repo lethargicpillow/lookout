@@ -492,8 +492,9 @@ impl RibbonGroup {
         self.register_widget(widget, glib::WeakRef::new(), glib::WeakRef::new(), glib::WeakRef::new(), RibbonSize::Small);
     }
 
-    /// Mark the controls dressed from here on as ones whose icon says what
-    /// they are (Bold, Italic): the Simplified row shows them without labels.
+    /// Test-only legacy icon-only mode. Production formatting now uses the
+    /// dedicated Basic Text grid; retain coverage of the compact layout path.
+    #[cfg(test)]
     pub(crate) fn plain(&self) {
         self.plain.set(true);
     }
