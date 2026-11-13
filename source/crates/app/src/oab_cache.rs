@@ -12,6 +12,9 @@ use lookout_graph::DirectoryPerson;
 use crate::window::UiState;
 use crate::directory::DirectoryBackend;
 
+/// Batch size for the paged recipient/address-book picker. People GAL uses a virtualized full list.
+pub(crate) const PAGE_SIZE: usize = 100;
+
 fn cache_root() -> PathBuf {
     gtk::glib::user_data_dir().join("lookout").join("gal")
 }
