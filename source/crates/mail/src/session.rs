@@ -2278,6 +2278,10 @@ async fn connect_and_run(
             // user's folder. (Moved here from the old synchronous
             // `SendMessage` handler; batching keeps an N-message offline
             // outbox from costing N Sent syncs and N reselects.)
+            // SMTP has already committed delivery. Bound the follow-up IMAP
+            // refresh too: a stalled STATUS/FETCH must not freeze the account.
+            let refresh_result = tokio::time::timeout(Duration::from_secs(45), async {
+            tracing::debug!("send pipeline: post-send folder refresh starting");
             let mut selection_restored = false;
             if let Some(sent_id) = sent_to_sync {
                 if let Some(path) = sent_id.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) {
@@ -2350,6 +2354,16 @@ async fn connect_and_run(
                 // there's no Sent resync to restore the user's folder.
                 session.select(&current_mailbox_name).await?;
                 session_selected = current_mailbox_id.clone();
+            }
+            Ok::<(), Error>(())
+            }).await;
+            match refresh_result {
+                Ok(Ok(())) => tracing::debug!("send pipeline: post-send folder refresh completed"),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    tracing::warn!("post-send folder refresh timed out; reconnecting (SMTP delivery already confirmed)");
+                    return Err(Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "post-send folder refresh timed out")));
+                }
             }
             next_outbox_due = cache_op(cache, |c| c.next_outbox_not_before()).await.and_then(|r| r.ok()).flatten();
             emit_outbox_contents(cache, events).await;
