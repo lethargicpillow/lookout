@@ -283,8 +283,8 @@ pub fn show_add_account_dialog(
         let mut builder = gtk::Window::builder()
             .modal(true)
             .title(if is_edit { "Edit mail account" } else { "Add mail account" })
-            .default_width(773)
-            .default_height(640);
+            .default_width(if is_edit { 773 } else { 640 })
+            .default_height(if is_edit { 640 } else { 390 });
         if let Some(win) = anchor.root().and_downcast::<gtk::Window>() {
             builder = builder.transient_for(&win);
         }
@@ -292,8 +292,8 @@ pub fn show_add_account_dialog(
     };
 
     // -- form fields --
-    let name_entry = gtk::Entry::builder().placeholder_text("Display name").build();
-    let email_entry = gtk::Entry::builder().placeholder_text("name@example.com").build();
+    let name_entry = gtk::Entry::builder().placeholder_text("Display name (optional)").hexpand(true).build();
+    let email_entry = gtk::Entry::builder().placeholder_text("name@example.com").hexpand(true).build();
 
     let oab_entry = gtk::Entry::builder().placeholder_text("https://exchange.example/OAB/GUID/oab.xml").hexpand(true).build();
     if let Some(account) = existing.as_ref() {
@@ -318,7 +318,9 @@ pub fn show_add_account_dialog(
 
     let same_password_switch = gtk::Switch::new();
     same_password_switch.set_active(true);
-    let imap_password_entry = gtk::PasswordEntry::builder().placeholder_text("Password").build();
+    let imap_password_entry = gtk::PasswordEntry::builder()
+        .placeholder_text(if is_edit { "Leave blank to keep saved password" } else { "Password" })
+        .show_peek_icon(true).hexpand(true).build();
     let smtp_password_entry = gtk::PasswordEntry::builder().placeholder_text("SMTP password").build();
     let smtp_password_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(8).build();
 
@@ -353,40 +355,61 @@ pub fn show_add_account_dialog(
         .build();
 
     let mut row = 0;
-    // Discovery is deliberately opt-in (click or Enter on the email field):
-    // do not contact external domains for each partially typed address.
     let detect_button = gtk::Button::with_label("Find settings");
-    let setup_status = gtk::Label::builder().wrap(true).halign(gtk::Align::Start).css_classes(["dim-label"]).build();
+    detect_button.set_halign(gtk::Align::End);
+    let setup_status = gtk::Label::builder().wrap(true).halign(gtk::Align::Start)
+        .xalign(0.0).css_classes(["dim-label"]).visible(false).build();
     let approve_button = gtk::Button::with_label("Trust this server and continue");
     approve_button.set_visible(false);
     if !is_edit {
-        let intro = gtk::Label::builder().label("Enter your email address and password, then find settings. Exchange server settings are discovered automatically.").wrap(true).halign(gtk::Align::Start).build();
-        form.attach(&intro, 0, row, 4, 1);
+        let intro = gtk::Label::builder()
+            .label("Enter your email and password. Lookout will find your mail server settings automatically.")
+            .wrap(true).halign(gtk::Align::Start).xalign(0.0).build();
+        form.attach(&intro, 0, row, 2, 1);
         row += 1;
     }
+    form.attach(&field_label("Email address"), 0, row, 1, 1);
+    form.attach(&email_entry, 1, row, 1, 1);
+    row += 1;
+    form.attach(&field_label("Password"), 0, row, 1, 1);
+    form.attach(&imap_password_entry, 1, row, 1, 1);
+    row += 1;
     form.attach(&field_label("Name"), 0, row, 1, 1);
     form.attach(&name_entry, 1, row, 1, 1);
     row += 1;
-    form.attach(&field_label("Email address"), 0, row, 1, 1);
-    form.attach(&email_entry, 1, row, 1, 1);
-    if !is_edit { form.attach(&detect_button, 2, row, 2, 1); }
-    row += 1;
     if !is_edit {
-        form.attach(&setup_status, 1, row, 3, 1);
+        form.attach(&detect_button, 1, row, 1, 1);
         row += 1;
-        form.attach(&approve_button, 1, row, 3, 1);
+        form.attach(&setup_status, 0, row, 2, 1);
+        row += 1;
+        form.attach(&approve_button, 1, row, 1, 1);
         row += 1;
     }
-    form.attach(&field_label("IMAP server"), 0, row, 1, 1);
-    form.attach(&imap_host_entry, 1, row, 1, 1);
-    form.attach(&port_label("Port"), 2, row, 1, 1);
-    form.attach(&imap_port_spin, 3, row, 1, 1);
+
+    // Keep technical settings available for existing accounts and imported
+    // profiles, but out of the normal email/password discovery workflow.
+    let advanced = gtk::Expander::builder().label("Advanced server settings")
+        .expanded(is_edit || prefill.is_some()).hexpand(true).build();
+    let server_form = gtk::Grid::builder().column_spacing(12).row_spacing(8)
+        .margin_top(12).hexpand(true).build();
+    advanced.set_child(Some(&server_form));
+    form.attach(&advanced, 0, row, 2, 1);
     row += 1;
-    form.attach(&field_label("IMAP username"), 0, row, 1, 1);
-    form.attach(&imap_username_entry, 1, row, 1, 1);
+    let error_label = gtk::Label::builder().halign(gtk::Align::Start).xalign(0.0)
+        .css_classes(["error"]).wrap(true).visible(false).build();
+    form.attach(&error_label, 0, row, 2, 1);
+
+    let mut row = 0;
+    server_form.attach(&field_label("IMAP server"), 0, row, 1, 1);
+    server_form.attach(&imap_host_entry, 1, row, 1, 1);
+    server_form.attach(&port_label("Port"), 2, row, 1, 1);
+    server_form.attach(&imap_port_spin, 3, row, 1, 1);
     row += 1;
-    form.attach(&field_label("IMAP security"), 0, row, 1, 1);
-    form.attach(&imap_security_dropdown, 1, row, 1, 1);
+    server_form.attach(&field_label("IMAP username"), 0, row, 1, 1);
+    server_form.attach(&imap_username_entry, 1, row, 1, 1);
+    row += 1;
+    server_form.attach(&field_label("IMAP security"), 0, row, 1, 1);
+    server_form.attach(&imap_security_dropdown, 1, row, 1, 1);
     row += 1;
 
     let same_server_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(12).hexpand(true).build();
@@ -394,7 +417,7 @@ pub fn show_add_account_dialog(
     crate::privacy::mark_ui(&same_server_label);
     same_server_row.append(&same_server_label);
     same_server_row.append(&same_server_switch);
-    form.attach(&same_server_row, 1, row, 3, 1);
+    server_form.attach(&same_server_row, 1, row, 3, 1);
     row += 1;
 
     let smtp_host_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(12).build();
@@ -408,11 +431,11 @@ pub fn show_add_account_dialog(
     smtp_username_row.append(&smtp_username_entry);
     smtp_fields_box.append(&smtp_host_row);
     smtp_fields_box.append(&smtp_username_row);
-    form.attach(&field_label("SMTP"), 0, row, 1, 1);
-    form.attach(&smtp_fields_box, 1, row, 3, 1);
+    server_form.attach(&field_label("SMTP"), 0, row, 1, 1);
+    server_form.attach(&smtp_fields_box, 1, row, 3, 1);
     row += 1;
-    form.attach(&field_label("SMTP security"), 0, row, 1, 1);
-    form.attach(&smtp_security_dropdown, 1, row, 1, 1);
+    server_form.attach(&field_label("SMTP security"), 0, row, 1, 1);
+    server_form.attach(&smtp_security_dropdown, 1, row, 1, 1);
     row += 1;
     let plain_note = gtk::Label::builder()
         .label("Without encryption, your password and mail cross the network unprotected.")
@@ -421,7 +444,7 @@ pub fn show_add_account_dialog(
         .css_classes(["warning"])
         .build();
     crate::privacy::mark_ui(&plain_note);
-    form.attach(&plain_note, 1, row, 3, 1);
+    server_form.attach(&plain_note, 1, row, 3, 1);
     row += 1;
 
     let same_password_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(12).hexpand(true).build();
@@ -433,25 +456,18 @@ pub fn show_add_account_dialog(
     crate::privacy::mark_ui(&same_password_label);
     same_password_row.append(&same_password_label);
     same_password_row.append(&same_password_switch);
-    form.attach(&same_password_row, 1, row, 3, 1);
+    server_form.attach(&same_password_row, 1, row, 3, 1);
     row += 1;
 
-    form.attach(&field_label("Password"), 0, row, 1, 1);
-    form.attach(&imap_password_entry, 1, row, 3, 1);
-    row += 1;
     smtp_password_box.append(&smtp_password_entry);
-    form.attach(&smtp_password_box, 1, row, 3, 1);
+    server_form.attach(&smtp_password_box, 1, row, 3, 1);
     row += 1;
 
-    form.attach(&field_label("Exchange OAB URL"), 0, row, 1, 1);
-    form.attach(&oab_entry, 1, row, 3, 1);
+    server_form.attach(&field_label("Exchange OAB URL"), 0, row, 1, 1);
+    server_form.attach(&oab_entry, 1, row, 3, 1);
     row += 1;
     let oab_hint = gtk::Label::builder().label("Optional: full HTTPS manifest URL for DavMail GAL automatic updates. Uses the saved IMAP password. Clear to disable.").wrap(true).halign(gtk::Align::Start).css_classes(["dim-label"]).build();
-    form.attach(&oab_hint, 1, row, 3, 1);
-    row += 1;
-
-    let error_label = gtk::Label::builder().halign(gtk::Align::Start).css_classes(["error"]).wrap(true).visible(false).build();
-    form.attach(&error_label, 0, row, 4, 1);
+    server_form.attach(&oab_hint, 1, row, 3, 1);
 
     // SMTP mirrors IMAP unless told otherwise.
     for (slave, master) in [(&smtp_host_entry, &imap_host_entry), (&smtp_username_entry, &imap_username_entry)] {
@@ -465,9 +481,12 @@ pub fn show_add_account_dialog(
         });
     }
     same_server_switch.connect_state_set({
-        let smtp_fields_box = smtp_fields_box.clone();
+        let host = smtp_host_entry.clone();
+        let username = smtp_username_entry.clone();
         move |_switch, state| {
-            smtp_fields_box.set_sensitive(!state);
+            // Sharing the hostname/login must not disable the SMTP port.
+            host.set_sensitive(!state);
+            username.set_sensitive(!state);
             glib::Propagation::Proceed
         }
     });
@@ -482,7 +501,8 @@ pub fn show_add_account_dialog(
     // `set_active` seed above - sync the dependent fields' visibility once
     // up front so an edit dialog opened with "same server"/"same password"
     // off starts with the right fields shown.
-    smtp_fields_box.set_sensitive(!same_server_switch.is_active());
+    smtp_host_entry.set_sensitive(!same_server_switch.is_active());
+    smtp_username_entry.set_sensitive(!same_server_switch.is_active());
     smtp_password_box.set_visible(!same_password_switch.is_active());
 
     // Changing the security mode moves a standard port to the new mode's
@@ -527,6 +547,65 @@ pub fn show_add_account_dialog(
     root.append(&scroller);
     root.append(&footer);
     dialog.set_child(Some(&root));
+    {
+        let dialog = dialog.downgrade();
+        advanced.connect_expanded_notify(move |expander| {
+            if let Some(dialog) = dialog.upgrade() {
+                if expander.is_expanded() {
+                    dialog.set_default_size(773, 700);
+                } else if !is_edit {
+                    dialog.set_default_size(640, 390);
+                }
+            }
+        });
+    }
+    // A new account needs discovery (or explicit advanced configuration)
+    // before saving. Editing an existing profile retains its saved secret.
+    let ready = Rc::new(std::cell::Cell::new(is_edit || prefill.is_some()));
+    let running = Rc::new(std::cell::Cell::new(false));
+    let refresh_actions: Rc<dyn Fn()> = {
+        let email = email_entry.clone();
+        let password = imap_password_entry.clone();
+        let button = detect_button.clone();
+        let save = save_button.clone();
+        let advanced = advanced.clone();
+        let ready = ready.clone();
+        let running = running.clone();
+        Rc::new(move || {
+            let credentials = crate::recipient_entry::is_plausible_address(email.text().trim())
+                && !password.text().is_empty();
+            button.set_sensitive(!running.get() && credentials);
+            save.set_sensitive(!running.get() && (is_edit || (credentials && (ready.get() || advanced.is_expanded()))));
+        })
+    };
+    refresh_actions();
+    if !is_edit {
+        let refresh = refresh_actions.clone();
+        let ready = ready.clone();
+        let status = setup_status.clone();
+        let approve = approve_button.clone();
+        let oab = oab_entry.clone();
+        let name = name_entry.clone();
+        let previous = Rc::new(RefCell::new(email_entry.text().trim().to_owned()));
+        email_entry.connect_changed(move |entry| {
+            let address = entry.text().trim().to_owned();
+            let mut old = previous.borrow_mut();
+            if *old != address {
+                if ready.replace(false) {
+                    oab.set_text("");
+                    if name.text().as_str() == old.as_str() { name.set_text(""); }
+                }
+                *old = address;
+                status.set_visible(false);
+                approve.set_visible(false);
+            }
+            refresh();
+        });
+        let refresh = refresh_actions.clone();
+        imap_password_entry.connect_changed(move |_| refresh());
+        let refresh = refresh_actions.clone();
+        advanced.connect_expanded_notify(move |_| refresh());
+    }
 
     {
         let dialog = dialog.clone();
@@ -550,13 +629,15 @@ pub fn show_add_account_dialog(
             let su = smtp_username_entry.clone();
             let same = same_server_switch.clone();
             let same_password = same_password_switch.clone();
-            let smtp_box = smtp_fields_box.clone();
+            let smtp_box_host = smtp_host_entry.clone();
+            let smtp_box_user = smtp_username_entry.clone();
             let password_box = smtp_password_box.clone();
             Rc::new(move |imap: crate::account_setup::Server, smtp: crate::account_setup::Server| {
                 if name.text().trim().is_empty() { name.set_text(&email.text()); }
                 same.set_active(imap.host == smtp.host && imap.username == smtp.username);
                 same_password.set_active(true);
-                smtp_box.set_sensitive(!same.is_active());
+                smtp_box_host.set_sensitive(!same.is_active());
+                smtp_box_user.set_sensitive(!same.is_active());
                 password_box.set_visible(false);
                 ih.set_text(&imap.host);
                 is.set_selected(security_position(imap.security));
@@ -568,7 +649,6 @@ pub fn show_add_account_dialog(
                 su.set_text(&smtp.username);
             })
         };
-        let running = Rc::new(std::cell::Cell::new(false));
         let approved = Rc::new(RefCell::new(Vec::<String>::new()));
         let pending = Rc::new(RefCell::new(None::<String>));
         let detected_address = Rc::new(RefCell::new(String::new()));
@@ -586,8 +666,12 @@ pub fn show_add_account_dialog(
             let approved = approved.clone();
             let pending = pending.clone();
             let detected_address = detected_address.clone();
+            let ready = ready.clone();
+            let refresh = refresh_actions.clone();
             Rc::new(move || {
-                if running.replace(true) { return; }
+                if running.get() || !crate::recipient_entry::is_plausible_address(email.text().trim()) || password.text().is_empty() { return; }
+                running.set(true);
+                ready.set(false);
                 let address = email.text().trim().to_owned();
                 if *detected_address.borrow() != address {
                     approved.borrow_mut().clear();
@@ -598,6 +682,8 @@ pub fn show_add_account_dialog(
                 approve.set_visible(false);
                 save_button.set_sensitive(false);
                 status.set_label("Discovering mail and Exchange settings…");
+                status.set_visible(true);
+                refresh();
                 let (tx, rx) = async_channel::bounded(1);
                 let request = address.clone();
                 let secret = password.text().to_string();
@@ -620,24 +706,30 @@ pub fn show_add_account_dialog(
                     };
                     let _ = tx.send(result).await;
                 });
-                let (email, button, approve, oab, status, apply, running, save_button, pending, password) =
-                    (email.clone(), button.clone(), approve.clone(), oab.clone(), status.clone(), apply.clone(), running.clone(), save_button.clone(), pending.clone(), password.clone());
+                let (email, approve, oab, status, apply, running, pending, password) =
+                    (email.clone(), approve.clone(), oab.clone(), status.clone(), apply.clone(), running.clone(), pending.clone(), password.clone());
+                let ready = ready.clone();
+                let refresh = refresh.clone();
                 glib::spawn_future_local(async move {
                     let result = rx.recv().await;
                     running.set(false);
-                    button.set_sensitive(true);
-                    save_button.set_sensitive(true);
+                    refresh();
                     if email.text().trim() != address { status.set_label("Email changed. Find settings again."); return; }
                     match result {
                         Ok(Ok(Discovery::Mail { imap, smtp })) => {
+                            oab.set_text("");
                             apply(imap, smtp);
-                            status.set_label("Secure IMAP/SMTP settings found. Add the account to verify your password.");
+                            ready.set(true);
+                            refresh();
+                            status.set_label("Mail settings found. Add account to verify and connect.");
                         }
                         Ok(Ok(Discovery::Exchange { ews: Some(_), oab: discovered_oab })) => {
-                            if let Some(url) = discovered_oab { oab.set_text(&url); }
+                            oab.set_text(discovered_oab.as_deref().unwrap_or(""));
                             let server = |port| crate::account_setup::Server { host: "127.0.0.1".into(), port, security: Security::Plain, username: address.clone() };
                             apply(server(1143), server(1025));
-                            status.set_label("Exchange discovered and DavMail ready. Add the account to verify sign-in; calendar and contacts use the same account.");
+                            ready.set(true);
+                            refresh();
+                            status.set_label("Exchange found. Mail, calendar and contacts are ready to connect.");
                         }
                         Ok(Ok(Discovery::PasswordRequired | Discovery::Exchange { ews: None, .. })) => {
                             status.set_label("Exchange requires authentication. Enter your password and find settings again.");
@@ -660,8 +752,8 @@ pub fn show_add_account_dialog(
             detect_button.connect_clicked(move |_| detect());
         }
         {
-            let detect = detect.clone();
-            email_entry.connect_activate(move |_| detect());
+            let password = imap_password_entry.clone();
+            email_entry.connect_activate(move |_| { password.grab_focus(); });
         }
         {
             let detect = detect.clone();
@@ -690,8 +782,9 @@ pub fn show_add_account_dialog(
         let email_entry = email_entry.clone();
         let dialog = dialog.clone();
         move || {
-            let name = name_entry.text().trim().to_string();
+            if !save_button.is_sensitive() { return; }
             let email = email_entry.text().trim().to_string();
+            let name = if name_entry.text().trim().is_empty() { email.clone() } else { name_entry.text().trim().to_string() };
             let imap_host = imap_host_entry.text().trim().to_string();
             let imap_port = imap_port_spin.value_as_int().clamp(1, 65535) as u16;
             let imap_security = selected_security(&imap_security_dropdown);
@@ -761,7 +854,6 @@ pub fn show_add_account_dialog(
             // account isn't half-configured. Blank password fields (the
             // edit-without-changing-the-password case) skip that slot's
             // write entirely, leaving the existing keyring entry untouched.
-            if !save_button.is_sensitive() { return; }
             save_button.set_sensitive(false);
             let verify = existing.is_none();
             if verify {
