@@ -94,6 +94,7 @@ impl ComposeActionBar {
 /// the pane shows the loading page; a failure or timeout drops back to
 /// "empty" with a toast. No-op when the message's account isn't connected.
 pub(crate) fn open_draft_composer(state: &Rc<RefCell<UiState>>, reading_stack: &gtk::Stack, summary: &EmailSummary) {
+    if !crate::window_input::accepts_input(reading_stack) { return; }
     if mailbox_account_id(&summary.mailbox).is_none() {
         return;
     }
@@ -294,7 +295,9 @@ pub(crate) fn show_composer_in_reading_pane_full(
     // rather than displacing it and losing edits before its autosave tick.
     let existing_window = state.borrow().compose_popout_window.as_ref().map(|(_, win)| win.clone());
     if let Some(win) = existing_window {
-        win.present();
+        // A late draft fetch or another background event must not raise an
+        // existing editor over a different application.
+        if crate::window_input::any_active_window() { win.present(); }
         return;
     }
     if reading_stack.child_by_name("compose").is_some() {

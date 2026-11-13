@@ -2421,6 +2421,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let worker = worker.clone();
         let reading_stack = reading_stack.clone();
         message_list_view.connect_activate(move |view, position| {
+            if !crate::window_input::focus_is_within(view) { return; }
             let Some(summary) = message_list.summary_at_position(position) else { return };
             // A draft opens in the composer, not the read-only window (item
             // 1.12): editing is the only useful thing to do with one.
@@ -10291,7 +10292,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let file_mode = file_mode.clone();
         let file_mode_close = file_mode_close.clone();
         let controller = gtk::EventControllerKey::new();
-        controller.connect_key_pressed(move |_controller, keyval, keycode, state_modifiers| {
+        controller.connect_key_pressed(move |controller, keyval, keycode, state_modifiers| {
+            if !controller.widget().is_some_and(|widget| crate::window_input::accepts_input(&widget)) {
+                return glib::Propagation::Stop;
+            }
             if file_mode.get() {
                 if keyval == gtk::gdk::Key::Escape && (state_modifiers & crate::shortcuts::MODIFIER_MASK).is_empty() {
                     let close = file_mode_close.borrow().clone();

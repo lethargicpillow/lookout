@@ -538,7 +538,8 @@ impl RecipientEntry {
         // from whatever comes next.
         {
             let this = self.clone();
-            self.entry.connect_activate(move |_| {
+            self.entry.connect_activate(move |entry| {
+                if !crate::window_input::accepts_input(entry) { return; }
                 if this.take_selected_suggestion() {
                     return;
                 }
@@ -919,6 +920,7 @@ impl RecipientEntry {
     }
 
     fn show_completion(&self) {
+        if !crate::window_input::accepts_input(&self.entry) { return; }
         if let Some(popover) = &self.popover {
             if !popover.is_visible() { popover.popup(); }
         } else if self.completion_panel.parent().is_some() {
@@ -928,6 +930,7 @@ impl RecipientEntry {
     }
 
     fn focus_within_completion(&self) -> bool {
+        if !crate::window_input::accepts_input(&self.entry) { return false; }
         // GtkRoot retains the logical focus widget even when the X11 popup
         // momentarily changes the active native surface.
         let Some(root) = self.entry.root() else { return false; };

@@ -829,7 +829,7 @@ pub(crate) fn install_search_history(state: &Rc<RefCell<UiState>>, search_entry:
         let popover = history_popover.clone();
         let entry = search_entry.clone();
         focus.connect_enter(move |_| {
-            if entry.text().is_empty() {
+            if entry.text().is_empty() && crate::window_input::accepts_input(&entry) {
                 refresh_history();
                 popover.popup();
             }

@@ -110,6 +110,7 @@ mod trusted_senders;
 mod ui_state_db;
 mod util;
 mod window;
+mod window_input;
 mod worker;
 
 use std::cell::{Cell, RefCell};
@@ -229,6 +230,7 @@ fn main() -> glib::ExitCode {
     app.connect_activate(move |app| {
         let display = gtk::gdk::Display::default().expect("GTK initializes a display");
         crate::resources::register(&display);
+        crate::window_input::install();
 
         let existing = window.borrow().clone();
         if let Some(win) = existing {

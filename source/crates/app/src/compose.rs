@@ -3257,7 +3257,7 @@ pub fn build_compose_view(
         let dock_button = dock_button.clone();
         let editor_toolbar = editor_toolbar.clone();
         pop_out_button.connect_clicked(move |_| {
-            if popped_out.get() {
+            if !crate::window_input::accepts_input(&content) || popped_out.get() {
                 return;
             }
             moving.set(true);
