@@ -6137,7 +6137,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             search_clear_button.connect_clicked(move |_| entry.set_text(""));
         }
 
-        install_search_history(&state, &search_entry);
     }
 
     // The nav rail runs the full height *below the title bar* - it sits
@@ -6340,6 +6339,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // than the window, clipping the ribbon and even window header controls.
     window_overlay.set_measure_overlay(&toast_overlay, true);
     window_overlay.set_clip_overlay(&toast_overlay, true);
+    install_search_history(&state, &search_entry, &window_overlay);
     // The application, rather than its wallpaper, defines the usable size.
     // Avoid a permanent minimum from the hidden ribbon pages or a fixed
     // search box; the content can now shrink before the window is clamped.

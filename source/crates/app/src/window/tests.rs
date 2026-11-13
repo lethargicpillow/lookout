@@ -3282,8 +3282,9 @@ fn search_history_keeps_entry_focus_and_dismisses_on_edit_escape_and_navigation(
     let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
     content.append(&entry);
     content.append(&other);
-    let window = gtk::Window::builder().child(&content).build();
-    let popover = install_search_history(&state, &entry);
+    let host = gtk::Overlay::builder().child(&content).build();
+    let window = gtk::Window::builder().default_width(400).default_height(300).child(&host).build();
+    let (popover, history) = install_search_history(&state, &entry, &host);
     window.present();
     let drain = || {
         let context = glib::MainContext::default();
@@ -3298,7 +3299,8 @@ fn search_history_keeps_entry_focus_and_dismisses_on_edit_escape_and_navigation(
     };
     entry.grab_focus();
     drain();
-    assert!(!popover.is_autohide(), "history must never grab input from the window");
+    assert!(!popover.is::<gtk::Popover>(), "history must never create a native popup");
+    assert_eq!(popover.parent().as_ref(), Some(host.upcast_ref::<gtk::Widget>()));
     assert!(popover.is_visible());
     let focus = gtk::prelude::GtkWindowExt::focus(&window).unwrap();
     assert!(focus == entry || focus.is_ancestor(&entry));
@@ -3314,7 +3316,6 @@ fn search_history_keeps_entry_focus_and_dismisses_on_edit_escape_and_navigation(
 
     refocus();
     assert!(popover.is_visible());
-    let history = popover.child().unwrap().downcast::<gtk::Box>().unwrap();
     let query = history.first_child().unwrap().downcast::<gtk::Button>().unwrap();
     assert!(!query.gets_focus_on_click(), "clicking a query keeps focus in the entry");
     query.emit_clicked();
@@ -3329,7 +3330,6 @@ fn search_history_keeps_entry_focus_and_dismisses_on_edit_escape_and_navigation(
     assert!(!popover.is_visible(), "other controls must remain reachable");
     assert!(other.has_focus());
     window.destroy();
-    popover.unparent();
 }
 
 #[test]

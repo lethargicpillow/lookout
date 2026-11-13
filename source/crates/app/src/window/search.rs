@@ -769,16 +769,9 @@ pub(crate) fn mention_identity_lists(identities: &[lookout_core::Identity]) -> (
     (addresses, names)
 }
 
-/// Installs the title-bar search's recent-search list (Outlook's history
-/// dropdown): a popover anchored to `search_entry`, shown when the entry
-/// gains focus while empty. Returns the popover (tests).
-///
-/// The popover is deliberately not autohide. An autohide popover takes an
-/// input grab, so while it was up the rest of the window ignored clicks, and
-/// when the grab ended focus returned to the entry, which reopened it. The
-/// list instead follows the entry: it closes when the entry loses focus, when
-/// its text changes (typing, or picking a query), and on Escape.
-pub(crate) fn install_search_history(state: &Rc<RefCell<UiState>>, search_entry: &gtk::SearchEntry) -> gtk::Popover {
+/// Recent searches are a clipped overlay of the title bar's own window.
+/// It follows entry focus without creating a native popup or input grab.
+pub(crate) fn install_search_history(state: &Rc<RefCell<UiState>>, search_entry: &gtk::SearchEntry, host: &gtk::Overlay) -> (gtk::ScrolledWindow, gtk::Box) {
     let history_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(2)
@@ -787,10 +780,33 @@ pub(crate) fn install_search_history(state: &Rc<RefCell<UiState>>, search_entry:
         .margin_start(6)
         .margin_end(6)
         .build();
-    let history_popover = gtk::Popover::new();
-    history_popover.set_autohide(false);
-    history_popover.set_child(Some(&history_box));
-    history_popover.set_parent(search_entry);
+    let history_popover = gtk::ScrolledWindow::builder().child(&history_box)
+        .propagate_natural_height(true).max_content_height(260)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .focusable(false).visible(false)
+        .css_classes(["compose-completion-panel", "lookout-transient-panel"]).build();
+    host.add_overlay(&history_popover);
+    host.set_measure_overlay(&history_popover, false);
+    host.set_clip_overlay(&history_popover, true);
+    {
+        let panel = history_popover.downgrade();
+        let entry = search_entry.downgrade();
+        host.connect_get_child_position(move |host, child| {
+            let panel = panel.upgrade()?;
+            if child != panel.upcast_ref::<gtk::Widget>() { return None; }
+            let bounds = entry.upgrade()?.compute_bounds(host)?;
+            let width = host.width().max(1);
+            let height = host.height().max(1);
+            let w = (bounds.width().ceil() as i32).max(240).min(width).max(1);
+            let x = (bounds.x().floor() as i32).clamp(0, width - w);
+            let h = child.measure(gtk::Orientation::Vertical, w).1.clamp(1, 260).min(height);
+            let top = bounds.y().floor() as i32;
+            let bottom = (bounds.y() + bounds.height()).ceil() as i32;
+            let y = if bottom + h <= height { bottom } else { top - h };
+            Some(gtk::gdk::Rectangle::new(x, y.clamp(0, height - h), w, h))
+        });
+    }
     let refresh_history: Rc<dyn Fn()> = {
         let state = state.clone();
         let entry = search_entry.clone();
@@ -831,22 +847,27 @@ pub(crate) fn install_search_history(state: &Rc<RefCell<UiState>>, search_entry:
         focus.connect_enter(move |_| {
             if entry.text().is_empty() && crate::window_input::accepts_input(&entry) {
                 refresh_history();
-                popover.popup();
+                popover.set_visible(true);
+                if let Some(host) = popover.parent() { host.queue_allocate(); }
             }
         });
     }
     {
         let popover = history_popover.clone();
-        focus.connect_leave(move |_| popover.popdown());
+        focus.connect_leave(move |_| popover.set_visible(false));
     }
     search_entry.add_controller(focus);
     {
         let popover = history_popover.clone();
-        search_entry.connect_changed(move |_| popover.popdown());
+        search_entry.connect_changed(move |_| popover.set_visible(false));
     }
     {
         let popover = history_popover.clone();
-        search_entry.connect_stop_search(move |_| popover.popdown());
+        search_entry.connect_stop_search(move |_| popover.set_visible(false));
     }
-    history_popover
+    {
+        let panel = history_popover.clone();
+        search_entry.connect_unmap(move |_| panel.set_visible(false));
+    }
+    (history_popover, history_box)
 }
