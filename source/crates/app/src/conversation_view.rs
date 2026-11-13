@@ -267,7 +267,7 @@ pub fn body_srcdoc(body: &EmailBody, card: usize, images_allowed: bool, all_allo
     };
     let theme = if dark { crate::window::MESSAGE_THEME_OVERRIDE_CSS } else { "" };
     let html = format!("{}<style>{BODY_BASE_CSS}{theme}</style>", qualify_cid_refs(&html, card));
-    crate::window::wrap_message_with_csp(&html, images_allowed, all_allowed)
+    crate::window::wrap_mail_message_with_csp(&html, images_allowed, all_allowed)
 }
 
 /// Base style inside every body frame: no outer margin (the card pads it),
@@ -520,8 +520,8 @@ pub fn js_restore_scroll(y: f64) -> String {
 /// The conversation document's own look: libadwaita-like cards in light
 /// and dark, following the system scheme.
 const DOCUMENT_CSS: &str = r#"
-:root { color-scheme: light dark; --bg: #fafafb; --card: #ffffff; --fg: #1e1e20; --dim: #6b6b70; --line: rgba(0,0,0,.09); --accent: #3584e4; --chip: rgba(0,0,0,.06); --note: #fdf4d7; }
-@media (prefers-color-scheme: dark) { :root { --bg: #222226; --card: #2e2e32; --fg: #f0f0f2; --dim: #a0a0a8; --line: rgba(255,255,255,.1); --accent: #78aeed; --chip: rgba(255,255,255,.1); --note: #4a4120; } }
+:root { color-scheme: light dark; --bg: #fafafb; --card: #ffffff; --fg: #1e1e20; --dim: #6b6b70; --line: rgba(0,0,0,.20); --accent: #3584e4; --chip: rgba(0,0,0,.06); --note: #fdf4d7; }
+@media (prefers-color-scheme: dark) { :root { --bg: #222226; --card: #2e2e32; --fg: #f0f0f2; --dim: #a0a0a8; --line: rgba(255,255,255,.24); --accent: #78aeed; --chip: rgba(255,255,255,.1); --note: #4a4120; } }
 html, body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; }
 body { padding: 8px 12px 16px; }
 .toolbar { display: flex; align-items: center; gap: 12px; padding: 0 4px 8px; color: var(--dim); font-size: 12px; }
@@ -529,7 +529,7 @@ body { padding: 8px 12px 16px; }
 button { font: inherit; color: inherit; }
 button.link { background: none; border: 0; padding: 0; color: var(--accent); cursor: pointer; }
 button.link:hover { text-decoration: underline; }
-.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; margin: 0 0 8px; overflow: hidden; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; margin: 0 0 12px; overflow: hidden; }
 .card.unread { box-shadow: inset 3px 0 0 var(--accent); }
 .head { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; cursor: pointer; outline: none; }
 .head:focus-visible { box-shadow: inset 0 0 0 2px var(--accent); border-radius: 10px; }
@@ -547,7 +547,7 @@ button.link:hover { text-decoration: underline; }
 .recipients, .preview { color: var(--dim); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .card:not(.expanded) .recipients, .card.expanded .preview { display: none; }
 .content { display: none; padding: 0 12px 10px 54px; }
-.card.expanded .content { display: block; }
+.card.expanded .content { display: block; border-top: 1px solid var(--line); padding-top: 10px; }
 .note { background: var(--note); border-radius: 6px; padding: 6px 10px; margin: 0 0 8px; font-size: 12px; }
 .attachments { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px; }
 .tile { display: flex; flex-direction: column; align-items: flex-start; max-width: 220px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); cursor: pointer; }
