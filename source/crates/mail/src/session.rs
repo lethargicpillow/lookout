@@ -1639,6 +1639,19 @@ pub async fn run_account_session(
         tokio::spawn(run_davmail_draft_worker(config.clone(), credentials.clone(), events.clone(), offline_rx.clone(), rx));
         Some(tx)
     } else { None };
+    // Keep DavMail preview downloads on a separate connection, never on
+    // the primary session that handles opening folders and sending mail.
+    let preview_task = davmail_saves_sent(&config.imap, &config.smtp).then(|| {
+        tokio::spawn(run_davmail_preview_worker(config.clone(), credentials.clone(), cache.clone(), events.clone(), mailbox_tx.subscribe(), offline_rx.clone()))
+    });
+    // Abort the worker when the account session exits (including task cancellation).
+    struct PreviewTaskGuard(Option<tokio::task::JoinHandle<()>>);
+    impl Drop for PreviewTaskGuard {
+        fn drop(&mut self) {
+            if let Some(task) = self.0.take() { task.abort(); }
+        }
+    }
+    let _preview_task = PreviewTaskGuard(preview_task);
 
     loop {
         // Work Offline (M-40): no network module runs while the user has
@@ -2976,7 +2989,11 @@ async fn connect_and_run(
                     // list glyph and the Mentions filter on demand.
                     let matcher = mention_matcher(cache);
                     let mut mentions: HashMap<Uid, bool> = HashMap::new();
+                    let mut previews = HashMap::new();
                     for (uid, body) in bodies {
+                        if let Some(preview) = crate::body::preview_from_body(&body) {
+                            previews.insert(uid, preview);
+                        }
                         if crate::body::mentions_in_body(&matcher, &body) {
                             mentions.insert(uid, true);
                         }
@@ -2988,11 +3005,12 @@ async fn connect_and_run(
                             })
                             .await;
                     }
-                    if !mentions.is_empty() {
+                    if !previews.is_empty() || !mentions.is_empty() {
                         if let Some(Err(e)) = cache_op(cache, {
                             let mailbox = mailbox.clone();
                             let mentions = mentions.clone();
-                            move |c| c.update_previews(&mailbox, &HashMap::new(), &mentions)
+                            let previews = previews.clone();
+                            move |c| c.update_previews_for_validity(&mailbox, uidvalidity, &previews, &mentions)
                         })
                         .await
                         {
@@ -3001,7 +3019,7 @@ async fn connect_and_run(
                         let _ = events
                             .send(AccountEvent::PreviewsFetched {
                                 mailbox: mailbox.clone(),
-                                previews: HashMap::new(),
+                                previews,
                                 mentions,
                             })
                             .await;
@@ -8027,6 +8045,102 @@ async fn emit_messages(mailbox_id: &MailboxId, uidvalidity: UidValidity, message
     // A sync can bring flags set by another client, so the Tasks view's
     // flagged-mail list is re-read too.
     emit_flagged_messages(cache, events).await;
+}
+
+/// DavMail cannot reliably serve partial MIME fetches. Backfill snippets
+/// from cached bodies first, then a small number of complete small messages
+/// on a disposable connection. Only the newest 30 in the selected folder
+/// are considered; no bulk attachment download or main-session lock.
+async fn run_davmail_preview_worker(
+    config: AccountConfig,
+    credentials: std::sync::Arc<dyn CredentialProvider>,
+    cache: CacheHandle,
+    events: async_channel::Sender<AccountEvent>,
+    mut mailbox_rx: tokio::sync::watch::Receiver<MailboxId>,
+    mut offline: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {},
+            changed = mailbox_rx.changed() => { if changed.is_err() { return; } },
+            changed = offline.changed() => { if changed.is_err() { return; } },
+        }
+        if *offline.borrow() { continue; }
+        let mailbox = mailbox_rx.borrow_and_update().clone();
+        let Some(path) = mailbox.0.strip_prefix(&format!("{}:", config.account_id.0)).map(str::to_owned) else { continue; };
+        let Some(Ok((validity, candidates, mut previews))) = cache_op(&cache, {
+            let mailbox = mailbox.clone();
+            let account = config.account_id.clone();
+            move |c| -> Result<_> {
+                let Some(folder) = c.load_mailboxes(&account)?.into_iter().find(|f| f.id == mailbox) else {
+                    return Ok((UidValidity(0), Vec::new(), HashMap::new()));
+                };
+                let mut messages = c.load_messages_by_uid(&mailbox, folder.uidvalidity)?.into_values().collect::<Vec<_>>();
+                messages.sort_by_key(|m| std::cmp::Reverse(m.uid.0));
+                messages.truncate(30);
+                let wanted = messages.iter().filter(|m| m.preview.is_none()).map(|m| m.uid).collect::<Vec<_>>();
+                let bodies = c.load_bodies(&mailbox, &wanted, folder.uidvalidity)?;
+                let mut previews = HashMap::new();
+                let mut candidates = Vec::new();
+                for m in messages.into_iter().filter(|m| m.preview.is_none()) {
+                    if let Some(body) = bodies.get(&m.uid) {
+                        previews.insert(m.uid, crate::body::preview_from_body(body).unwrap_or_default());
+                    } else if m.size > 0 && m.size <= 512 * 1024 && candidates.len() < 5 {
+                        candidates.push(m.uid);
+                    }
+                }
+                Ok((folder.uidvalidity, candidates, previews))
+            }
+        }).await else { continue; };
+        if validity.0 == 0 { continue; }
+        // Cached snippets need no server connection. Publish those even if
+        // a subsequent network fetch fails.
+        publish_davmail_previews(&cache, &events, &mailbox, validity, &mut previews).await;
+        if candidates.is_empty() || *offline.borrow() || mailbox_rx.has_changed().unwrap_or(true) { continue; }
+        let fetch = async {
+            let credential = credentials.imap_credential().await.map_err(Error::LoginFailed)?;
+            let (mut session, _) = login(&config, credential).await?;
+            let meta = session.select(&path).await?;
+            if meta.uid_validity != Some(validity.0) { return Ok::<(), Error>(()); }
+            for uid in candidates {
+                if *offline.borrow() || mailbox_rx.has_changed().unwrap_or(true) { break; }
+                if let Some(raw) = fetch_body(&mut session, uid).await? {
+                    let preview = preview_from_raw(&raw).unwrap_or_default();
+                    previews.insert(uid, preview);
+                    publish_davmail_previews(&cache, &events, &mailbox, validity, &mut previews).await;
+                }
+            }
+            Ok(())
+        };
+        match tokio::time::timeout(Duration::from_secs(15), fetch).await {
+            Ok(Ok(())) => {},
+            Ok(Err(e)) => tracing::debug!("DavMail preview fetch failed: {e}"),
+            Err(_) => tracing::debug!("DavMail preview fetch timed out"),
+        }
+    }
+}
+
+async fn publish_davmail_previews(
+    cache: &CacheHandle,
+    events: &async_channel::Sender<AccountEvent>,
+    mailbox: &MailboxId,
+    validity: UidValidity,
+    previews: &mut HashMap<Uid, String>,
+) {
+    if previews.is_empty() { return; }
+    let batch = std::mem::take(previews);
+    let stored = cache_op(cache, {
+        let mailbox = mailbox.clone();
+        let batch = batch.clone();
+        move |c| c.update_previews_for_validity(&mailbox, validity, &batch, &HashMap::new())
+    }).await;
+    if matches!(stored, Some(Ok(true))) {
+        let _ = events.send(AccountEvent::PreviewsFetched {
+            mailbox: mailbox.clone(), previews: batch, mentions: HashMap::new(),
+        }).await;
+    }
 }
 
 /// Fetches list-row snippets for the newest `PREVIEW_FETCH_LIMIT` messages in
