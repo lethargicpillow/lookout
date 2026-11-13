@@ -27,7 +27,13 @@ pub(crate) fn show_manager(
 ) {
     accounts.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.0.cmp(&b.0.0)));
     let accounts = Rc::new(accounts);
-    let Some(parent) = anchor.root().and_downcast::<gtk::Window>() else { return; };
+    // A caller can pass the captured toplevel directly, even when its
+    // originating ribbon control is temporarily detached.
+    let Some(parent) = anchor.clone().downcast::<gtk::Window>().ok()
+        .or_else(|| anchor.root().and_downcast::<gtk::Window>()) else {
+        tracing::warn!("signature manager: missing parent window");
+        return;
+    };
     // Only one manager per composer window. A nonmodal transient stays with
     // its parent without blocking the other Lookout windows.
     let toplevels = gtk::Window::toplevels();
