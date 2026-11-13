@@ -552,7 +552,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     let folder_list_view = gtk::ListView::new(Some(folder_selection.clone()), Some(folder_factory));
     folder_list_view.add_css_class("mail-folder-tree");
-    let folder_scroller = gtk::ScrolledWindow::builder().child(&folder_list_view).vexpand(true).build();
+    // Reserve a real scrollbar gutter: folder row actions, counts and sync
+    // spinners must never sit underneath GTK's overlay scrollbar.
+    let folder_scroller = gtk::ScrolledWindow::builder()
+        .child(&folder_list_view)
+        .vexpand(true)
+        .overlay_scrolling(false)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .build();
     let folder_card = card_section(&folder_scroller);
     folder_card.add_css_class("folder-pane");
     folder_card.add_css_class("mail-navigation-pane");
