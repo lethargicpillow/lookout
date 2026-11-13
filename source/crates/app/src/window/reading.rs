@@ -329,6 +329,87 @@ pub(crate) fn find_named_descendant(root: &impl IsA<gtk::Widget>, name: &str) ->
     None
 }
 
+/// Fit the embedded HTML document to the outer GTK viewport. A bounded
+/// measurement keeps large or unusual emails from imposing window minima.
+/// Only application-owned JS runs, in an isolated world. The timer is
+/// inactive outside the single-message HTML view and never overlaps calls.
+pub(crate) fn install_message_document_sizing(web_view: &webkit::WebView, scroller: &gtk::ScrolledWindow, state: &Rc<RefCell<UiState>>) {
+    const MAX_DOCUMENT_HEIGHT: i32 = 32_768;
+    let pending = Rc::new(Cell::new(false));
+    let weak_view = web_view.downgrade();
+    let weak_scroller = scroller.downgrade();
+    let weak_state = Rc::downgrade(state);
+    glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+        let (Some(view), Some(scroller), Some(state)) = (weak_view.upgrade(), weak_scroller.upgrade(), weak_state.upgrade()) else {
+            return glib::ControlFlow::Break;
+        };
+        if !view.is_mapped() || !scroller.is_mapped() || view.is_loading() || pending.get() {
+            return glib::ControlFlow::Continue;
+        }
+        let (key, generation) = {
+            let st = state.borrow();
+            (st.rendered_message.clone(), st.reveal_generation)
+        };
+        if key.is_none() { return glib::ControlFlow::Continue; }
+        pending.set(true);
+        let pending = pending.clone();
+        let weak_view = view.downgrade();
+        let weak_scroller = scroller.downgrade();
+        let weak_state = Rc::downgrade(&state);
+        // body.scrollHeight includes overflowing images, but unlike the
+        // root's scrollHeight does not normally include the entire viewport.
+        // Account for body margins and content outside its normal flow.
+        view.evaluate_javascript(
+            r#"(() => {
+                const b = document.body;
+                if (!b) return 0;
+                const rect = b.getBoundingClientRect();
+                const css = getComputedStyle(b);
+                const bottom = parseFloat(css.marginBottom) || 0;
+                return Math.ceil(Math.max(b.scrollHeight, rect.height) + Math.max(0, rect.top + window.scrollY) + bottom + 2);
+            })()"#,
+            Some("lookout-document-size"), None, None::<&gio::Cancellable>,
+            move |result| {
+                pending.set(false);
+                let (Some(view), Some(scroller), Some(state)) = (weak_view.upgrade(), weak_scroller.upgrade(), weak_state.upgrade()) else { return; };
+                let st = state.borrow();
+                if st.rendered_message != key || st.reveal_generation != generation || !view.is_mapped() || view.is_loading() { return; }
+                drop(st);
+                let Ok(value) = result else { return; };
+                let height = value.to_double() * view.zoom_level();
+                if !height.is_finite() || height <= 0.0 { return; }
+                let height = (height.ceil() as i32).clamp(300, MAX_DOCUMENT_HEIGHT);
+                if (view.height_request() - height).abs() > 2 {
+                    view.set_size_request(-1, height);
+                    scroller.queue_resize();
+                }
+            },
+        );
+        glib::ControlFlow::Continue
+    });
+    // WebKit normally consumes wheel events even when the whole document
+    // fits its allocation. Route vertical scrolling to the containing mail
+    // viewport, except for Ctrl+wheel zoom or exceptionally tall documents
+    // that still need WebKit's own scrolling.
+    let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+    scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let weak_view = web_view.downgrade();
+    let weak_scroller = scroller.downgrade();
+    scroll.connect_scroll(move |controller, _, dy| {
+        if controller.current_event_state().contains(gtk::gdk::ModifierType::CONTROL_MASK) {
+            return glib::Propagation::Proceed;
+        }
+        let (Some(view), Some(scroller)) = (weak_view.upgrade(), weak_scroller.upgrade()) else { return glib::Propagation::Proceed; };
+        if view.height_request() >= MAX_DOCUMENT_HEIGHT { return glib::Propagation::Proceed; }
+        let adjustment = scroller.vadjustment();
+        let upper = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+        let step = adjustment.step_increment().max(32.0);
+        adjustment.set_value((adjustment.value() + dy * step).clamp(adjustment.lower(), upper));
+        glib::Propagation::Stop
+    });
+    web_view.add_controller(scroll);
+}
+
 /// Locates the reading pane's attachment strip - the named `gtk::Box`
 /// (`"attachments"`) that `build_window` inserted between the message header
 /// and the body `content_stack`.
@@ -1236,6 +1317,10 @@ pub(crate) fn render_body(
     // message (see the selection handler's `already_shown` guard) can be
     // recognized as a no-op instead of another crossfade.
     state.borrow_mut().rendered_message = Some((mailbox.clone(), uid));
+    if let Some(scroller) = reading_stack.child_by_name("message").and_downcast::<gtk::ScrolledWindow>() {
+        let adjustment = scroller.vadjustment();
+        adjustment.set_value(adjustment.lower());
+    }
     // The body arrived: drop the pending request marker and disable any
     // still-armed failure backstop, and stop the loading spinner. Without this
     // the timeout could fire after a successful (if slow) fetch and show the
@@ -1596,6 +1681,7 @@ pub(crate) fn render_body(
             // disarms it on every selection change, so a load started for a
             // message the user has already moved on from can never reveal.
             state.borrow_mut().pending_html_reveal = true;
+            web_view.set_size_request(-1, 300);
             web_view.load_html(&loaded_html, None);
             tracing::debug!(?mailbox, uid = uid.0, "render_body: load_html issued");
             // The reveal above is gated on WebKit's `Finished` event, but a

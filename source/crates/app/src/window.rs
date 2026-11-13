@@ -3194,7 +3194,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .bottom_margin(12)
         .build();
     crate::compose::bind_plain_page_theme(&text_view);
-    let text_scroller = gtk::ScrolledWindow::builder().child(&text_view).build();
+    let text_scroller = gtk::ScrolledWindow::builder()
+        .child(&text_view)
+        .propagate_natural_height(true)
+        .vscrollbar_policy(gtk::PolicyType::Never)
+        .build();
 
     // --- Reading-pane header: subject/sender/avatar/To/date, plus a second
     // set of Reply/Reply-All/Forward buttons duplicating the top command
@@ -3224,11 +3228,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     content_stack.add_named(&web_view, Some("html"));
     content_stack.add_named(&text_scroller, Some("text"));
     let message_page = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
-    // Message metadata can be arbitrarily tall (many recipients or files).
-    // Give it its own bounded viewport, not a minimum size for the window.
-    let message_details = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    // One viewport for the entire message, including metadata and files.
+    // Its child can grow with the document without resizing the main window.
     message_page.append(&message_header.subject_bar);
-    message_details.append(&message_header.widget);
+    message_page.append(&message_header.widget);
     // The attachment strip and body content stack are named children -
     // `find_named_child` locates them by walk rather than relying on sibling
     // order, so `action_bar` can sit after the body without breaking
@@ -3241,7 +3244,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     attachment_strip.set_margin_top(8);
     attachment_strip.set_margin_bottom(4);
     attachment_strip.set_visible(false);
-    message_details.append(&attachment_strip);
+    message_page.append(&attachment_strip);
     // The iMIP invite-details card, between the attachments and the body.
     // The `adw::Banner` at the bottom of the page only fits a title and a
     // button, so this card carries what the invitation actually says - when,
@@ -3297,23 +3300,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     imip_join_button.set_widget_name("imip-join-button");
     imip_join_button.set_visible(false);
     imip_invite_card.append(&imip_join_button);
-    message_details.append(&imip_invite_card);
+    message_page.append(&imip_invite_card);
     // The delivery status notification card (M-27 / C-07), above the body:
     // a message that is an RFC 3464 report shows its verdict and per-recipient
     // outcome here, with the report's own prose still rendered below.
     // `render_delivery_report_card` fills it per message and hides it for
     // everything that isn't one.
-    message_details.append(&crate::window::build_delivery_report_card());
-    let message_details_scroller = gtk::ScrolledWindow::builder()
-        .child(&message_details)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vscrollbar_policy(gtk::PolicyType::Automatic)
-        .propagate_natural_height(true)
-        .max_content_height(240)
-        .vexpand(false)
-        .build();
-    message_page.append(&message_details_scroller);
-    content_stack.set_vexpand(true);
+    message_page.append(&crate::window::build_delivery_report_card());
+    // The WebView is sized to the document below, not to a fixed fraction
+    // of the pane. Plain text similarly exposes its natural height.
+    content_stack.set_vexpand(false);
     message_page.append(&content_stack);
     // The List-Unsubscribe banner, between the header and the body: revealed
     // by `render_body` when the message's headers offer an unsubscribe
@@ -3460,7 +3456,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
     message_page.append(&follow_up_banner);
-    reading_stack.add_named(&message_page, Some("message"));
+    let message_scroller = gtk::ScrolledWindow::builder()
+        .child(&message_page)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_height(false)
+        .propagate_natural_width(false)
+        .vexpand(true)
+        .hexpand(true)
+        .build();
+    reading_stack.add_named(&message_scroller, Some("message"));
+    install_message_document_sizing(&web_view, &message_scroller, &state);
     let reading_empty = gtk::Box::builder().orientation(gtk::Orientation::Vertical)
         .hexpand(true).vexpand(true).build();
     let reading_prompt = gtk::Box::builder().orientation(gtk::Orientation::Vertical)

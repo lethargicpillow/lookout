@@ -3102,7 +3102,13 @@ async fn connect_and_run(
                     // A failed part fetch must answer the UI with
                     // `PartFetchFailed` rather than kill the whole session via
                     // `?` - one bad section shouldn't cost the connection.
-                    let fetched = match cache_op(cache, {
+                    let fetched = if davmail_compat && part.cid.is_some() && part.content_type.starts_with("image/") {
+                        match fetch_raw_message_cached(cache, &mut session, &mailbox, uid, uidvalidity).await {
+                            Ok(Some(raw)) => Ok(crate::body::find_part_in_raw(&raw, &part)),
+                            Ok(None) => Ok(None),
+                            Err(e) => Err(e),
+                        }
+                    } else { match cache_op(cache, {
                         let mailbox = mailbox.clone();
                         let part_number = part.part_number.clone();
                         move |c| c.load_attachment(&mailbox, uid, uidvalidity, &part_number)
@@ -3119,7 +3125,7 @@ async fn connect_and_run(
                             fetch_attachment_bytes(cache, &mut session, &mailbox, uid, uidvalidity, &part).await
                         }
                         None => fetch_attachment_bytes(cache, &mut session, &mailbox, uid, uidvalidity, &part).await,
-                    };
+                    }};
                     let bytes = match fetched {
                         Ok(Some(bytes)) => Some(bytes),
                         // `None` means the server didn't return the requested
