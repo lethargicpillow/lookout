@@ -77,6 +77,13 @@
     min-width: 18px;
     min-height: 18px;
 }
+.compose-format-arrow > button {
+    min-width: 12px;
+    min-height: 26px;
+    padding: 0 1px;
+    margin: 0;
+}
+.compose-format-arrow image { -gtk-icon-size: 10px; }
 .compose-format-block .compose-format-button:hover { background-color: alpha(@view_fg_color, 0.15); }
 .compose-fields { padding: 8px; background-color: @window_bg_color; }
 .compose-recipient { padding: 0; border: none; background: transparent; }

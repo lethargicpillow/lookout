@@ -635,33 +635,180 @@ fn compose_theme_band(style: &crate::ribbon::RibbonStyle) -> (crate::ribbon::Rib
     (band, page)
 }
 
-/// The compact Message ribbon panel: two selectors over five frequent
-/// commands. The remaining formatting commands have their own Format Text tab.
-fn compose_basic_text_block(font_family: &gtk::DropDown, font_size: &gtk::DropDown, commands: [&gtk::Button; 5]) -> gtk::Box {
+/// A split formatting command: the arrow opens actual alternatives.
+fn compose_format_split(button: &gtk::Button, choices: &[(&str, Rc<dyn Fn()>)], extra: Option<&gtk::Widget>) -> gtk::Box {
+    let pair = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
+        .spacing(0).valign(gtk::Align::Center).build();
+    pair.append(button);
+    let menu = gtk::MenuButton::builder().icon_name("pan-down-symbolic")
+        .always_show_arrow(false).css_classes(["flat", "compose-format-arrow"])
+        .tooltip_text("More options").build();
+    let popover = gtk::Popover::new();
+    let items = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).build();
+    for (label, action) in choices {
+        let item = gtk::Button::with_label(label);
+        item.add_css_class("flat");
+        let action = action.clone();
+        let popup = popover.downgrade();
+        item.connect_clicked(move |_| {
+            if let Some(popup) = popup.upgrade() { popup.popdown(); }
+            action();
+        });
+        items.append(&item);
+    }
+    if let Some(extra) = extra { items.append(extra); }
+    popover.set_child(Some(&items));
+    menu.set_popover(Some(&popover));
+    pair.append(&menu);
+    pair
+}
+
+fn compose_format_command(button: &gtk::Button) {
+    button.add_css_class("compose-format-button");
+    button.add_css_class("flat");
+    button.set_size_request(28, -1);
+    button.set_halign(gtk::Align::Center);
+    button.set_valign(gtk::Align::Center);
+    button.set_hexpand(false);
+    button.set_vexpand(false);
+}
+
+fn compose_format_divider(row: &gtk::Box) {
+    let line = gtk::Separator::new(gtk::Orientation::Vertical);
+    line.add_css_class("compose-format-divider");
+    row.append(&line);
+}
+
+fn compose_list_style(web: &webkit::WebView, ordered: bool, style: &'static str) {
+    let tag = if ordered { "OL" } else { "UL" };
+    let command = if ordered { "InsertOrderedList" } else { "InsertUnorderedList" };
+    let script = format!(r#"(function() {{
+        const find = () => {{
+            let n = window.getSelection()?.anchorNode;
+            if (n && n.nodeType !== 1) n = n.parentElement;
+            return n?.closest('ol,ul');
+        }};
+        let list = find();
+        if (!list || list.tagName !== '{tag}') {{
+            document.execCommand('{command}', false, null);
+            list = find();
+        }}
+        if (list && list.tagName === '{tag}') list.style.listStyleType = '{style}';
+    }})()"#);
+    web.grab_focus();
+    let web = web.clone();
+    glib::spawn_future_local(async move {
+        let _ = web.evaluate_javascript_future(&script, None, None).await;
+    });
+}
+
+/// Match the original Outlook Basic Text panel, in two compact rows.
+fn compose_basic_text_block(format: &FormatControls, web: &Rc<webkit::WebView>) -> gtk::Box {
     let block = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical).spacing(2).homogeneous(true)
-        .vexpand(false).valign(gtk::Align::Fill).halign(gtk::Align::Start)
+        .vexpand(false).hexpand(false).valign(gtk::Align::Fill).halign(gtk::Align::Start)
         .css_classes(["compose-format-block"]).build();
-    let top = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
-        .spacing(2).valign(gtk::Align::Center).build();
-    let bottom = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
-        .spacing(2).homogeneous(true).valign(gtk::Align::Center).build();
-    for (selector, width) in [(font_family, 112), (font_size, 64)] {
+    let row = || gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
+        .spacing(2).valign(gtk::Align::Center).halign(gtk::Align::Start).build();
+    let top = row();
+    let bottom = row();
+    for (selector, width) in [(&format.font_family, 112), (&format.font_size, 64)] {
         selector.set_size_request(width, -1);
-        selector.set_hexpand(selector == font_family);
-        selector.set_halign(gtk::Align::Fill);
+        selector.set_hexpand(false);
+        selector.set_halign(gtk::Align::Start);
         selector.set_valign(gtk::Align::Center);
         selector.add_css_class("compose-format-select");
         top.append(selector);
     }
-    for button in commands {
-        button.add_css_class("compose-format-button");
-        button.add_css_class("flat");
-        button.set_width_request(28);
-        button.set_halign(gtk::Align::Fill);
-        button.set_valign(gtk::Align::Center);
-        button.set_vexpand(false);
-        bottom.append(button);
+    let append = |row: &gtk::Box, button: &gtk::Button| {
+        compose_format_command(button);
+        row.append(button);
+    };
+    append(&top, &format.font_grow);
+    append(&top, &format.font_shrink);
+    compose_format_divider(&top);
+    for (button, ordered, styles) in [
+        (&format.bullets, false, [("Solid bullet", "disc"), ("Circle", "circle"), ("Square", "square")]),
+        (&format.numbering, true, [("1, 2, 3", "decimal"), ("a, b, c", "lower-alpha"), ("i, ii, iii", "lower-roman")]),
+    ] {
+        compose_format_command(button);
+        let choices: Vec<(&str, Rc<dyn Fn()>)> = styles.into_iter().map(|(label, style)| {
+            let web = web.clone();
+            let action: Rc<dyn Fn()> = Rc::new(move || compose_list_style(&web, ordered, style));
+            (label, action)
+        }).collect();
+        top.append(&compose_format_split(button, &choices, None));
+    }
+    compose_format_divider(&top);
+    append(&top, &format.clear_formatting);
+
+    for button in [&format.bold, &format.italic, &format.underline] {
+        append(&bottom, button);
+    }
+    compose_format_divider(&bottom);
+    compose_format_command(&format.highlight);
+    let highlight_choices: Vec<(&str, Rc<dyn Fn()>)> = [
+        ("Yellow", "#ffff00"), ("Green", "#00ff00"), ("Cyan", "#00ffff"),
+        ("Pink", "#ff80c0"), ("No color", "transparent"),
+    ].into_iter().map(|(label, value)| {
+        let web = web.clone();
+        let current = format.highlight_color.clone();
+        let action: Rc<dyn Fn()> = Rc::new(move || {
+            current.set(value);
+            web.grab_focus();
+            web.execute_editing_command_with_argument("BackColor", value);
+        });
+        (label, action)
+    }).collect();
+    bottom.append(&compose_format_split(&format.highlight, &highlight_choices, None));
+
+    let color = gtk::Button::new();
+    color.set_tooltip_text(Some("Text color"));
+    let color_content = gtk::Box::builder().orientation(gtk::Orientation::Vertical)
+        .spacing(0).halign(gtk::Align::Center).build();
+    color_content.append(&gtk::Label::new(Some("A")));
+    let swatch = gtk::DrawingArea::builder().content_width(14).content_height(3).build();
+    let source = format.color.clone();
+    swatch.set_draw_func(move |_, cr, width, height| {
+        let rgba = source.rgba();
+        cr.set_source_rgba(rgba.red() as f64, rgba.green() as f64, rgba.blue() as f64, rgba.alpha() as f64);
+        cr.rectangle(0.0, 0.0, width as f64, height as f64);
+        let _ = cr.fill();
+    });
+    let weak_swatch = swatch.downgrade();
+    format.color.connect_rgba_notify(move |_| {
+        if let Some(swatch) = weak_swatch.upgrade() { swatch.queue_draw(); }
+    });
+    color_content.append(&swatch);
+    color.set_child(Some(&color_content));
+    let source = format.color.clone();
+    let view = web.clone();
+    color.connect_clicked(move |_| {
+        let rgba = source.rgba();
+        let hex = format!("#{:02x}{:02x}{:02x}", (rgba.red()*255.0).round() as u8,
+            (rgba.green()*255.0).round() as u8, (rgba.blue()*255.0).round() as u8);
+        view.grab_focus();
+        view.execute_editing_command_with_argument("ForeColor", &hex);
+    });
+    compose_format_command(&color);
+    let color_choices: Vec<(&str, Rc<dyn Fn()>)> = [
+        ("Black", "#000000"), ("Red", "#d02020"), ("Blue", "#2050d0"), ("Green", "#208020"),
+    ].into_iter().map(|(label, value)| {
+        let source = format.color.clone();
+        let action: Rc<dyn Fn()> = Rc::new(move || {
+            if let Ok(rgba) = gtk::gdk::RGBA::parse(value) { source.set_rgba(&rgba); }
+        });
+        (label, action)
+    }).collect();
+    format.color.set_tooltip_text(Some("More colors"));
+    bottom.append(&compose_format_split(&color, &color_choices, Some(format.color.upcast_ref())));
+    compose_format_divider(&bottom);
+    for button in [&format.align_left, &format.align_center, &format.align_right] {
+        append(&bottom, button);
+    }
+    compose_format_divider(&bottom);
+    for button in [&format.outdent, &format.indent] {
+        append(&bottom, button);
     }
     block.append(&top);
     block.append(&bottom);
@@ -857,6 +1004,7 @@ pub(crate) struct FormatControls {
     pub font_grow: gtk::Button,
     pub font_shrink: gtk::Button,
     pub highlight: gtk::Button,
+    highlight_color: Rc<Cell<&'static str>>,
     pub color: gtk::ColorDialogButton,
     pub link: gtk::Button,
     pub emoji: gtk::MenuButton,
@@ -1481,9 +1629,9 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, F
     // These commands belong to the composer's Format Text ribbon.
     // Drive the existing size selector so its value and editing command
     // stay in step; at either end a click is a no-op.
-    let font_grow = gtk::Button::from_icon_name(crate::window::themed_icon_name(&["format-font-size-larger-symbolic", "zoom-in-symbolic"]));
+    let font_grow = gtk::Button::with_label("A⁺");
     font_grow.set_tooltip_text(Some("Increase font size"));
-    let font_shrink = gtk::Button::from_icon_name(crate::window::themed_icon_name(&["format-font-size-smaller-symbolic", "zoom-out-symbolic"]));
+    let font_shrink = gtk::Button::with_label("A⁻");
     font_shrink.set_tooltip_text(Some("Decrease font size"));
     for (button, delta) in [(&font_grow, 1i32), (&font_shrink, -1i32)] {
         let size = font_size.clone();
@@ -1495,10 +1643,12 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, F
         });
     }
     let highlight = gtk::Button::from_icon_name(crate::window::themed_icon_name(&["format-text-highlight-symbolic", "document-edit-symbolic"]));
-    highlight.set_tooltip_text(Some("Highlight text in yellow"));
+    highlight.set_tooltip_text(Some("Highlight text"));
+    let highlight_color = Rc::new(Cell::new("#ffff00"));
     {
         let web_view = web_view.clone();
-        highlight.connect_clicked(move |_| web_view.execute_editing_command_with_argument("BackColor", "#ffff00"));
+        let current = highlight_color.clone();
+        highlight.connect_clicked(move |_| web_view.execute_editing_command_with_argument("BackColor", current.get()));
     }
 
     let color_dialog = gtk::ColorDialog::new();
@@ -1715,6 +1865,7 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, F
         font_grow,
         font_shrink,
         highlight,
+        highlight_color,
         color: color_button,
         link: link_button,
         emoji: emoji_button,
@@ -2607,31 +2758,21 @@ pub fn build_compose_view(
             }
         }
     });
-    // Match the original compact Message-tab layout, rather than
-    // stretching the entire formatting toolset into Basic Text.
+    // Keep the full reference Basic Text panel on Message.
     editor_band.group("Basic Text", |group| {
-        group.widget(&compose_basic_text_block(&format.font_family, &format.font_size,
-            [&format.bold, &format.italic, &format.underline, &format.align_left, &format.bullets]));
+        let block = compose_basic_text_block(format, &rich_web_view);
+        block.set_sensitive(rich_toggle.is_active());
+        let weak = block.downgrade();
+        rich_toggle.connect_toggled(move |toggle| {
+            if let Some(block) = weak.upgrade() { block.set_sensitive(toggle.is_active()); }
+        });
+        group.widget(&block);
     });
     format_band.group("Font", |group| {
-        group.small_button(&format.font_grow, crate::window::themed_icon_name(&["format-font-size-larger-symbolic", "zoom-in-symbolic"]), "Increase Size");
-        group.small_button(&format.font_shrink, crate::window::themed_icon_name(&["format-font-size-smaller-symbolic", "zoom-out-symbolic"]), "Decrease Size");
         group.small_button(&format.strikethrough, "format-text-strikethrough-symbolic", "Strikethrough");
-        group.small_button(&format.clear_formatting, "edit-clear-all-symbolic", "Clear Formatting");
-        group.small_button(&format.highlight, crate::window::themed_icon_name(&["format-text-highlight-symbolic", "document-edit-symbolic"]), "Highlight");
-        let color = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
-            .spacing(4).valign(gtk::Align::Center).build();
-        color.append(&gtk::Label::new(Some("Text Color")));
-        color.append(&format.color);
-        group.widget(&color);
     });
     format_band.group("Paragraph", |group| {
-        group.small_button(&format.numbering, "list-number-symbolic", "Numbering");
-        group.small_button(&format.align_center, "format-justify-center-symbolic", "Center");
-        group.small_button(&format.align_right, "format-justify-right-symbolic", "Align Right");
         group.small_button(&format.justify, "format-justify-fill-symbolic", "Justify");
-        group.small_button(&format.outdent, "format-indent-less-symbolic", "Decrease Indent");
-        group.small_button(&format.indent, "format-indent-more-symbolic", "Increase Indent");
     });
     editor_band.group("Names", |group| {
         let address_book = gtk::Button::new();
@@ -3468,25 +3609,28 @@ mod tests {
     }
 
     #[test]
-    fn basic_text_has_two_selectors_and_five_commands_in_order() {
+    fn basic_text_keeps_reference_rows_and_all_primary_commands() {
         if !crate::gtk_test::gtk_ready() { return; }
-        let family = gtk::DropDown::from_strings(&["sans-serif"]);
-        let size = gtk::DropDown::from_strings(&["12 pt"]);
-        let buttons = ["Bold", "Italic", "Underline", "Align Left", "Bullets"].map(gtk::Button::with_label);
-        let block = compose_basic_text_block(&family, &size, [&buttons[0], &buttons[1], &buttons[2], &buttons[3], &buttons[4]]);
+        let (web, format) = build_rich_editor(String::new());
+        let block = compose_basic_text_block(&format, &web);
         let top = block.first_child().unwrap();
         let bottom = block.last_child().unwrap();
-        assert_eq!(top.first_child().as_ref(), Some(family.upcast_ref::<gtk::Widget>()));
-        assert_eq!(top.last_child().as_ref(), Some(size.upcast_ref::<gtk::Widget>()));
-        assert_eq!(family.next_sibling().as_ref(), Some(size.upcast_ref::<gtk::Widget>()));
-        assert!(size.next_sibling().is_none());
-        let mut child = bottom.first_child();
-        for button in &buttons {
-            assert_eq!(child.as_ref(), Some(button.upcast_ref::<gtk::Widget>()));
-            child = button.next_sibling();
+        assert_eq!(top.first_child().as_ref(), Some(format.font_family.upcast_ref::<gtk::Widget>()));
+        assert_eq!(format.font_family.next_sibling().as_ref(), Some(format.font_size.upcast_ref::<gtk::Widget>()));
+        assert!(!format.font_family.property::<bool>("hexpand"));
+        for button in [&format.font_grow, &format.font_shrink, &format.clear_formatting] {
+            assert_eq!(button.parent().as_ref(), Some(&top));
         }
-        assert!(child.is_none());
-        assert!(top.next_sibling().as_ref() == Some(&bottom));
+        for button in [&format.bullets, &format.numbering] {
+            assert_eq!(button.parent().unwrap().parent().as_ref(), Some(&top));
+        }
+        for button in [&format.bold, &format.italic, &format.underline, &format.align_left,
+            &format.align_center, &format.align_right, &format.outdent, &format.indent] {
+            assert_eq!(button.parent().as_ref(), Some(&bottom));
+        }
+        assert_eq!(format.highlight.parent().unwrap().parent().as_ref(), Some(&bottom));
+        assert!(format.color.parent().is_some());
+        assert_eq!(top.next_sibling().as_ref(), Some(&bottom));
     }
 
     #[test]
