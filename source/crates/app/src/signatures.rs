@@ -70,7 +70,12 @@ pub(crate) fn show_manager(
     if let Some(index) = accounts.iter().position(|(id, _)| Some(id) == selected_account.as_ref()) {
         account.set_selected(index as u32);
     }
-    let defaults = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    // AdwComboRow is an AdwPreferencesRow/GtkListBoxRow and requires
+    // a GtkListBox parent for its layout and activation behavior.
+    let defaults = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .build();
     right.append(&defaults);
     let preview_title = gtk::Label::builder().label("Signature preview").xalign(0.0).css_classes(["heading"]).margin_top(12).build();
     right.append(&preview_title);
@@ -107,7 +112,7 @@ pub(crate) fn show_manager(
         Rc::new(move || {
             while let Some(child) = defaults.first_child() { defaults.remove(&child); }
             let Some((id, _)) = accounts.get(account.selected() as usize) else {
-                defaults.append(&gtk::Label::new(Some("No mail account available")));
+                defaults.set_placeholder(Some(&gtk::Label::new(Some("No mail account available"))));
                 return;
             };
             let (signatures, current) = {
@@ -133,7 +138,6 @@ pub(crate) fn show_manager(
                 ("Replies & forwards", current.reply, crate::config_view::SignatureDefault::Reply),
             ] {
                 let row = crate::config_view::signature_default_dropdown(title, "", &id.0, value, &signatures, kind, &set);
-                row.add_css_class("card");
                 defaults.append(&row);
             }
         })
