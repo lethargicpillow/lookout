@@ -93,18 +93,40 @@ fn scaled_dimension(pixels: i32, source_zoom: u32, target_zoom: u32) -> i32 {
     ((pixels as f64 * target_zoom as f64 / source_zoom.max(1) as f64).round() as i32).max(1)
 }
 
-// A viewport centre expressed in page coordinates, independent of zoom.
-// When the page fits, its centre is the anchor on that axis.
-fn view_anchor(value: f64, lower: f64, viewport: f64, extent: f64) -> f64 {
-    if extent <= 0.0 { return 0.5; }
-    let inset = ((viewport - extent) / 2.0).max(0.0);
-    ((value - lower + viewport / 2.0 - inset) / extent).clamp(0.0, 1.0)
+// A page point and the viewport pixel at which it must remain.
+// None means the viewport centre (slider zoom); Some is the mouse cursor.
+#[derive(Clone, Copy)]
+struct ZoomAnchor {
+    page: (f64, f64),
+    cursor: Option<(f64, f64)>,
 }
 
-fn anchor_position(anchor: f64, lower: f64, viewport: f64, extent: f64) -> f64 {
+fn view_anchor(value: f64, lower: f64, viewport: f64, extent: f64, offset: f64) -> f64 {
+    if extent <= 0.0 { return 0.5; }
     let inset = ((viewport - extent) / 2.0).max(0.0);
-    (lower + anchor * extent + inset - viewport / 2.0)
+    ((value - lower + offset - inset) / extent).clamp(0.0, 1.0)
+}
+
+fn anchor_position(anchor: f64, lower: f64, viewport: f64, extent: f64, offset: f64) -> f64 {
+    let inset = ((viewport - extent) / 2.0).max(0.0);
+    (lower + anchor * extent + inset - offset)
         .clamp(lower, lower + (extent - viewport).max(0.0))
+}
+
+fn viewport_offset(cursor: Option<(f64, f64)>, width: f64, height: f64) -> (f64, f64) {
+    let (x, y) = cursor.unwrap_or((width / 2.0, height / 2.0));
+    (x.clamp(0.0, width.max(0.0)), y.clamp(0.0, height.max(0.0)))
+}
+
+fn event_cursor(event: &gtk::gdk::Event, viewport: &gtk::Viewport) -> Option<(f64, f64)> {
+    let (x, y) = event.position()?;
+    let window = viewport.root().and_downcast::<gtk::Window>()?;
+    let (nx, ny) = window.surface_transform();
+    // Match GTK's event-to-widget translation, including CSD shadows.
+    let point = window.compute_point(viewport, &gtk::graphene::Point::new(
+        (x - nx) as f32, (y - ny) as f32,
+    ))?;
+    Some((point.x() as f64, point.y() as f64))
 }
 
 fn set_scroll(adjustment: &gtk::Adjustment, value: f64) {
@@ -225,7 +247,8 @@ struct Preview {
     busy: Cell<bool>,
     picture: glib::WeakRef<PageCanvas>,
     scroller: glib::WeakRef<gtk::ScrolledWindow>,
-    pending_anchor: Cell<Option<(f64, f64)>>,
+    pending_anchor: Cell<Option<ZoomAnchor>>,
+    wheel_cursor: Cell<Option<(f64, f64)>>,
     anchor_revision: Cell<u64>,
     counter: glib::WeakRef<gtk::Label>,
     status: glib::WeakRef<gtk::Label>,
@@ -264,17 +287,36 @@ impl Preview {
         }
     }
 
-    fn capture_anchor(&self) -> (f64, f64) {
-        if let Some(anchor) = self.pending_anchor.get() { return anchor; }
+    fn capture_anchor(&self, cursor: Option<(f64, f64)>) -> ZoomAnchor {
+        let pending = self.pending_anchor.get();
+        if let Some(anchor) = pending {
+            if anchor.cursor == cursor { return anchor; }
+        }
         let (Some(picture), Some(scroller)) = (self.picture.upgrade(), self.scroller.upgrade()) else {
-            return (0.5, 0.5);
+            return ZoomAnchor { page: (0.5, 0.5), cursor };
         };
         let h = scroller.hadjustment();
         let v = scroller.vadjustment();
-        (
-            view_anchor(h.value(), h.lower(), h.page_size(), picture.width_request() as f64),
-            view_anchor(v.value(), v.lower(), v.page_size(), picture.height_request() as f64),
-        )
+        let w = picture.width_request() as f64;
+        let height = picture.height_request() as f64;
+        let (x, y) = viewport_offset(cursor, h.page_size(), v.page_size());
+        // During fast wheel bursts the previous size request may not yet
+        // have been allocated. Project the pending scroll position first,
+        // rather than reading an obsolete scroll offset for the new extent.
+        let (hx, vy) = if let Some(anchor) = pending {
+            let (ax, ay) = viewport_offset(anchor.cursor, h.page_size(), v.page_size());
+            (
+                anchor_position(anchor.page.0, h.lower(), h.page_size(), w, ax),
+                anchor_position(anchor.page.1, v.lower(), v.page_size(), height, ay),
+            )
+        } else { (h.value(), v.value()) };
+        ZoomAnchor {
+            page: (
+                view_anchor(hx, h.lower(), h.page_size(), w, x),
+                view_anchor(vy, v.lower(), v.page_size(), height, y),
+            ),
+            cursor,
+        }
     }
 
     fn cancel_anchor(&self) {
@@ -282,7 +324,7 @@ impl Preview {
         self.anchor_revision.set(self.anchor_revision.get().wrapping_add(1));
     }
 
-    fn restore_anchor(self: &Rc<Self>, anchor: (f64, f64)) {
+    fn restore_anchor(self: &Rc<Self>, anchor: ZoomAnchor) {
         self.pending_anchor.set(Some(anchor));
         let revision = self.anchor_revision.get().wrapping_add(1);
         self.anchor_revision.set(revision);
@@ -312,8 +354,9 @@ impl Preview {
             frames.set(frames.get() + 1);
             if !ready && frames.get() < 8 { return glib::ControlFlow::Continue; }
             if h.page_size() > 0.0 && v.page_size() > 0.0 {
-                set_scroll(&h, anchor_position(anchor.0, h.lower(), h.page_size(), w));
-                set_scroll(&v, anchor_position(anchor.1, v.lower(), v.page_size(), height));
+                let (x, y) = viewport_offset(anchor.cursor, h.page_size(), v.page_size());
+                set_scroll(&h, anchor_position(anchor.page.0, h.lower(), h.page_size(), w, x));
+                set_scroll(&v, anchor_position(anchor.page.1, v.lower(), v.page_size(), height, y));
             }
             preview.pending_anchor.set(None);
             glib::ControlFlow::Break
@@ -322,9 +365,10 @@ impl Preview {
 
     fn request_zoom(self: &Rc<Self>, value: f64) {
         let zoom = zoom_value(value);
+        let cursor = self.wheel_cursor.take();
         if self.zoom.replace(zoom) == zoom { return; }
         if let (Some(picture), Some(source)) = (self.picture.upgrade(), self.rendered_zoom.get()) {
-            let anchor = self.capture_anchor();
+            let anchor = self.capture_anchor(cursor);
             picture.resize_for_zoom(source, zoom);
             self.restore_anchor(anchor);
         }
@@ -395,7 +439,11 @@ impl Preview {
                 let first = self.rendered_zoom.get().is_none();
                 // First open/new page: centre horizontally, start at top.
                 // Resolution refinement must retain a manual pan, not reset.
-                let anchor = if first { (0.5, 0.0) } else { self.capture_anchor() };
+                let anchor = if first {
+                    ZoomAnchor { page: (0.5, 0.0), cursor: None }
+                } else {
+                    self.pending_anchor.get().unwrap_or_else(|| self.capture_anchor(None))
+                };
                 let old_size = (picture.width_request(), picture.height_request());
                 self.rendered_zoom.set(Some(rendered_zoom));
                 picture.set_texture(texture);
@@ -513,7 +561,7 @@ pub(super) fn show(content: &gtk::Box, bytes: &[u8]) {
         bytes: Arc::new(bytes.to_vec()), page: Cell::new(1), pages: Cell::new(0),
         zoom: Cell::new(DEFAULT_ZOOM), busy: Cell::new(false),
         picture: picture.downgrade(), scroller: scroller.downgrade(),
-        pending_anchor: Cell::new(None), anchor_revision: Cell::new(0),
+        pending_anchor: Cell::new(None), wheel_cursor: Cell::new(None), anchor_revision: Cell::new(0),
         counter: counter.downgrade(), status: status.downgrade(),
         previous: previous.downgrade(), next: next.downgrade(),
         slider: slider.downgrade(), zoom_label: zoom_label.downgrade(),
@@ -601,40 +649,60 @@ pub(super) fn show(content: &gtk::Box, bytes: &[u8]) {
     }
     viewport.set_cursor_from_name(Some("grab"));
     viewport.add_controller(drag);
-    // Capture above the scrolled window, before its own scrolling
-    // controller consumes the event. Ctrl+wheel shares the slider's
-    // live scaling and deferred high-resolution render.
-    let zoom_scroll = gtk::EventControllerScroll::new(
-        gtk::EventControllerScrollFlags::VERTICAL | gtk::EventControllerScrollFlags::DISCRETE,
-    );
-    zoom_scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
+    // Handle the raw scroll event in the ancestor capture phase. Unlike
+    // a discrete scroll controller, this consumes every Ctrl+scroll event
+    // (including smooth deltas and stop events) before GtkScrolledWindow.
+    let scroll = gtk::EventControllerLegacy::new();
+    scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
     let weak = Rc::downgrade(&preview);
-    zoom_scroll.connect_scroll(move |controller, _, dy| {
-        if !controller.current_event_state().contains(gtk::gdk::ModifierType::CONTROL_MASK) {
+    let weak_viewport = viewport.downgrade();
+    let smooth = Cell::new(0.0f64);
+    scroll.connect_event(move |_, event| {
+        let Some(event_scroll) = event.downcast_ref::<gtk::gdk::ScrollEvent>() else {
+            return glib::Propagation::Proceed;
+        };
+        let ctrl = event.modifier_state().contains(gtk::gdk::ModifierType::CONTROL_MASK);
+        let Some(preview) = weak.upgrade() else { return glib::Propagation::Proceed; };
+        if !ctrl {
+            smooth.set(0.0);
+            preview.cancel_anchor();
             return glib::Propagation::Proceed;
         }
-        if let Some(preview) = weak.upgrade() {
-            if preview.pages.get() > 0 && dy != 0.0 {
-                let zoom = wheel_zoom(preview.zoom.get(), dy);
+        if event_scroll.is_stop() {
+            smooth.set(0.0);
+            return glib::Propagation::Stop;
+        }
+        let dy = match event_scroll.direction() {
+            gtk::gdk::ScrollDirection::Up => -1.0,
+            gtk::gdk::ScrollDirection::Down => 1.0,
+            gtk::gdk::ScrollDirection::Smooth => {
+                let (_, delta) = event_scroll.deltas();
+                let delta = if event_scroll.unit() == gtk::gdk::ScrollUnit::Surface {
+                    delta / 40.0
+                } else { delta };
+                let total = smooth.get() + delta;
+                let steps = total.trunc();
+                smooth.set(total - steps);
+                steps
+            }
+            _ => 0.0,
+        };
+        if preview.pages.get() > 0 && dy != 0.0 {
+            let zoom = wheel_zoom(preview.zoom.get(), dy);
+            if zoom != preview.zoom.get() {
                 if let Some(slider) = preview.slider.upgrade() {
+                    preview.wheel_cursor.set(weak_viewport.upgrade()
+                        .and_then(|viewport| event_cursor(event, &viewport)));
                     slider.set_value(zoom as f64);
+                    preview.wheel_cursor.set(None);
                 }
             }
         }
-        // Even at the zoom limits, Ctrl+wheel must not move the page.
+        // No ordinary scrolling or page navigation while Ctrl is held,
+        // including horizontal events and when already at a zoom limit.
         glib::Propagation::Stop
     });
-    document.add_controller(zoom_scroll);
-
-    // A new manual scroll must win over a pending zoom allocation.
-    let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
-    scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
-    let weak = Rc::downgrade(&preview);
-    scroll.connect_scroll(move |_, _, _| {
-        if let Some(preview) = weak.upgrade() { preview.cancel_anchor(); }
-        glib::Propagation::Proceed
-    });
-    viewport.add_controller(scroll);
+    document.add_controller(scroll);
     preview.begin();
 }
 
@@ -644,14 +712,27 @@ mod tests {
 
     #[test]
     fn pdf_zoom_keeps_viewport_centre_and_clamps_at_edges() {
-        assert_eq!(view_anchor(0.0, 0.0, 800.0, 400.0), 0.5);
-        assert_eq!(anchor_position(0.5, 0.0, 800.0, 1600.0), 400.0);
-        assert_eq!(view_anchor(400.0, 0.0, 800.0, 1600.0), 0.5);
-        assert_eq!(view_anchor(800.0, 0.0, 400.0, 2000.0), 0.5);
-        assert_eq!(anchor_position(0.5, 0.0, 400.0, 4000.0), 1800.0);
-        assert_eq!(anchor_position(0.0, 0.0, 400.0, 2000.0), 0.0);
-        assert_eq!(anchor_position(1.0, 0.0, 400.0, 2000.0), 1600.0);
-        assert_eq!(anchor_position(0.9, 0.0, 800.0, 400.0), 0.0);
+        assert_eq!(view_anchor(0.0, 0.0, 800.0, 400.0, 400.0), 0.5);
+        assert_eq!(anchor_position(0.5, 0.0, 800.0, 1600.0, 400.0), 400.0);
+        assert_eq!(view_anchor(400.0, 0.0, 800.0, 1600.0, 400.0), 0.5);
+        assert_eq!(view_anchor(800.0, 0.0, 400.0, 2000.0, 200.0), 0.5);
+        assert_eq!(anchor_position(0.5, 0.0, 400.0, 4000.0, 200.0), 1800.0);
+        assert_eq!(anchor_position(0.0, 0.0, 400.0, 2000.0, 200.0), 0.0);
+        assert_eq!(anchor_position(1.0, 0.0, 400.0, 2000.0, 200.0), 1600.0);
+        assert_eq!(anchor_position(0.9, 0.0, 800.0, 400.0, 400.0), 0.0);
+    }
+
+    #[test]
+    fn pdf_zoom_keeps_the_point_under_the_cursor() {
+        let p = view_anchor(300.0, 0.0, 800.0, 1600.0, 600.0);
+        assert_eq!(p, 0.5625);
+        let offset = anchor_position(p, 0.0, 800.0, 3200.0, 600.0);
+        assert_eq!(offset, 1200.0);
+        assert_eq!(view_anchor(offset, 0.0, 800.0, 3200.0, 600.0), p);
+        let p = view_anchor(0.0, 0.0, 800.0, 400.0, 550.0);
+        assert_eq!(p, 0.875);
+        assert_eq!(anchor_position(p, 0.0, 800.0, 1600.0, 550.0), 800.0);
+        assert_eq!(viewport_offset(Some((600.0, 120.0)), 800.0, 500.0), (600.0, 120.0));
     }
 
     #[test]
