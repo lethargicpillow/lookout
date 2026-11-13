@@ -6459,6 +6459,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // re-entrantly inside `set_position`, so a borrow held across one would be
     // an immediate `BorrowMutError`.
     let pane_widths_applying: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    // A surface resize may clamp a split before its allocation changes, so
+    // comparing only GtkPaned extents cannot identify every automatic move.
+    let pane_restore_pending = Rc::new(Cell::new(false));
+    let settled_surface_size: Rc<Cell<Option<(i32, i32)>>> = Rc::new(Cell::new(None));
     let panes_restored: Rc<RefCell<HashMap<&'static str, PaneRestoreState>>> = Rc::new(RefCell::new(HashMap::new()));
     // Each pane's allocated width as of the previous restore attempt, so an
     // attempt can tell a settled allocation from one still catching up with
@@ -6675,14 +6679,25 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let schedule_apply_pane_widths = {
         let apply_stored_pane_widths = apply_stored_pane_widths.clone();
         let window_for_apply = window.clone();
+        let restore_pending = pane_restore_pending.clone();
+        let settled_surface_size = settled_surface_size.clone();
+        let list_paned = messages_reading_paned.clone();
+        let list_width = list_width.clone();
+        let refresh_list_style = refresh_list_style.clone();
         let debounce: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
         move || {
+            restore_pending.set(true);
             if let Some(id) = debounce.take() {
                 id.remove();
             }
             let apply = apply_stored_pane_widths.clone();
             let window = window_for_apply.clone();
             let debounce_for_timeout = debounce.clone();
+            let restore_pending = restore_pending.clone();
+            let settled_surface_size = settled_surface_size.clone();
+            let list_paned = list_paned.clone();
+            let list_width = list_width.clone();
+            let refresh_list_style = refresh_list_style.clone();
             let attempts = Cell::new(0u8);
             let previous_width: Cell<Option<i32>> = Cell::new(None);
             let previous_height: Cell<Option<i32>> = Cell::new(None);
@@ -6701,6 +6716,20 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 attempts.set(attempts.get() + 1);
                 if settled || last_attempt {
                     debounce_for_timeout.set(None);
+                    settled_surface_size.set(window.surface().map(|surface| (surface.width(), surface.height())));
+                    restore_pending.set(false);
+                    // A horizontal allocation can change with no position
+                    // notify (reading pane Off/Bottom). Refit the real list
+                    // after the final layout, without writing preferred widths.
+                    let list_paned = list_paned.clone();
+                    let list_width = list_width.clone();
+                    let refresh = refresh_list_style.clone();
+                    glib::idle_add_local_once(move || {
+                        if list_paned.is_mapped() {
+                            list_width.set(crate::window::sort::list_pane_width(&list_paned));
+                            refresh();
+                        }
+                    });
                     return glib::ControlFlow::Break;
                 }
                 glib::ControlFlow::Continue
@@ -6719,6 +6748,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let window_for_save = window.clone();
             let state_for_save = state.clone();
             let applying = pane_widths_applying.clone();
+            let restore_pending = pane_restore_pending.clone();
+            let settled_surface_size = settled_surface_size.clone();
             let restore_state = pane_restore_state.clone();
             let record_pane_state = mark_pane_restored.clone();
             let debounce: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
@@ -6736,7 +6767,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     return;
                 }
                 // A restore's own `set_position` lands here synchronously.
-                if applying.get() {
+                if applying.get() || restore_pending.get() {
+                    return;
+                }
+                // A configure may reach the paned before the surface notify.
+                // Never interpret that clamp as a deliberate divider drag.
+                let surface_size = window_for_save.surface().map(|surface| (surface.width(), surface.height()));
+                if surface_size.is_none() || surface_size != settled_surface_size.get() {
                     return;
                 }
                 // The key follows the paned's current orientation, so the
@@ -7048,10 +7085,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // Seed the row from the pack in force without writing anything back.
         apply(initial_style, false);
     }
-    // Restore percentages at map/page changes only. During an interactive
-    // resize GtkPaned itself keeps the folder/list widths and assigns the
-    // remaining space to reading. Do not repeatedly rewrite its positions
-    // from old settings in the middle of a compositor configure sequence.
+    // During an interactive resize let GtkPaned allocate freely. Once the
+    // surface stops changing, replay the saved proportions. Otherwise a
+    // temporary clamp in a narrow window becomes the new permanent split.
+    // The shared restore debounce is restarted by every configure.
     {
         let settings = settings.clone();
         let wired = Rc::new(Cell::new(false));
@@ -7083,8 +7120,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 }
             };
             let width_notify = on_notify.clone();
-            surface.connect_width_notify(move |_| width_notify());
-            surface.connect_height_notify(move |_| on_notify());
+            let restore_width = schedule_apply_pane_widths.clone();
+            surface.connect_width_notify(move |_| {
+                restore_width();
+                width_notify();
+            });
+            let restore_height = schedule_apply_pane_widths.clone();
+            surface.connect_height_notify(move |_| {
+                restore_height();
+                on_notify();
+            });
         });
     }
     {
