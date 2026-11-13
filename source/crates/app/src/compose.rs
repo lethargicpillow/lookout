@@ -623,16 +623,12 @@ pub(crate) fn page_background_button() -> gtk::ToggleButton {
     button
 }
 
-/// Keep the page switch at the right edge of the commands, like the
-/// signature editor. The inner ribbon receives only the remaining width,
-/// so its overflow controller never has to hide this fixed control.
-fn compose_commands_with_page_background(commands: &gtk::Box) -> gtk::Box {
-    let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
-        .spacing(6).hexpand(true).css_classes(["compose-ribbon-commands"]).build();
-    commands.set_hexpand(true);
-    row.append(commands);
-    row.append(&page_background_button());
-    row
+/// Pin the page switch between the expanding command area and the app
+/// theme control. The overflow controller reserves its width separately.
+fn append_compose_page_background(row: &gtk::Box) -> gtk::ToggleButton {
+    let button = page_background_button();
+    row.append(&button);
+    button
 }
 
 /// Only the formatting strip scrolls; the page switch remains accessible
@@ -2651,11 +2647,8 @@ pub fn build_compose_view(
     let tabs = gtk::StackSwitcher::builder().stack(&editor_stack).halign(gtk::Align::Start).build();
     tabs.add_css_class("compose-ribbon-tabs");
     editor_toolbar.append(&tabs);
-    let ribbon_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(4).hexpand(true).vexpand(false).build();
-    // The compact page switch remains outside the scrollable command
-    // pages and overflow. Both the ribbon and the switch follow the editor
-    // when it moves between the reading pane and its own window.
-    editor_toolbar.append(&compose_commands_with_page_background(&ribbon_row));
+    let ribbon_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(4).hexpand(true).vexpand(false).css_classes(["compose-ribbon-commands"]).build();
+    editor_toolbar.append(&ribbon_row);
     let editor_scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::External)
         .vscrollbar_policy(gtk::PolicyType::Never)
@@ -2667,6 +2660,7 @@ pub fn build_compose_view(
         .child(&editor_stack)
         .build();
     ribbon_row.append(&editor_scroller);
+    let page_switch = append_compose_page_background(&ribbon_row);
     let more = gtk::MenuButton::builder().icon_name("view-more-symbolic").tooltip_text("More commands").build();
     let more_band = crate::ribbon::RibbonBand::new(&ribbon_style, &[]);
     let theme_band = crate::ribbon::RibbonBand::new(&ribbon_style, &[]);
@@ -2685,6 +2679,7 @@ pub fn build_compose_view(
     more.set_popover(Some(&popover));
     let overflow = crate::ribbon::RibbonOverflow::new(&ribbon_style, &more, &overflow_box, &extras, &separator, &more_band);
     overflow.set_layout_band(&theme_band);
+    overflow.reserve_fixed_widget(&page_switch);
     overflow.add_band(&editor_band);
     overflow.add_band(&insert_band);
     overflow.add_band(&options_band);
@@ -3427,11 +3422,15 @@ mod tests {
         for name in ["message", "insert", "options"] {
             stack.add_titled(&gtk::Box::new(gtk::Orientation::Vertical, 0), Some(name), name);
         }
-        let commands = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).hexpand(true).build();
-        commands.append(&stack);
-        let row = compose_commands_with_page_background(&commands);
-        let button = row.last_child().unwrap().downcast::<gtk::ToggleButton>().unwrap();
-        assert_eq!(row.first_child().as_ref(), Some(commands.upcast_ref::<gtk::Widget>()));
+        let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).hexpand(true).build();
+        row.append(&stack);
+        let button = append_compose_page_background(&row);
+        let app_theme = gtk::Button::new();
+        let more = gtk::MenuButton::new();
+        row.append(&app_theme);
+        row.append(&more);
+        assert_eq!(button.prev_sibling().as_ref(), Some(stack.upcast_ref::<gtk::Widget>()));
+        assert_eq!(button.next_sibling().as_ref(), Some(app_theme.upcast_ref::<gtk::Widget>()));
         let other = page_background_button();
         assert_eq!(button.widget_name(), "page-background-toggle");
         for name in ["message", "insert", "options"] {

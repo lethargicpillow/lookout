@@ -901,6 +901,7 @@ struct OverflowInner {
     stack: RefCell<glib::WeakRef<gtk::Stack>>,
     bands: RefCell<Vec<RegisteredBand>>,
     layout: RefCell<Option<RegisteredBand>>,
+    fixed_widgets: RefCell<Vec<glib::WeakRef<gtk::Widget>>>,
     mail_home: RefCell<glib::WeakRef<gtk::Box>>,
     /// Guards against the width notifications our own visibility changes
     /// cause while a fit is in progress.
@@ -930,6 +931,7 @@ impl RibbonOverflow {
             stack: RefCell::new(glib::WeakRef::new()),
             bands: RefCell::new(Vec::new()),
             layout: RefCell::new(None),
+            fixed_widgets: RefCell::new(Vec::new()),
             mail_home: RefCell::new(glib::WeakRef::new()),
             refreshing: Cell::new(false),
         });
@@ -961,6 +963,12 @@ impl RibbonOverflow {
             root: band.root.downgrade(),
             state: band.state.clone(),
         });
+    }
+
+    /// Reserve a permanent control outside the command pages. Unlike the
+    /// layout band, it is never moved into More.
+    pub(crate) fn reserve_fixed_widget(&self, widget: &impl IsA<gtk::Widget>) {
+        self.inner.fixed_widgets.borrow_mut().push(widget.as_ref().downgrade());
     }
 
     /// The Mail Home command band. Its More menu always has entries (the
@@ -1079,7 +1087,12 @@ impl OverflowInner {
         let more_width = self.more_width();
         // A couple of pixels of slack keep rounding/the scroller's own
         // geometry from leaving the row one pixel too wide.
-        let full_available = width - more_width - 2;
+        let fixed_width: i32 = self.fixed_widgets.borrow().iter()
+            .filter_map(|widget| widget.upgrade())
+            .filter(|widget| widget.is_visible())
+            .map(|widget| widget.measure(gtk::Orientation::Horizontal, -1).1 + 4)
+            .sum();
+        let full_available = width - more_width - fixed_width - 2;
         let layout = self.layout.borrow().clone();
         let layout_visible = layout.as_ref().is_some_and(|l| l.root.upgrade().is_some());
         let layout_width = if layout_visible { self.layout_width() } else { 0 };
