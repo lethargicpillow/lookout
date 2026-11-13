@@ -703,19 +703,7 @@ pub(crate) fn spawn_cache_open(worker: &Worker, account_id: AccountId) -> async_
     let (reply_tx, reply_rx) = async_channel::bounded(1);
     worker.spawn(async move {
         let warn_id = account_id.clone();
-        let opened = tokio::task::spawn_blocking(move || {
-            for attempt in 0..4 {
-                match lookout_mail::Cache::open(&account_id) {
-                    Err(lookout_mail::Error::Cache(rusqlite::Error::SqliteFailure(ref e, _)))
-                        if attempt < 3 && matches!(e.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) =>
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(250 * (attempt + 1)));
-                    }
-                    result => return result,
-                }
-            }
-            unreachable!("last attempt returns")
-        }).await;
+        let opened = tokio::task::spawn_blocking(move || lookout_mail::Cache::open(&account_id)).await;
         let cache = match opened {
             Ok(Ok(cache)) => Some(Arc::new(cache)),
             Ok(Err(e)) => {

@@ -18,11 +18,12 @@ class Failure(Exception):
     pass
 
 def fetch(session, url, limit, target=None):
+    stage = "download" if target else "manifest"
     with session.get(url, timeout=(15, 45), stream=True, allow_redirects=False) as response:
         if response.status_code in (401, 403):
             raise Failure("authentication")
         if response.status_code != 200:
-            raise Failure("http_" + str(response.status_code))
+            raise Failure(stage + "_http_" + str(response.status_code))
         data = bytearray()
         count = 0
         digest = hashlib.sha1()

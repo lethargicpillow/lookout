@@ -56,10 +56,13 @@ fn download(url: &str, login: &str, password: &str, known: Option<String>, dir: 
             "connection" => "OAB connection or DNS resolution failed",
             "http_transport" => "OAB HTTP transport failed",
             "helper" => "OAB helper failed internally",
-            "http_404" => "OAB manifest or download not found (HTTP 404)",
-            "http_503" => "OAB service unavailable (HTTP 503)",
-            "http_500" => "OAB server error (HTTP 500)",
-            "http_301" | "http_302" | "http_307" | "http_308" => "OAB server returned a redirect",
+            "manifest_http_404" => "OAB manifest not found (HTTP 404)",
+            "download_http_404" => "OAB download not found (HTTP 404)",
+            "manifest_http_503" => "OAB manifest service unavailable (HTTP 503)",
+            "download_http_503" => "OAB download service unavailable (HTTP 503)",
+            "manifest_http_500" | "download_http_500" => "OAB server error (HTTP 500)",
+            "manifest_http_301" | "manifest_http_302" | "manifest_http_307" | "manifest_http_308"
+            | "download_http_301" | "download_http_302" | "download_http_307" | "download_http_308" => "OAB server returned a redirect",
             _ => "OAB network/helper failure",
         }.into());
     }
@@ -70,23 +73,56 @@ fn download(url: &str, login: &str, password: &str, known: Option<String>, dir: 
     Ok(Some(response.to_owned()))
 }
 
-async fn sync(account: OtherAccount, url: String) -> Result<(bool, i64), String> {
+// Only reuse explicitly configured endpoints for the exact same local
+// Exchange mailbox/login, never for another user or merely the same domain.
+fn alternative_urls(config: &crate::app_config::AppConfig, account: &OtherAccount, primary: &str) -> Vec<String> {
+    let mut seen = HashSet::from([primary.to_owned()]);
+    config.other_accounts.iter()
+        .filter(|a| a.id != account.id
+            && a.email.eq_ignore_ascii_case(&account.email)
+            && a.imap_username.eq_ignore_ascii_case(&account.imap_username)
+            && crate::other_accounts::davmail_accounts(a).is_some())
+        .filter_map(|a| config.oab_urls.get(&a.id))
+        .filter(|url| valid_url(url) && seen.insert((*url).clone()))
+        .cloned().take(2).collect()
+}
+
+fn retry_other_endpoint(error: &str) -> bool {
+    error.contains("HTTP 503") || error.contains("HTTP 404")
+        || error.contains("HTTP 500") || error.contains("connection or DNS")
+        || error.contains("timed out") || error.contains("redirect")
+}
+
+async fn sync(account: OtherAccount, url: String, alternatives: Vec<String>) -> Result<(bool, i64, String), String> {
     let password = SecretServiceKeyring::new().load_password(&AccountId(account.id.clone()), "imap").await
         .map_err(|_| "OAB account password unavailable")?;
     tokio::task::spawn_blocking(move || {
-        let scratch = Scratch::new()?;
         let known = crate::oab_cache::fingerprint(&account.id);
-        let downloaded = download(&url, &account.imap_username, &password, known, &scratch.0)?;
-        let updated = downloaded.is_some();
-        if let Some(fingerprint) = downloaded {
-            crate::oab_cache::import_for_account(&account.id, &scratch.0.join("full.oab"), Some(&fingerprint))
-                .map_err(|_| "OAB decode or database import failed")?;
+        let mut candidates = std::iter::once(url).chain(alternatives).peekable();
+        let mut last_error = String::from("No OAB endpoint available");
+        while let Some(url) = candidates.next() {
+            let scratch = Scratch::new()?;
+            let downloaded = match download(&url, &account.imap_username, &password, known.clone(), &scratch.0) {
+                Ok(result) => result,
+                Err(error) if candidates.peek().is_some() && retry_other_endpoint(&error) => {
+                    tracing::debug!(account = %account.id, reason = %error, "Trying previously configured OAB endpoint for same mailbox");
+                    last_error = error;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let updated = downloaded.is_some();
+            if let Some(fingerprint) = downloaded {
+                crate::oab_cache::import_for_account(&account.id, &scratch.0.join("full.oab"), Some(&fingerprint))
+                    .map_err(|_| "OAB decode or database import failed")?;
+            }
+            let checked_at = chrono::Utc::now().timestamp();
+            if crate::oab_cache::record_check(&account.id, checked_at).is_err() {
+                tracing::warn!("Could not persist GAL check timestamp");
+            }
+            return Ok((updated, checked_at, url));
         }
-        let checked_at = chrono::Utc::now().timestamp();
-        if crate::oab_cache::record_check(&account.id, checked_at).is_err() {
-            tracing::warn!("Could not persist GAL check timestamp");
-        }
-        Ok((updated, checked_at))
+        Err(last_error)
     }).await.map_err(|_| "OAB background task failed")?
 }
 
@@ -171,10 +207,11 @@ pub(crate) fn start(
                 config.other_accounts.iter().filter(|a| st.account_enabled(&AccountId(a.id.clone())))
                     .filter(|a| manual.as_ref().is_none_or(|id| id == &a.id))
                     .filter(|a| crate::other_accounts::davmail_accounts(a).is_some())
-                    .filter_map(|a| config.oab_urls.get(&a.id).filter(|url| valid_url(url)).map(|url| (a.clone(), url.clone())))
+                    .filter_map(|a| config.oab_urls.get(&a.id).filter(|url| valid_url(url))
+                        .map(|url| (a.clone(), url.clone(), alternative_urls(&config, a, url))))
                     .collect::<Vec<_>>()
             };
-            for (account, url) in accounts {
+            for (account, url, alternatives) in accounts {
                 let key = (account.id.clone(), url.clone());
                 if running.borrow().contains(&account.id) { continue; }
                 if manual.is_none() && due.borrow().get(&key).is_some_and(|t| *t > Instant::now()) { continue; }
@@ -182,7 +219,7 @@ pub(crate) fn start(
                 running.borrow_mut().insert(account.id.clone());
                 let id = account.id.clone();
                 let (tx, rx) = async_channel::bounded(1);
-                worker.spawn(async move { let _ = tx.send(sync(account, url).await).await; });
+                worker.spawn(async move { let _ = tx.send(sync(account, url, alternatives).await).await; });
                 let state = state.clone();
                 let due = due.clone();
                 let running = running.clone();
@@ -192,19 +229,32 @@ pub(crate) fn start(
                 glib::spawn_future_local(async move {
                     let result = rx.recv().await.unwrap_or_else(|_| Err("OAB worker stopped".into()));
                     running.borrow_mut().remove(&id);
-                    due.borrow_mut().insert(key, Instant::now() + if result.is_ok() { CHECK } else { RETRY });
+                    due.borrow_mut().insert(key.clone(), Instant::now() + if result.is_ok() { CHECK } else { RETRY });
+                    // Keep the verified alternative after a successful full
+                    // import, unless the account was edited in the meantime.
+                    if let Ok((_, _, used_url)) = &result {
+                        if used_url != &key.1 {
+                            let config = state.borrow().app_config.clone();
+                            let mut config = config.borrow_mut();
+                            if config.oab_urls.get(&id) == Some(&key.1) {
+                                config.oab_urls.insert(id.clone(), used_url.clone());
+                                crate::app_config::save(&config);
+                                due.borrow_mut().insert((id.clone(), used_url.clone()), Instant::now() + CHECK);
+                            }
+                        }
+                    }
                     {
                         let mut statuses = statuses.borrow_mut();
                         let status = statuses.entry(id.clone()).or_default();
                         match &result {
-                            Ok((_, timestamp)) => { status.last_success = Some(*timestamp); status.error = None; }
+                            Ok((_, timestamp, _)) => { status.last_success = Some(*timestamp); status.error = None; }
                             Err(message) => status.error = Some(message.clone()),
                         }
                     }
                     repaint();
                     match result {
-                        Ok((true, _)) => {
-                            tracing::info!("Exchange GAL updated");
+                        Ok((true, _, _)) => {
+                            tracing::info!(account = %id, "Exchange GAL updated");
                             let query = {
                                 let mut st = state.borrow_mut();
                                 st.contacts_directory_source = None;
@@ -214,8 +264,8 @@ pub(crate) fn start(
                             };
                             if let Some(query) = query { refresh(&query); }
                         }
-                        Ok((false, _)) => tracing::debug!("Exchange GAL is current"),
-                        Err(message) => tracing::warn!(reason = %message, "Exchange GAL refresh failed; previous snapshot retained"),
+                        Ok((false, _, _)) => tracing::debug!(account = %id, "Exchange GAL is current"),
+                        Err(message) => tracing::warn!(account = %id, reason = %message, "Exchange GAL refresh failed; previous snapshot retained"),
                     }
                 });
             }

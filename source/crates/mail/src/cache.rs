@@ -803,6 +803,41 @@ impl Cache {
     /// Opens (creating if needed) the cache database for `account_id` under
     /// `$XDG_CACHE_HOME/lookout/mail/`.
     pub fn open(account_id: &AccountId) -> Result<Self> {
+        // Serialize initialization for the same database, not all accounts.
+        // Both the session and autocomplete call this at account startup.
+        // Weak entries avoid retaining a lock per account forever.
+        use std::sync::{Arc, OnceLock, Weak};
+        static OPEN_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(account_id)));
+        let lock = {
+            let mut locks = OPEN_LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+                .lock().unwrap_or_else(|e| e.into_inner());
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(&path).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(Mutex::new(()));
+                locks.insert(path, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        // WAL setup can return SQLITE_BUSY immediately, even with a busy
+        // handler. Retry centrally so all readers and writers benefit.
+        for attempt in 0..5 {
+            match Self::open_once(account_id) {
+                Err(crate::error::Error::Cache(rusqlite::Error::SqliteFailure(ref e, _)))
+                    if attempt < 4 && matches!(e.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(200 * (attempt + 1)));
+                }
+                result => return result,
+            }
+        }
+        unreachable!("last attempt returns")
+    }
+
+    fn open_once(account_id: &AccountId) -> Result<Self> {
         let dir = cache_dir();
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{}.sqlite3", sanitize_filename(account_id)));
@@ -815,7 +850,10 @@ impl Cache {
         // flight. `journal_mode` is persistent (stored in the file header),
         // so this also upgrades databases created before it was set.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        let journal: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+        if !journal.eq_ignore_ascii_case("wal") {
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+        }
         // Room for every `prepare_cached` statement at once (rusqlite's default
         // is 16): the hot read paths and the eight overlay lookups would
         // otherwise evict the sync and delete statements, and each other.
@@ -3560,6 +3598,26 @@ mod tests {
             flags: vec![],
             subscribed: true,
         }
+    }
+
+    #[test]
+    fn concurrent_first_open_initializes_one_cache() {
+        let id = temp_account_id();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let threads: Vec<_> = (0..4).map(|_| {
+            let id = id.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let cache = Cache::open(&id).expect("concurrent initial cache open");
+                let conn = cache.conn.lock().unwrap();
+                let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+                let journal: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+                assert!(version >= 9);
+                assert_eq!(journal, "wal");
+            })
+        }).collect();
+        for thread in threads { thread.join().unwrap(); }
     }
 
     #[test]
