@@ -4964,6 +4964,21 @@ mod tests {
     }
 
     #[test]
+    fn background_preview_rejects_recycled_uid() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+        cache.replace_messages(&mailbox_id, UidValidity(2), &[sample_summary(&mailbox_id, 1, None)]).unwrap();
+        let previews = HashMap::from([(Uid(1), "old message".to_string())]);
+        assert!(!cache.update_previews_for_validity(&mailbox_id, UidValidity(1), &previews, &HashMap::new()).unwrap());
+        assert!(cache.load_messages_by_uid(&mailbox_id, UidValidity(2)).unwrap()[&Uid(1)].preview.is_none());
+        assert!(cache.update_previews_for_validity(&mailbox_id, UidValidity(2), &previews, &HashMap::new()).unwrap());
+        assert_eq!(cache.load_messages_by_uid(&mailbox_id, UidValidity(2)).unwrap()[&Uid(1)].preview.as_deref(), Some("old message"));
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn update_previews_patches_mentions_without_a_preview() {
         let account_id = temp_account_id();
         let cache = Cache::open(&account_id).unwrap();
