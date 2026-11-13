@@ -6552,6 +6552,7 @@ struct AppendedDraft {
     message_id: String,
     path: String,
     previous: Vec<Uid>,
+    uid_validity: Option<u32>,
     source: Option<(String, Uid)>,
 }
 
@@ -6577,7 +6578,7 @@ async fn append_draft(
     };
     let (raw, message_id, _) = tokio::task::spawn_blocking(move || build_draft_raw_message(&msg))
         .await.map_err(|e| Error::Io(std::io::Error::other(format!("draft MIME worker failed: {e}"))))?;
-    session.select(&path).await?;
+    let uid_validity = session.select(&path).await?.uid_validity;
     // Capture the old UIDs before APPEND, including a copy that may have
     // landed during a previous ambiguous connection failure. Never search
     // by Message-ID and purge after APPEND: that would delete the new copy.
@@ -6601,7 +6602,7 @@ async fn append_draft(
     tracing::debug!(bytes = raw.len(), "send pipeline: IMAP APPEND starting");
     session.append(&path, Some("(\\Draft \\Seen)"), None, raw.as_slice()).await?;
     tracing::debug!("send pipeline: IMAP APPEND accepted");
-    Ok(AppendedDraft { message_id, path, previous, source })
+    Ok(AppendedDraft { message_id, path, previous, uid_validity, source })
 }
 
 async fn cleanup_draft(session: &mut Session<SessionStream>, saved: &AppendedDraft, has_uidplus: bool) -> Result<()> {
@@ -6614,6 +6615,106 @@ async fn cleanup_draft(session: &mut Session<SessionStream>, saved: &AppendedDra
     }
     tracing::debug!("send pipeline: draft cleanup completed");
     Ok(())
+}
+
+/// A separate deadline and label for every bridge round trip. An expired
+/// connection is disposable; never issue another command on it.
+async fn davmail_draft_step<T>(
+    stage: &'static str,
+    future: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let started = std::time::Instant::now();
+    tracing::debug!(stage, "DavMail draft cleanup step starting");
+    match tokio::time::timeout(Duration::from_secs(30), future).await {
+        Ok(Ok(value)) => {
+            tracing::debug!(stage, elapsed_ms = started.elapsed().as_millis() as u64, "DavMail draft cleanup step completed");
+            Ok(value)
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(stage, elapsed_ms = started.elapsed().as_millis() as u64, "DavMail draft cleanup step failed: {error}");
+            Err(error)
+        }
+        Err(_) => Err(Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut,
+            format!("DavMail draft {stage} timed out")))),
+    }
+}
+
+/// A whole-folder EXPUNGE is not safe if another mail client has marked
+/// unrelated messages for deletion. Only allow it for our exact old UIDs.
+fn draft_expunge_is_safe(deleted: &HashSet<u32>, targets: &[Uid]) -> bool {
+    deleted.iter().all(|uid| targets.iter().any(|target| target.0 == *uid))
+}
+
+/// DavMail normally auto-expunges during STORE. Verify the exact old UID
+/// set after STORE and skip the expensive redundant EXPUNGE when possible.
+/// Never search by Message-ID here: a newly appended draft shares that ID.
+async fn davmail_purge_draft_uids(
+    session: &mut Session<SessionStream>,
+    path: &str,
+    expected_validity: Option<u32>,
+    targets: &[Uid],
+    has_uidplus: bool,
+) -> Result<()> {
+    if targets.is_empty() { return Ok(()); }
+    let meta = davmail_draft_step("SELECT", async { Ok(session.select(path).await?) }).await?;
+    if expected_validity.is_some() && meta.uid_validity != expected_validity {
+        return Err(Error::Io(std::io::Error::other("Draft mailbox UIDVALIDITY changed; old UIDs not deleted")));
+    }
+    let present = davmail_draft_step("UID SEARCH before STORE", uids_still_present(session, targets)).await?;
+    for uid_set in uid_set_chunks(&present) {
+        davmail_draft_step("UID STORE", async {
+            let _: Vec<_> = session.uid_store(&uid_set, "+FLAGS.SILENT (\\Deleted)").await?.try_collect().await?;
+            Ok(())
+        }).await?;
+    }
+    if present.is_empty() { return Ok(()); }
+    let remaining = davmail_draft_step("UID SEARCH after STORE", uids_still_present(session, &present)).await?;
+    if remaining.is_empty() {
+        tracing::debug!("DavMail draft cleanup: STORE already removed old UIDs; EXPUNGE skipped");
+        return Ok(());
+    }
+    if has_uidplus {
+        for uid_set in uid_set_chunks(&remaining) {
+            davmail_draft_step("UID EXPUNGE", async {
+                let _: Vec<_> = session.uid_expunge(&uid_set).await?.try_collect().await?;
+                Ok(())
+            }).await?;
+        }
+    } else {
+        let deleted = davmail_draft_step("UID SEARCH DELETED", async {
+            Ok(session.uid_search("DELETED").await?)
+        }).await?;
+        if !draft_expunge_is_safe(&deleted, &remaining) {
+            return Err(Error::Io(std::io::Error::other("Draft cleanup skipped whole-mailbox EXPUNGE: unrelated deleted messages")));
+        }
+        davmail_draft_step("EXPUNGE", async {
+            let _: Vec<_> = session.expunge().await?.try_collect().await?;
+            Ok(())
+        }).await?;
+    }
+    let remaining = davmail_draft_step("UID SEARCH after EXPUNGE", uids_still_present(session, &remaining)).await?;
+    if !remaining.is_empty() {
+        return Err(Error::Io(std::io::Error::other("DavMail still reports old draft UIDs after EXPUNGE")));
+    }
+    Ok(())
+}
+
+async fn davmail_cleanup_draft(session: &mut Session<SessionStream>, saved: &AppendedDraft, has_uidplus: bool) -> Result<()> {
+    davmail_purge_draft_uids(session, &saved.path, saved.uid_validity, &saved.previous, has_uidplus).await?;
+    if let Some((path, uid)) = &saved.source {
+        davmail_purge_draft_uids(session, path, None, &[*uid], has_uidplus).await?;
+    }
+    Ok(())
+}
+
+async fn davmail_delete_draft(session: &mut Session<SessionStream>, folders: &[Mailbox], account_id: &AccountId, message_id: &str, has_uidplus: bool) -> Result<()> {
+    let Some(path) = drafts_path(folders, account_id) else { return Ok(()); };
+    let meta = davmail_draft_step("SELECT for delete", async { Ok(session.select(path).await?) }).await?;
+    let uids = davmail_draft_step("UID SEARCH Message-ID", async {
+        Ok(session.uid_search(format!("HEADER Message-Id {}", imap_quote(&format!("<{message_id}>")))).await?)
+    }).await?;
+    let uids: Vec<Uid> = uids.into_iter().map(Uid).collect();
+    davmail_purge_draft_uids(session, path, meta.uid_validity, &uids, has_uidplus).await
 }
 
 enum DavmailDraftJob {
@@ -6648,10 +6749,12 @@ async fn run_davmail_draft_worker(
                     Ok(Ok((mut session, has_uidplus, saved))) => {
                         tracing::debug!("send pipeline: isolated IMAP draft saved");
                         let _ = events.send(AccountEvent::DraftSaved { message_id: saved.message_id.clone() }).await;
-                        match tokio::time::timeout(Duration::from_secs(15), cleanup_draft(&mut session, &saved, has_uidplus)).await {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => tracing::warn!("DavMail draft cleanup failed: {e}"),
-                            Err(_) => tracing::warn!("DavMail draft cleanup timed out"),
+                        // APPEND is already confirmed; never repeat the upload
+                        // because cleanup failed. Only exact pre-APPEND UIDs
+                        // are eligible for removal.
+                        match davmail_cleanup_draft(&mut session, &saved, has_uidplus).await {
+                            Ok(()) => tracing::debug!("DavMail draft cleanup completed"),
+                            Err(e) => tracing::warn!("DavMail draft cleanup failed: {e}"),
                         }
                     }
                     failure => {
@@ -6667,15 +6770,16 @@ async fn run_davmail_draft_worker(
             }
             DavmailDraftJob::Delete { folders, message_id } => {
                 if *offline.borrow() { continue; }
-                let result = tokio::time::timeout(Duration::from_secs(20), async {
-                    let credential = credentials.imap_credential().await.map_err(Error::LoginFailed)?;
-                    let (mut session, caps) = login(&config, credential).await?;
-                    delete_draft(&mut session, &folders, &config.account_id, &message_id, caps.has_uidplus).await
-                }).await;
+                let result = async {
+                    let (mut session, caps) = davmail_draft_step("login for delete", async {
+                        let credential = credentials.imap_credential().await.map_err(Error::LoginFailed)?;
+                        login(&config, credential).await
+                    }).await?;
+                    davmail_delete_draft(&mut session, &folders, &config.account_id, &message_id, caps.has_uidplus).await
+                }.await;
                 match result {
-                    Ok(Ok(())) => tracing::debug!("send pipeline: isolated draft deleted"),
-                    Ok(Err(e)) => tracing::warn!("DavMail draft delete failed: {e}"),
-                    Err(_) => tracing::warn!("DavMail draft delete timed out"),
+                    Ok(()) => tracing::debug!("send pipeline: isolated draft deleted"),
+                    Err(e) => tracing::warn!("DavMail draft delete failed: {e}"),
                 }
             }
         }
@@ -8789,6 +8893,15 @@ async fn fetch_body_cached(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn draft_expunge_never_includes_unrelated_deleted_messages() {
+        let targets = [Uid(10), Uid(11)];
+        assert!(draft_expunge_is_safe(&HashSet::from([10]), &targets));
+        assert!(draft_expunge_is_safe(&HashSet::from([10, 11]), &targets));
+        assert!(!draft_expunge_is_safe(&HashSet::from([10, 12]), &targets));
+        assert!(draft_expunge_is_safe(&HashSet::new(), &targets));
+    }
 
     #[test]
     fn davmail_envelope_fetch_omits_unreliable_structure() {
