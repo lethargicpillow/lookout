@@ -916,8 +916,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let sender_photo_cache: Rc<RefCell<HashMap<String, Option<gtk::gdk::Texture>>>> = Rc::new(RefCell::new(HashMap::new()));
     let worker_for_rows = worker.clone();
     let message_factory = gtk::SignalListItemFactory::new();
+    let realized_rows = message_list.realized_rows();
     message_factory.connect_setup(move |_, list_item| {
         let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
+        {
+            let mut rows = realized_rows.borrow_mut();
+            rows.retain(|weak| weak.upgrade().is_some());
+            rows.push(list_item.downgrade());
+        }
         // A row is either a date-section header or a message. Both branches
         // are built once here and toggled with `set_visible` rather than
         // being separate factories or a `Gtk.Stack` - a Stack would size
@@ -2929,7 +2935,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // --- Reading pane: WebKit for HTML, GtkTextView for plain text ---
     let _reading_stack = reading_stack.clone();
     let webkit_settings = webkit::Settings::new();
-    webkit_settings.set_enable_javascript(false);
+    // Only isolated application scripts may run, never sender markup JS.
+    webkit_settings.set_enable_javascript(true);
+    webkit_settings.set_enable_javascript_markup(false);
     webkit_settings.set_enable_developer_extras(false);
     // Deliberately *not* forced to `Never` here, unlike the other three
     // WebViews in this app: under WebKitGTK's software-rendering path,
@@ -2950,6 +2958,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // (the toggle handler also re-renders, see below). Built here, empty, so
     // the toggle's closure can arm it later.
     let user_content_manager = webkit::UserContentManager::new();
+    install_mail_quote_script(&user_content_manager, webkit::UserContentInjectedFrames::TopFrame);
     let theme_override_sheet = webkit::UserStyleSheet::new(
         MESSAGE_THEME_OVERRIDE_CSS,
         webkit::UserContentInjectedFrames::TopFrame,

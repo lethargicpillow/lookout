@@ -1023,12 +1023,65 @@ pub(crate) fn wrap_message_with_csp(html: &str, images_allowed: bool, all_allowe
 /// becomes almost black under the dark-message inversion. Mid-grey stays
 /// legible in either theme. Restrict the rules to reply/quote markup rather
 /// than altering arbitrary tables, signatures, and newsletter separators.
+/// Trusted isolated-world script. Detect the actual Outlook reply header
+/// even when Exchange/DavMail stripped its original id or inline border.
+/// No sender scripts are enabled, and no stored or outgoing MIME is changed.
+pub(crate) const MAIL_QUOTE_SCRIPT: &str = r#"
+(function () {
+    const from = /^\s*(?:From|От|Отправитель)\s*:/i;
+    const sent = /^\s*(?:Sent|Date|Отправлено|Дата)\s*:/i;
+    const to = /^\s*(?:To|Кому)\s*:/i;
+    const subject = /^\s*(?:Subject|Тема)\s*:/i;
+    const text = el => (el.innerText || el.textContent || '').replace(/\u00a0/g, ' ');
+    const isHeader = value => {
+        const lines = value.slice(0, 3000).split(/\r?\n/).filter(line => line.trim());
+        if (!lines.length || !from.test(lines[0])) return false;
+        let phase = 0;
+        for (const line of lines.slice(1, 12)) {
+            if (phase === 0 && sent.test(line)) phase = 1;
+            else if (phase === 1 && to.test(line)) phase = 2;
+            else if (phase === 2 && subject.test(line)) return true;
+        }
+        return false;
+    };
+    const matches = [];
+    for (const el of document.querySelectorAll('p,div,td,pre,blockquote')) {
+        let value = text(el);
+        if (!from.test(value)) continue;
+        // Headers may be one paragraph with BRs, or four/five siblings.
+        if (!isHeader(value)) {
+            let next = el.nextElementSibling;
+            for (let i = 0; next && i < 6 && !isHeader(value); ++i, next = next.nextElementSibling) {
+                const part = text(next);
+                if (from.test(part)) break;
+                value += '\n' + part;
+            }
+        }
+        if (isHeader(value)) matches.push(el);
+    }
+    // Mark the innermost matching header once, not every enclosing
+    // Outlook WordSection or table. Repeat independently at each reply.
+    for (const el of matches) {
+        if (matches.some(other => other !== el && el.contains(other) && from.test(text(other)))) continue;
+        const known = el.closest('#divRplyFwdMsg,#x_divRplyFwdMsg,.OutlookMessageHeader');
+        (known || el).classList.add('lookout-reply-boundary');
+    }
+})();
+"#;
+
+pub(crate) fn install_mail_quote_script(manager: &webkit::UserContentManager, frames: webkit::UserContentInjectedFrames) {
+    manager.add_script(&webkit::UserScript::for_world(
+        MAIL_QUOTE_SCRIPT, frames, webkit::UserScriptInjectionTime::End,
+        "lookout-mail-quotes", &[], &[],
+    ));
+}
+
 const MAIL_QUOTE_CSS: &str = r#"
-#divRplyFwdMsg, #x_divRplyFwdMsg, .OutlookMessageHeader,
+#divRplyFwdMsg, #x_divRplyFwdMsg, .OutlookMessageHeader, .lookout-reply-boundary,
 div[style*="border-top" i]:has(> p.MsoNormal b, > p.MsoNormal strong):not(:has(#divRplyFwdMsg, #x_divRplyFwdMsg)):not(#divRplyFwdMsg *, #x_divRplyFwdMsg *) {
-    border-top: 1px solid #808080 !important;
-    margin-top: 18px !important;
-    padding-top: 10px !important;
+    border-top: 2px solid #808080 !important;
+    margin-top: 24px !important;
+    padding-top: 12px !important;
 }
 hr:has(+ #divRplyFwdMsg, + #x_divRplyFwdMsg) {
     display: none !important;

@@ -110,9 +110,11 @@ pub(crate) fn open_message_window(parent: &adw::ApplicationWindow, state: &Rc<Re
     // pane's widget stack, minus the banners the window doesn't offer
     // (unsubscribe / iMIP / read receipt). ---
     let webkit_settings = webkit::Settings::new();
-    webkit_settings.set_enable_javascript(false);
+    webkit_settings.set_enable_javascript(true);
+    webkit_settings.set_enable_javascript_markup(false);
     webkit_settings.set_enable_developer_extras(false);
     let user_content_manager = webkit::UserContentManager::new();
+    crate::window::install_mail_quote_script(&user_content_manager, webkit::UserContentInjectedFrames::TopFrame);
     let theme_override_sheet = webkit::UserStyleSheet::new(
         crate::window::MESSAGE_THEME_OVERRIDE_CSS,
         webkit::UserContentInjectedFrames::TopFrame,

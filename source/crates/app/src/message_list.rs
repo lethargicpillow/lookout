@@ -1143,6 +1143,7 @@ fn splice_diff(store: &gio::ListStore, old_keys: &[RowKey], new_keys: &[RowKey],
     let diff = diff_range(old_keys, new_keys);
     let removed = diff.old_removed(old_keys.len());
     let inserted = diff.new_inserted(new_keys.len());
+    if removed.is_empty() && inserted.is_empty() { return; }
     store.splice(removed.start as u32, removed.len() as u32, &new_rows[inserted]);
 }
 
@@ -1355,6 +1356,7 @@ pub struct MessageListModel {
     /// The viewport attached by window.rs. Metadata-only refreshes use it
     /// to recover from a GTK scroll reset, never to force a jump to row zero.
     scroller: Rc<RefCell<Option<(gtk::ScrolledWindow, gtk::ListView)>>>,
+    realized_rows: Rc<RefCell<Vec<glib::WeakRef<gtk::ListItem>>>>,
 }
 
 /// Above this many messages, `repopulate`'s pure-data prefix (filter + sort +
@@ -1443,6 +1445,7 @@ impl MessageListModel {
             generation: Rc::new(Cell::new(0)),
             worker,
             scroller: Rc::new(RefCell::new(None)),
+            realized_rows: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -1450,6 +1453,37 @@ impl MessageListModel {
     /// position instead of letting a replaced GTK row reset the scroll.
     pub fn attach_scroller(&self, scroller: &gtk::ScrolledWindow, view: &gtk::ListView) {
         *self.scroller.borrow_mut() = Some((scroller.clone(), view.clone()));
+    }
+
+    pub(crate) fn realized_rows(&self) -> Rc<RefCell<Vec<glib::WeakRef<gtk::ListItem>>>> {
+        self.realized_rows.clone()
+    }
+
+    /// Capture the first visible message and the focused visible selection
+    /// before a splice destroys GTK's internal item/focus anchor.
+    fn viewport_anchor(&self) -> Option<(RowIdentity, bool)> {
+        let (_, view) = self.scroller.borrow().clone()?;
+        let focus_in_list = view.root().and_then(|root| root.focus())
+            .is_some_and(|focus| focus.is_ancestor(&view));
+        let mut rows = self.realized_rows.borrow_mut();
+        rows.retain(|weak| weak.upgrade().is_some());
+        let mut first: Option<(f32, RowIdentity)> = None;
+        for item in rows.iter().filter_map(|weak| weak.upgrade()) {
+            let pos = item.position();
+            if pos == gtk::INVALID_LIST_POSITION { continue; }
+            let Some(child) = item.child() else { continue; };
+            let Some(bounds) = child.compute_bounds(&view) else { continue; };
+            if !child.is_mapped() || bounds.y() + bounds.height() <= 0.0
+                || bounds.y() >= view.height() as f32 { continue; }
+            let Some(identity) = self.row_identity_at(pos) else { continue; };
+            if focus_in_list && self.selection.is_selected(pos) {
+                return Some((identity, true));
+            }
+            if first.as_ref().is_none_or(|(y, _)| bounds.y() < *y) {
+                first = Some((bounds.y(), identity));
+            }
+        }
+        first.map(|(_, identity)| (identity, false))
     }
 
     fn scroll_position(&self) -> Option<f64> {
@@ -1460,9 +1494,21 @@ impl MessageListModel {
     /// marking the selected message read). Preserve the pixel position only
     /// for unchanged message order, never for a new folder/filter/sort.
     /// Do not call scroll_to(0): selection and live refresh are not navigation.
-    fn preserve_scroll(&self, value: f64) {
+    fn preserve_scroll(&self, value: f64, anchor: Option<(RowIdentity, bool)>) {
         let Some((scroller, view)) = self.scroller.borrow().clone() else { return; };
         let adjustment = scroller.vadjustment();
+        // A selected item that was visible before the splice must retain
+        // its focus, otherwise GTK can re-anchor to the first list row.
+        // Do not focus a selection that was off-screen or in another pane.
+        if let Some((identity, focus)) = anchor {
+            if let Some(pos) = (0..self.selection.n_items())
+                .find(|&pos| self.row_identity_at(pos).as_ref() == Some(&identity)) {
+                if focus || (value > 1.0 && adjustment.value() <= 1.0) {
+                    let flags = if focus { gtk::ListScrollFlags::FOCUS } else { gtk::ListScrollFlags::empty() };
+                    view.scroll_to(pos, flags, None);
+                }
+            }
+        }
         let restore_if_reset = |adjustment: &gtk::Adjustment| {
             if value > 1.0 && adjustment.value() <= 1.0 {
                 adjustment.set_value(value);
@@ -1806,6 +1852,7 @@ impl MessageListModel {
                     && same_message_order(old_keys, &keys)
             });
         let old_scroll = if keep_scroll { self.scroll_position() } else { None };
+        let anchor = if keep_scroll { self.viewport_anchor() } else { None };
 
         // Snapshot what the user has collapsed before anything is spliced.
         self.capture_collapsed();
@@ -1950,7 +1997,7 @@ impl MessageListModel {
         self.restore_selection(previous_selection, previous_single_index);
 
         if let Some(value) = old_scroll {
-            self.preserve_scroll(value);
+            self.preserve_scroll(value, anchor);
         }
     }
 
@@ -2265,6 +2312,9 @@ impl MessageListModel {
         if n == 0 {
             return;
         }
+        // No selection mutation if GTK already retained the same rows.
+        // In particular, do not reset the anchor on every preview update.
+        if self.selected_rows() == previous { return; }
         let previous: HashSet<RowIdentity> = previous.into_iter().collect();
         let survivors = gtk::Bitset::new_empty();
         let mut survivor_count = 0u32;

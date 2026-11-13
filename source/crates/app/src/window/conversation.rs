@@ -828,6 +828,7 @@ pub(crate) fn build_conversation_ui(ctx: &ConversationContext, reading_stack: &g
     settings.set_enable_javascript_markup(false);
     settings.set_enable_developer_extras(false);
     let user_content_manager = webkit::UserContentManager::new();
+    install_mail_quote_script(&user_content_manager, webkit::UserContentInjectedFrames::AllFrames);
     user_content_manager.add_script(&webkit::UserScript::for_world(
         view::SCRIPT,
         webkit::UserContentInjectedFrames::AllFrames,
