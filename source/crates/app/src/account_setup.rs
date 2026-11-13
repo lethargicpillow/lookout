@@ -134,7 +134,9 @@ async fn xml_response(mut response: reqwest::Response) -> Option<String> {
 }
 
 async fn mail_probe(client: &reqwest::Client, url: String, email: &str) -> Option<Discovery> {
-    let response = client.get(url).query(&[("emailaddress", email)]).send().await.ok()?;
+    let mut url = reqwest::Url::parse(&url).ok()?;
+    url.query_pairs_mut().append_pair("emailaddress", email);
+    let response = client.get(url).send().await.ok()?;
     parse_mail(&xml_response(response).await?, email)
 }
 
@@ -211,7 +213,7 @@ fn create_private(path: &Path, data: &str) -> Result<(), String> {
     fs::create_dir_all(path.parent().ok_or("Invalid configuration path")?).map_err(|_| "Cannot create configuration directory")?;
     let mut file = fs::OpenOptions::new().create_new(true).write(true).mode(0o600).open(path)
         .map_err(|_| "Cannot create configuration file without overwriting an existing file")?;
-    file.write_all(data.as_bytes()).map_err(|_| "Cannot write configuration file")
+    file.write_all(data.as_bytes()).map_err(|_| "Cannot write configuration file".to_owned())
 }
 
 fn compatible(p: &HashMap<String, String>, ews: &str) -> bool {
@@ -274,7 +276,7 @@ pub(crate) async fn verify_credentials(account: &crate::app_config::OtherAccount
     let config = AccountConfig {
         account_id: lookout_core::AccountId(account.id.clone()),
         display_name: account.display_name.clone(), email: account.email.clone(),
-        mention_addresses: vec![account.email.clone()], mention_rules: vec![],
+        mention_addresses: vec![account.email.clone()], mention_names: vec![],
         local_focus_enabled: false, local_focus_contacts: vec![],
         imap: EndpointConfig { host: account.imap_host.clone(), port: account.imap_port,
             security: account.resolved_imap_security(), username: account.imap_username.clone() },
