@@ -410,8 +410,17 @@ pub(crate) fn open_message_window(parent: &adw::ApplicationWindow, state: &Rc<Re
                 crate::window::themed_icon_name(&["weather-clear-night-symbolic", "night-light-symbolic", "weather-clear-symbolic"])
             });
             button.set_tooltip_text(Some(if button.is_active() { "View in Light Mode" } else { "View in Dark Mode" }));
+            crate::settings::set_page_dark(button.is_active());
             crate::window::set_message_theme_armed(button.is_active(), &web_view, &user_content_manager, &theme_override_sheet);
             rerender(&state, &entry);
+        });
+    }
+    {
+        let weak = header.theme_button.downgrade();
+        crate::settings::observe_page_dark(move |dark| {
+            let Some(button) = weak.upgrade() else { return false };
+            button.set_active(dark);
+            true
         });
     }
     {
