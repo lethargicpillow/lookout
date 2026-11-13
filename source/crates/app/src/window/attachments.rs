@@ -18,6 +18,8 @@ use crate::worker::Worker;
 
 use super::*;
 
+mod pdf_preview;
+
 /// A safe save-suggested name for an attachment without one: falls back to a
 /// part-number-based placeholder (the raw wire could be anything, and a
 /// filename containing `/` from a hostile header must not be fed to the save
@@ -225,12 +227,14 @@ pub(crate) struct AttachmentPreview {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PreviewKind { Image, Text, Unsupported }
+enum PreviewKind { Image, Text, Pdf, Unsupported }
 
 fn preview_kind(mime: &str, name: &str) -> PreviewKind {
     let mime = mime.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
     let ext = name.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase()).unwrap_or_default();
-    if mime.starts_with("text/") || matches!(mime.as_str(), "application/json" | "application/xml" | "application/javascript")
+    if mime == "application/pdf" || (mime == "application/octet-stream" && ext == "pdf") {
+        PreviewKind::Pdf
+    } else if mime.starts_with("text/") || matches!(mime.as_str(), "application/json" | "application/xml" | "application/javascript")
         || matches!(ext.as_str(), "txt" | "md" | "log" | "csv" | "json" | "xml" | "html" | "htm" | "css" | "js" | "rs" | "py" | "ini" | "yaml" | "yml") {
         PreviewKind::Text
     } else if matches!(mime.as_str(), "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/bmp" | "image/tiff" | "image/x-icon" | "image/vnd.microsoft.icon")
@@ -243,10 +247,8 @@ pub(crate) fn attachment_icon(part: &BodyPart) -> &'static str {
     match preview_kind(&part.content_type, &attachment_display_name(part)) {
         PreviewKind::Image => "image-x-generic-symbolic",
         PreviewKind::Text => "text-x-generic-symbolic",
-        PreviewKind::Unsupported => {
-            if part.content_type.eq_ignore_ascii_case("application/pdf") { "application-pdf-symbolic" }
-            else { "mail-attachment-symbolic" }
-        }
+        PreviewKind::Pdf => "application-pdf-symbolic",
+        PreviewKind::Unsupported => "mail-attachment-symbolic",
     }
 }
 
@@ -405,6 +407,7 @@ pub(crate) fn attachment_preview_arrived(state: &Rc<RefCell<UiState>>, mailbox: 
             let scroller = gtk::ScrolledWindow::builder().child(&view).vexpand(true).hexpand(true).build();
             content.append(&scroller);
         }
+        PreviewKind::Pdf => pdf_preview::show(&content, bytes),
         PreviewKind::Unsupported => preview_status(&content, "No built-in preview for this file type. Use Open, Open With or Save."),
     }
 }
@@ -462,7 +465,8 @@ mod preview_tests {
         assert_eq!(preview_kind("application/octet-stream", "data.csv"), PreviewKind::Text);
         assert_eq!(preview_kind("image/png", "photo.png"), PreviewKind::Image);
         assert_eq!(preview_kind("image/svg+xml", "drawing.svg"), PreviewKind::Unsupported);
-        assert_eq!(preview_kind("application/pdf", "document.pdf"), PreviewKind::Unsupported);
+        assert_eq!(preview_kind("application/pdf", "document.pdf"), PreviewKind::Pdf);
+        assert_eq!(preview_kind("application/octet-stream", "report.PDF"), PreviewKind::Pdf);
     }
 }
 
