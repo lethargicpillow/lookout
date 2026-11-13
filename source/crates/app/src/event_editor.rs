@@ -797,6 +797,7 @@ pub fn show_event_editor(
     toolbar_view.set_content(Some(&editor_stack));
     let card_host = gtk::Overlay::builder().child(&toolbar_view).build();
     crate::profile_card::prepare_host(&card_host);
+    attendees_field.install_completion_overlay(&card_host);
     dialog.set_content(Some(&card_host));
 
     // --- Prefill text fields from the edited occurrence.

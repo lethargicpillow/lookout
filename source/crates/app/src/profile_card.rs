@@ -125,6 +125,7 @@ struct CardPlacement {
     panel: glib::WeakRef<gtk::Widget>,
     anchor: glib::WeakRef<gtk::Widget>,
     point: Option<(f64, f64)>,
+    active: std::rc::Weak<RefCell<Option<gtk::Widget>>>,
 }
 
 thread_local! {
@@ -136,11 +137,15 @@ fn current_panel() -> Option<gtk::Widget> {
 }
 
 fn close_panel(panel: &gtk::Widget) {
-    CARD_PLACEMENT.with(|slot| {
+    let active = CARD_PLACEMENT.with(|slot| {
         let matches = slot.borrow().as_ref().and_then(|card| card.panel.upgrade())
             .is_some_and(|current| current == *panel);
-        if matches { slot.borrow_mut().take(); }
+        if matches { slot.borrow_mut().take().and_then(|card| card.active.upgrade()) } else { None }
     });
+    if let Some(active) = active {
+        let mut slot = active.borrow_mut();
+        if slot.as_ref() == Some(panel) { *slot = None; }
+    }
     panel.set_visible(false);
     if let Some(host) = panel.parent().and_downcast::<gtk::Overlay>() {
         host.remove_overlay(panel);
@@ -477,6 +482,7 @@ fn show_overlay_card(ctx: &ProfileCardContext, anchor: &gtk::Widget, address: &E
     }
     CARD_PLACEMENT.with(|slot| *slot.borrow_mut() = Some(CardPlacement {
         panel: panel.downgrade(), anchor: anchor.downgrade(), point,
+        active: Rc::downgrade(active),
     }));
     *active.borrow_mut() = Some(panel.clone());
     host.add_overlay(&panel);

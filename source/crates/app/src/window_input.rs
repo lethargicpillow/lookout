@@ -41,7 +41,7 @@ fn collect_transients(widget: &gtk::Widget, popovers: &mut Vec<gtk::Popover>, pa
             if !popovers.iter().any(|p| p == &popover) { popovers.push(popover); }
         }
     }
-    if widget.has_css_class("compose-completion-panel") {
+    if widget.has_css_class("lookout-transient-panel") || widget.has_css_class("compose-completion-panel") {
         panels.push(widget.clone());
     }
     let mut child = widget.first_child();

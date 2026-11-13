@@ -195,8 +195,7 @@ pub struct RecipientEntry {
     /// members are stored as address tokens and expanded on send. Unused in
     /// plain mode.
     tokens: Rc<RefCell<Vec<Chip>>>,
-    // Compose uses an in-window overlay, not a native popup surface.
-    popover: Option<gtk::Popover>,
+    // Every recipient editor uses an in-window overlay, never a native popup.
     completion_panel: gtk::ScrolledWindow,
     suggestion_list: gtk::ListBox,
     suggestions: Rc<RefCell<Vec<Suggestion>>>,
@@ -325,18 +324,10 @@ impl RecipientEntry {
             .max_content_height(220)
             .hscrollbar_policy(gtk::PolicyType::Never)
             .build();
-        let popover = if compose {
-            scroller.add_css_class("compose-completion-panel");
-            scroller.set_visible(false);
-            scroller.set_focusable(false);
-            None
-        } else {
-            let popup = gtk::Popover::builder()
-                .child(&scroller).position(gtk::PositionType::Bottom)
-                .autohide(false).focusable(false).has_arrow(false).build();
-            popup.set_parent(&entry);
-            Some(popup)
-        };
+        scroller.add_css_class("compose-completion-panel");
+        scroller.add_css_class("lookout-transient-panel");
+        scroller.set_visible(false);
+        scroller.set_focusable(false);
 
         let this = RecipientEntry {
             root,
@@ -346,7 +337,6 @@ impl RecipientEntry {
             entry,
             plain,
             tokens: Rc::new(RefCell::new(Vec::new())),
-            popover,
             completion_panel: scroller,
             suggestion_list,
             suggestions: Rc::new(RefCell::new(Vec::new())),
@@ -650,6 +640,28 @@ impl RecipientEntry {
             let this = self.clone();
             self.entry.connect_unmap(move |_| this.dismiss_suggestions());
         }
+        // Invalidate both halves of a pending directory lookup when the
+        // owner loses activation. Rebind across dock/pop-out moves.
+        {
+            let generation = self.suggestion_generation.clone();
+            let panel = self.completion_panel.downgrade();
+            let hook: RefCell<Option<(glib::WeakRef<gtk::Window>, glib::SignalHandlerId)>> = RefCell::new(None);
+            self.entry.connect_root_notify(move |entry| {
+                if let Some((owner, handler)) = hook.borrow_mut().take() {
+                    if let Some(owner) = owner.upgrade() { owner.disconnect(handler); }
+                }
+                let Some(owner) = crate::window_input::owner_window(entry) else { return };
+                let generation = generation.clone();
+                let panel = panel.clone();
+                let handler = owner.connect_is_active_notify(move |owner| {
+                    if !owner.is_active() {
+                        generation.set(generation.get().wrapping_add(1));
+                        if let Some(panel) = panel.upgrade() { panel.set_visible(false); }
+                    }
+                });
+                *hook.borrow_mut() = Some((owner.downgrade(), handler));
+            });
+        }
     }
 
     /// Turns the entry's current text into chips. Chip mode only.
@@ -879,7 +891,7 @@ impl RecipientEntry {
     /// The overlay is shared by the composer and sits outside its address
     /// scroller so the dropdown covers the body without resizing it.
     pub(crate) fn install_completion_overlay(&self, overlay: &gtk::Overlay) {
-        if self.popover.is_some() { return; }
+        if self.completion_panel.parent().is_some() { return; }
         let panel = &self.completion_panel;
         overlay.add_overlay(panel);
         overlay.set_measure_overlay(panel, false);
@@ -911,19 +923,16 @@ impl RecipientEntry {
     }
 
     fn completion_visible(&self) -> bool {
-        self.popover.as_ref().map_or_else(|| self.completion_panel.is_visible(), |p| p.is_visible())
+        self.completion_panel.is_visible()
     }
 
     fn hide_completion(&self) {
-        if let Some(popover) = &self.popover { popover.popdown(); }
-        else { self.completion_panel.set_visible(false); }
+        self.completion_panel.set_visible(false);
     }
 
     fn show_completion(&self) {
         if !crate::window_input::accepts_input(&self.entry) { return; }
-        if let Some(popover) = &self.popover {
-            if !popover.is_visible() { popover.popup(); }
-        } else if self.completion_panel.parent().is_some() {
+        if self.completion_panel.parent().is_some() {
             self.completion_panel.set_visible(true);
             if let Some(parent) = self.completion_panel.parent() { parent.queue_allocate(); }
         }
@@ -931,11 +940,11 @@ impl RecipientEntry {
 
     fn focus_within_completion(&self) -> bool {
         if !crate::window_input::accepts_input(&self.entry) { return false; }
-        // GtkRoot retains the logical focus widget even when the X11 popup
-        // momentarily changes the active native surface.
+        // The panel shares its owner's root; no native surface can steal
+        // focus from the recipient entry.
         let Some(root) = self.entry.root() else { return false; };
         let Some(focus) = gtk::prelude::RootExt::focus(&root) else {
-            return self.completion_visible();
+            return false;
         };
         focus == self.entry.clone().upcast::<gtk::Widget>()
             || focus.is_ancestor(&self.entry)
