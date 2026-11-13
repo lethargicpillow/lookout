@@ -543,6 +543,8 @@ pub fn show_event_editor(
         .right_margin(6)
         .build();
 
+    crate::compose::bind_plain_page_theme(&description_view);
+
     // --- Form layout: a preferences-style group for the row-shaped fields,
     // the compact date/time row, and the notes body filling the rest.
     let fields_group = adw::PreferencesGroup::new();
@@ -790,6 +792,7 @@ pub fn show_event_editor(
     let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     spacer.set_hexpand(true);
     top_bar.append(&spacer);
+    top_bar.append(&crate::compose::page_background_button());
     top_bar.append(&delete_button);
 
     let toolbar_view = adw::ToolbarView::new();

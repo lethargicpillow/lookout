@@ -388,6 +388,7 @@ pub(crate) fn show_message_details_dialog(state: &Rc<RefCell<UiState>>, parent: 
     close_button.set_css_classes(&["flat"]);
     close_button.set_tooltip_text(Some("Close"));
     header.pack_end(&close_button);
+    header.pack_end(&crate::compose::page_background_button());
 
     let switcher = adw::ViewSwitcher::builder().policy(adw::ViewSwitcherPolicy::Wide).build();
     header.set_title_widget(Some(&switcher));
@@ -422,6 +423,7 @@ pub(crate) fn show_message_details_dialog(state: &Rc<RefCell<UiState>>, parent: 
         .left_margin(8)
         .right_margin(8)
         .build();
+    crate::compose::bind_plain_page_theme(&headers_view);
     // Seed the header block from the body cache when the message has already
     // been read this session; the raw fetch overwrites it with the
     // authoritative block when it lands.
@@ -455,6 +457,7 @@ pub(crate) fn show_message_details_dialog(state: &Rc<RefCell<UiState>>, parent: 
         .left_margin(8)
         .right_margin(8)
         .build();
+    crate::compose::bind_plain_page_theme(&source_view);
     let source_scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Automatic)
         .vscrollbar_policy(gtk::PolicyType::Automatic)

@@ -78,7 +78,11 @@ pub(crate) fn show_manager(
         .build();
     right.append(&defaults);
     let preview_title = gtk::Label::builder().label("Signature preview").xalign(0.0).css_classes(["heading"]).margin_top(12).build();
-    right.append(&preview_title);
+    let preview_header = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
+    preview_title.set_hexpand(true);
+    preview_header.append(&preview_title);
+    preview_header.append(&crate::compose::page_background_button());
+    right.append(&preview_header);
     let preview = gtk::TextView::builder().editable(false).cursor_visible(false).wrap_mode(gtk::WrapMode::WordChar)
         .left_margin(8).right_margin(8).top_margin(8).bottom_margin(8).build();
     crate::privacy::mark_content(&preview);
@@ -229,9 +233,7 @@ pub fn show_editor_dialog(anchor: &gtk::Widget, app_config: Rc<RefCell<AppConfig
         .build();
     let (web_view, format_controls) = crate::compose::build_rich_editor(existing.as_ref().map(|s| s.html.clone()).unwrap_or_default());
 
-    let toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
-    toolbar.append(&format_controls.strip());
-    toolbar.append(&crate::compose::page_background_button());
+    let toolbar = crate::compose::editor_format_toolbar(&format_controls.strip());
     let rich_scroller = gtk::ScrolledWindow::builder().child(&*web_view).hexpand(true).vexpand(true).build();
 
     let save_button = gtk::Button::with_label("Save");

@@ -148,6 +148,8 @@ pub(crate) fn show_automatic_replies_dialog(anchor: &gtk::Widget, state: Rc<RefC
     let end_field = Rc::new(TimeField::new());
     let internal_view = message_view();
     let external_view = message_view();
+    crate::compose::bind_plain_page_theme(&internal_view);
+    crate::compose::bind_plain_page_theme(&external_view);
     let audience_dropdown = gtk::DropDown::from_strings(&[ExternalAudience::All.label(), ExternalAudience::ContactsOnly.label(), ExternalAudience::None.label()]);
 
     let schedule_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(8).build();
@@ -163,7 +165,11 @@ pub(crate) fn show_automatic_replies_dialog(anchor: &gtk::Widget, state: Rc<RefC
     let message_caption = gtk::Label::builder().halign(gtk::Align::Start).css_classes(["dim-label", "caption"]).build();
     crate::privacy::mark_ui(&message_caption);
     let message_section = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
-    message_section.append(&message_caption);
+    let message_header = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
+    message_caption.set_hexpand(true);
+    message_header.append(&message_caption);
+    message_header.append(&crate::compose::page_background_button());
+    message_section.append(&message_header);
     message_section.append(&gtk::ScrolledWindow::builder().height_request(110).child(&internal_view).build());
     form.append(&section("Message", &message_section));
 

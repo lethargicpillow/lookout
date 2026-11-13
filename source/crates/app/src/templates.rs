@@ -40,9 +40,7 @@ pub fn show_editor_dialog(anchor: &gtk::Widget, app_config: Rc<RefCell<AppConfig
         .build();
     let (web_view, format_controls) = crate::compose::build_rich_editor(existing.as_ref().map(|t| t.html.clone()).unwrap_or_default());
 
-    let toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
-    toolbar.append(&format_controls.strip());
-    toolbar.append(&crate::compose::page_background_button());
+    let toolbar = crate::compose::editor_format_toolbar(&format_controls.strip());
     let rich_scroller = gtk::ScrolledWindow::builder().child(&*web_view).hexpand(true).vexpand(true).build();
 
     let save_button = gtk::Button::with_label("Save");
