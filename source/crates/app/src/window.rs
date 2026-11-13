@@ -11863,20 +11863,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             // category, where the global signature list lives.
             state.borrow_mut().manage_signatures = Some({
                 let state = state.clone();
-                let window = window.clone();
                 let refresh_hook = refresh_hook.clone();
-                Rc::new(move || {
-                    let (anchor, config, accounts, selected) = {
+                Rc::new(move |anchor, account| {
+                    let (config, accounts, selected) = {
                         let st = state.borrow();
-                        let anchor: gtk::Widget = st.compose_popout_window.as_ref()
-                            .map(|(_, win)| win.clone().upcast())
-                            .unwrap_or_else(|| window.clone().upcast());
                         let accounts = st.accounts.iter().map(|(id, h)| (id.clone(), h.email.clone())).collect();
-                        let selected = st.current_mailbox.as_ref().and_then(mailbox_account_id);
-                        (anchor, st.app_config.clone(), accounts, selected)
+                        let selected = account.or_else(|| st.accounts.keys().next().cloned());
+                        (st.app_config.clone(), accounts, selected)
                     };
                     let refresh = refresh_hook.borrow().clone();
-                    crate::signatures::show_manager(&anchor, config, accounts, selected, refresh);
+                    crate::signatures::show_manager(anchor, config, accounts, selected, refresh);
                 })
             });
             // The ribbon's Send / Receive ▸ Account Settings opens the same.
