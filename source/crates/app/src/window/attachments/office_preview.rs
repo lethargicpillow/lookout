@@ -16,6 +16,8 @@ const TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_PDF_BYTES: u64 = 64 * 1024 * 1024;
 const SOFFICE: &str = "/usr/bin/libreoffice";
 const BWRAP: &str = "/usr/bin/bwrap";
+const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
+const SYSTEMCTL: &str = "/usr/bin/systemctl";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum OfficeKind { Docx, Xlsx }
@@ -82,6 +84,8 @@ fn sandbox_command(work: &Path, kind: OfficeKind) -> Command {
         "--setenv", "PATH", "/usr/bin:/bin",
         "--setenv", "LANG", "C.UTF-8",
         "--setenv", "SAL_USE_VCLPLUGIN", "svp",
+        "--setenv", "SAL_DISABLESKIA", "1",
+        "--setenv", "SAL_DISABLEGL", "1",
         "--",
         SOFFICE, "-env:UserInstallation=file:///work/profile",
         "--headless", "--nologo", "--nodefault", "--nofirststartwizard", "--norestore",
@@ -90,12 +94,57 @@ fn sandbox_command(work: &Path, kind: OfficeKind) -> Command {
     cmd
 }
 
+// Refuse to execute the converter if the actual cgroup limits are absent.
+// A systemd installation without a delegated memory controller must not
+// silently turn a mail preview into an unbounded LibreOffice process.
+// All arguments are passed as positional parameters, never interpolated.
+const CHECK_LIMITS: &str = r#"
+IFS=: read -r hierarchy controllers group < /proc/self/cgroup || exit 125
+[ "$hierarchy" = 0 ] || exit 125
+read -r max < "/sys/fs/cgroup$group/memory.max" || exit 125
+read -r swap < "/sys/fs/cgroup$group/memory.swap.max" || exit 125
+[ "$max" -le 2147483648 ] 2>/dev/null || exit 125
+[ "$swap" = 0 ] || exit 125
+exec "$@"
+"#;
+
+fn limited_command(work: &Path, kind: OfficeKind, unit: &str) -> Command {
+    let sandbox = sandbox_command(work, kind);
+    let mut cmd = Command::new(SYSTEMD_RUN);
+    cmd.args(["--user", "--wait", "--pipe", "--collect", "--quiet", "--unit"])
+        .arg(unit)
+        .args([
+            "--property=MemoryHigh=1536M",
+            "--property=MemoryMax=2G",
+            "--property=MemorySwapMax=0",
+            "--property=TasksMax=128",
+            "--property=OOMPolicy=kill",
+            "--property=KillMode=control-group",
+            "--property=RuntimeMaxSec=60s",
+            "--property=TimeoutStopSec=3s",
+            "--", "/bin/sh", "-c", CHECK_LIMITS, "lookout-office",
+        ])
+        .arg(sandbox.get_program())
+        .args(sandbox.get_args());
+    cmd
+}
+
+fn stop_conversion(unit: &str) {
+    let _ = Command::new(SYSTEMCTL)
+        .args(["--user", "stop", unit])
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+        .status();
+}
+
 fn convert(bytes: &[u8], kind: OfficeKind, cancelled: &AtomicBool) -> Result<Vec<u8>, String> {
     if !Path::new(SOFFICE).is_file() {
         return Err("Office preview requires LibreOffice Writer and Calc. Use Open or Save.".into());
     }
     if !Path::new(BWRAP).is_file() {
         return Err("Office preview requires Bubblewrap (install bubblewrap). Use Open or Save.".into());
+    }
+    if !Path::new(SYSTEMD_RUN).is_file() || !Path::new(SYSTEMCTL).is_file() {
+        return Err("Office preview requires systemd user resource limits. Use Open or Save.".into());
     }
     let scratch = Scratch::new().map_err(|_| "Could not create a private conversion directory.".to_string())?;
     let prepare = || -> std::io::Result<()> {
@@ -108,21 +157,24 @@ fn convert(bytes: &[u8], kind: OfficeKind, cancelled: &AtomicBool) -> Result<Vec
     };
     prepare().map_err(|_| "Could not prepare the office attachment.".to_string())?;
 
-    let mut child = sandbox_command(&scratch.0, kind)
+    let unit = format!("lookout-office-{}.service", uuid::Uuid::new_v4());
+    let mut child = limited_command(&scratch.0, kind, &unit)
         .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
         .spawn().map_err(|_| "Could not start the isolated office converter.".to_string())?;
     let start = Instant::now();
     loop {
         if cancelled.load(Ordering::Relaxed) || start.elapsed() >= TIMEOUT {
+            stop_conversion(&unit);
             let _ = child.kill();
             let _ = child.wait();
             return Err("Office preview cancelled or timed out. Use Open or Save.".into());
         }
         match child.try_wait() {
             Ok(Some(status)) if status.success() => break,
-            Ok(Some(_)) => return Err("Office conversion failed. Check LibreOffice and Bubblewrap availability, or use Open or Save.".into()),
+            Ok(Some(_)) => return Err("Office conversion failed or exceeded its resource limit. Check LibreOffice, Bubblewrap and systemd user memory limits, or use Open or Save.".into()),
             Ok(None) => std::thread::sleep(Duration::from_millis(40)),
             Err(_) => {
+                stop_conversion(&unit);
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err("Office conversion stopped unexpectedly.".into());
@@ -182,6 +234,16 @@ pub(super) fn show(content: &gtk::Box, bytes: &[u8], kind: OfficeKind) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn office_conversion_has_mandatory_memory_and_runtime_limits() {
+        let cmd = limited_command(Path::new("/tmp/lookout-test"), OfficeKind::Docx, "lookout-test.service");
+        assert_eq!(cmd.get_program(), SYSTEMD_RUN);
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        for required in ["--user", "--property=MemoryMax=2G", "--property=MemorySwapMax=0", "--property=OOMPolicy=kill", "--property=KillMode=control-group", "--property=RuntimeMaxSec=60s", CHECK_LIMITS, BWRAP, "SAL_DISABLESKIA", "SAL_DISABLEGL"] {
+            assert!(args.iter().any(|a| a == required), "missing {required}");
+        }
+    }
 
     #[test]
     fn office_sandbox_keeps_documents_isolated() {
