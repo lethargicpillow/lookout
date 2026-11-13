@@ -121,7 +121,7 @@ pub(crate) fn rebuild_attachment_strip(state: &Rc<RefCell<UiState>>, reading_sta
     for part in attachments {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         row.add_css_class("attachment-row");
-        let icon = gtk::Image::from_icon_name("mail-attachment-symbolic");
+        let icon = gtk::Image::from_icon_name(attachment_icon(part));
         icon.add_css_class("dim-label");
         let name = attachment_display_name(part);
         let label = gtk::Label::new(Some(&format!("{name}  ·  {}", human_size(part.size.into()))));
@@ -137,6 +137,9 @@ pub(crate) fn rebuild_attachment_strip(state: &Rc<RefCell<UiState>>, reading_sta
         items.set_margin_bottom(6);
         items.set_margin_start(6);
         items.set_margin_end(6);
+        let preview_item = gtk::Button::with_label("Preview");
+        preview_item.add_css_class("flat");
+        preview_item.set_halign(gtk::Align::Start);
         let open_item = gtk::Button::with_label("Open");
         open_item.add_css_class("flat");
         open_item.set_halign(gtk::Align::Start);
@@ -146,14 +149,35 @@ pub(crate) fn rebuild_attachment_strip(state: &Rc<RefCell<UiState>>, reading_sta
         let save_item = gtk::Button::with_label("Save…");
         save_item.add_css_class("flat");
         save_item.set_halign(gtk::Align::Start);
+        items.append(&preview_item);
         items.append(&open_item);
         items.append(&open_with_item);
         items.append(&save_item);
         popover.set_child(Some(&items));
         menu_button.set_popover(Some(&popover));
-        row.append(&icon);
-        row.append(&label);
+        let preview_button = gtk::Button::new();
+        preview_button.add_css_class("flat");
+        preview_button.set_hexpand(true);
+        preview_button.set_tooltip_text(Some("Preview attachment"));
+        let tile = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        tile.append(&icon);
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        crate::privacy::mark(&label);
+        tile.append(&label);
+        preview_button.set_child(Some(&tile));
+        row.append(&preview_button);
         row.append(&menu_button);
+        for trigger in [&preview_button, &preview_item] {
+            let state = state.clone();
+            let mailbox = mailbox.clone();
+            let part = part.clone();
+            let anchor = preview_button.downgrade();
+            trigger.connect_clicked(move |_| {
+                let Some(anchor) = anchor.upgrade() else { return; };
+                let Some(parent) = anchor.root().and_downcast::<gtk::Window>() else { return; };
+                start_attachment_preview(&state, &parent, &mailbox, uid, &part);
+            });
+        }
 
         let button_for_open = menu_button.clone();
         let state_for_open = state.clone();
@@ -162,26 +186,6 @@ pub(crate) fn rebuild_attachment_strip(state: &Rc<RefCell<UiState>>, reading_sta
         open_item.connect_clicked(move |_| {
             start_attachment_fetch(&state_for_open, &mailbox_for_open, uid, &part_for_open, &button_for_open, PendingAttachmentAction::Open);
         });
-        // Double-clicking the row is the same as choosing "Open".
-        let gesture_open = gtk::GestureClick::new();
-        gesture_open.set_button(gtk::gdk::BUTTON_PRIMARY);
-        let button_for_dclick = menu_button.clone();
-        let state_for_dclick = state.clone();
-        let mailbox_for_dclick = mailbox.clone();
-        let part_for_dclick = part.clone();
-        gesture_open.connect_pressed(move |_, n_press, _, _| {
-            if n_press == 2 {
-                start_attachment_fetch(
-                    &state_for_dclick,
-                    &mailbox_for_dclick,
-                    uid,
-                    &part_for_dclick,
-                    &button_for_dclick,
-                    PendingAttachmentAction::Open,
-                );
-            }
-        });
-        row.add_controller(gesture_open);
         let button_for_open_with = menu_button.clone();
         let state_for_open_with = state.clone();
         let mailbox_for_open_with = mailbox.clone();
@@ -205,6 +209,217 @@ pub(crate) fn rebuild_attachment_strip(state: &Rc<RefCell<UiState>>, reading_sta
         });
 
         strip.append(&row);
+    }
+}
+
+/// A single non-modal preview, independent of reading selection and of
+/// the existing single/batch attachment actions.
+pub(crate) struct AttachmentPreview {
+    window: gtk::Window,
+    mailbox: MailboxId,
+    uid: Uid,
+    part: BodyPart,
+    content: gtk::Box,
+    actions: [gtk::Button; 3],
+    bytes: Option<Rc<Vec<u8>>>,
+    loading: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreviewKind { Image, Text, Unsupported }
+
+fn preview_kind(mime: &str, name: &str) -> PreviewKind {
+    let mime = mime.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let ext = name.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase()).unwrap_or_default();
+    if mime.starts_with("text/") || matches!(mime.as_str(), "application/json" | "application/xml" | "application/javascript")
+        || matches!(ext.as_str(), "txt" | "md" | "log" | "csv" | "json" | "xml" | "html" | "htm" | "css" | "js" | "rs" | "py" | "ini" | "yaml" | "yml") {
+        PreviewKind::Text
+    } else if matches!(mime.as_str(), "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/bmp" | "image/tiff" | "image/x-icon" | "image/vnd.microsoft.icon")
+        || (mime == "application/octet-stream" && matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "ico")) {
+        PreviewKind::Image
+    } else { PreviewKind::Unsupported }
+}
+
+pub(crate) fn attachment_icon(part: &BodyPart) -> &'static str {
+    match preview_kind(&part.content_type, &attachment_display_name(part)) {
+        PreviewKind::Image => "image-x-generic-symbolic",
+        PreviewKind::Text => "text-x-generic-symbolic",
+        PreviewKind::Unsupported => {
+            if part.content_type.eq_ignore_ascii_case("application/pdf") { "application-pdf-symbolic" }
+            else { "mail-attachment-symbolic" }
+        }
+    }
+}
+
+fn preview_status(content: &gtk::Box, message: &str) {
+    while let Some(child) = content.first_child() { content.remove(&child); }
+    let label = gtk::Label::new(Some(message));
+    label.set_wrap(true);
+    label.set_justify(gtk::Justification::Center);
+    label.set_halign(gtk::Align::Center);
+    label.set_valign(gtk::Align::Center);
+    label.set_vexpand(true);
+    label.set_margin_start(18);
+    label.set_margin_end(18);
+    content.append(&label);
+}
+
+pub(crate) fn start_attachment_preview(state: &Rc<RefCell<UiState>>, parent: &gtk::Window, mailbox: &MailboxId, uid: Uid, part: &BodyPart) {
+    let existing = {
+        let st = state.borrow();
+        st.attachment_preview.as_ref().filter(|p| p.mailbox == *mailbox && p.uid == uid && p.part.part_number == part.part_number
+            && (p.loading || p.bytes.is_some())).map(|p| p.window.clone())
+    };
+    if let Some(window) = existing { window.present(); return; }
+    let cmd = mailbox_account_id(mailbox).and_then(|id| state.borrow().accounts.get(&id).map(|h| h.interactive_cmd_tx.clone()));
+    let Some(cmd) = cmd else { return; };
+    let old = state.borrow_mut().attachment_preview.take();
+    if let Some(old) = old { old.window.close(); }
+    let window = gtk::Window::builder().title("Attachment preview")
+        .default_width(860).default_height(640).transient_for(parent).build();
+    if let Some(app) = parent.application() { window.set_application(Some(&app)); }
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let bar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
+        .spacing(6).margin_start(12).margin_end(12).margin_top(8).margin_bottom(8).build();
+    let actions = ["Open", "Open With…", "Save…"].map(gtk::Button::with_label);
+    for button in &actions { button.set_sensitive(false); bar.append(button); }
+    let label = gtk::Label::new(Some(&format!("{} · {}", attachment_display_name(part), human_size(part.size.into()))));
+    label.set_hexpand(true);
+    label.set_xalign(1.0);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    crate::privacy::mark(&label);
+    bar.append(&label);
+    root.append(&bar);
+    root.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).vexpand(true).hexpand(true).build();
+    preview_status(&content, "Loading attachment…");
+    root.append(&content);
+    let toast = adw::ToastOverlay::new();
+    toast.set_child(Some(&root));
+    window.set_child(Some(&toast));
+
+    for (index, button) in actions.iter().enumerate() {
+        let weak_state = Rc::downgrade(state);
+        let weak_window = window.downgrade();
+        let toast = toast.clone();
+        button.connect_clicked(move |_| {
+            let (Some(state), Some(window)) = (weak_state.upgrade(), weak_window.upgrade()) else { return; };
+            let payload = {
+                let st = state.borrow();
+                st.attachment_preview.as_ref().filter(|p| p.window == window)
+                    .and_then(|p| p.bytes.as_ref().map(|b| (p.part.clone(), b.clone())))
+            };
+            let Some((part, bytes)) = payload else { return; };
+            let toast = toast.clone();
+            glib::spawn_future_local(async move {
+                match index {
+                    0 => open_attachment_temp(&window, &state, toast, &part, bytes.as_slice()).await,
+                    1 => open_attachment_with(&state, toast, &part, bytes.as_slice()).await,
+                    _ => save_attachment_to_disk(&window, toast, &part, bytes.as_slice()).await,
+                }
+            });
+        });
+    }
+    {
+        let weak = Rc::downgrade(state);
+        window.connect_close_request(move |window| {
+            if let Some(state) = weak.upgrade() {
+                let mut st = state.borrow_mut();
+                if st.attachment_preview.as_ref().is_some_and(|p| p.window == *window) {
+                    st.attachment_preview = None;
+                }
+            }
+            glib::Propagation::Proceed
+        });
+    }
+    state.borrow_mut().attachment_preview = Some(AttachmentPreview {
+        window: window.clone(), mailbox: mailbox.clone(), uid, part: part.clone(),
+        content, actions, bytes: None, loading: true,
+    });
+    window.present();
+    if cmd.send_blocking(AccountCommand::FetchAttachment { mailbox: mailbox.clone(), uid, part: part.clone() }).is_err() {
+        attachment_preview_failed(state, mailbox, uid, &part.part_number, "Account is unavailable.");
+        return;
+    }
+    let weak_state = Rc::downgrade(state);
+    let weak_window = window.downgrade();
+    let mailbox = mailbox.clone();
+    let number = part.part_number.clone();
+    glib::timeout_add_local_once(std::time::Duration::from_millis(ATTACHMENT_FETCH_TIMEOUT_MS), move || {
+        let (Some(state), Some(window)) = (weak_state.upgrade(), weak_window.upgrade()) else { return; };
+        let is_current = state.borrow().attachment_preview.as_ref().is_some_and(|p| p.window == window && p.loading);
+        if is_current { attachment_preview_failed(&state, &mailbox, uid, &number, "Attachment fetch timed out. Reopen to retry."); }
+    });
+}
+
+pub(crate) fn attachment_preview_failed(state: &Rc<RefCell<UiState>>, mailbox: &MailboxId, uid: Uid, number: &str, message: &str) {
+    let content = {
+        let mut st = state.borrow_mut();
+        let Some(p) = st.attachment_preview.as_mut().filter(|p| p.loading && p.mailbox == *mailbox && p.uid == uid && p.part.part_number == number) else { return; };
+        p.loading = false;
+        p.content.clone()
+    };
+    preview_status(&content, message);
+}
+
+pub(crate) fn attachment_preview_arrived(state: &Rc<RefCell<UiState>>, mailbox: &MailboxId, uid: Uid, part: &BodyPart, bytes: &[u8]) {
+    let (content, actions) = {
+        let mut st = state.borrow_mut();
+        let Some(p) = st.attachment_preview.as_mut().filter(|p| p.loading && p.mailbox == *mailbox && p.uid == uid && p.part.part_number == part.part_number) else { return; };
+        p.loading = false;
+        p.bytes = Some(Rc::new(bytes.to_vec()));
+        (p.content.clone(), p.actions.clone())
+    };
+    for button in &actions { button.set_sensitive(true); }
+    let kind = preview_kind(&part.content_type, &attachment_display_name(part));
+    if bytes.len() > 32 * 1024 * 1024 {
+        preview_status(&content, "This attachment is too large to preview. Use Open or Save.");
+        return;
+    }
+    while let Some(child) = content.first_child() { content.remove(&child); }
+    match kind {
+        PreviewKind::Image => {
+            match gtk::gdk::Texture::from_bytes(&glib::Bytes::from(bytes)) {
+                Ok(texture) => {
+                    let picture = gtk::Picture::for_paintable(&texture);
+                    picture.set_content_fit(gtk::ContentFit::Contain);
+                    picture.set_can_shrink(true);
+                    picture.set_vexpand(true);
+                    picture.set_hexpand(true);
+                    crate::privacy::mark_blur_all(&picture);
+                    content.append(&picture);
+                }
+                Err(_) => preview_status(&content, "This image could not be decoded. Use Open or Save."),
+            }
+        }
+        PreviewKind::Text => {
+            let view = gtk::TextView::builder().editable(false).monospace(true)
+                .wrap_mode(gtk::WrapMode::WordChar).left_margin(12).right_margin(12)
+                .top_margin(12).bottom_margin(12).build();
+            let limit = bytes.len().min(512 * 1024);
+            let text = String::from_utf8_lossy(&bytes[..limit]).replace('\0', "\u{fffd}");
+            let mut lines = text.lines();
+            let mut shown = lines.by_ref().take(10_000).collect::<Vec<_>>().join("\n");
+            if limit < bytes.len() || lines.next().is_some() { shown.push_str("\n\n[Preview truncated. Save the attachment for the complete file.]"); }
+            view.buffer().set_text(&shown);
+            crate::privacy::mark_blur_all(&view);
+            let scroller = gtk::ScrolledWindow::builder().child(&view).vexpand(true).hexpand(true).build();
+            content.append(&scroller);
+        }
+        PreviewKind::Unsupported => preview_status(&content, "No built-in preview for this file type. Use Open, Open With or Save."),
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    #[test]
+    fn preview_classification_does_not_render_active_html_or_svg() {
+        assert_eq!(preview_kind("text/html", "page.html"), PreviewKind::Text);
+        assert_eq!(preview_kind("application/octet-stream", "data.csv"), PreviewKind::Text);
+        assert_eq!(preview_kind("image/png", "photo.png"), PreviewKind::Image);
+        assert_eq!(preview_kind("image/svg+xml", "drawing.svg"), PreviewKind::Unsupported);
+        assert_eq!(preview_kind("application/pdf", "document.pdf"), PreviewKind::Unsupported);
     }
 }
 
@@ -589,7 +804,7 @@ pub(crate) fn start_raw_message_export(message_list: &MessageListModel, state: &
 /// `FileDialog`, which goes through the XDG portal in sandboxed runs) and
 /// writes the fetched attachment bytes there. The dialog is cancellable by
 /// design; a write failure surfaces as a toast.
-pub(crate) async fn save_attachment_to_disk(window: &adw::ApplicationWindow, toast_overlay: adw::ToastOverlay, part: &BodyPart, bytes: &[u8]) {
+pub(crate) async fn save_attachment_to_disk(window: &impl IsA<gtk::Window>, toast_overlay: adw::ToastOverlay, part: &BodyPart, bytes: &[u8]) {
     let dialog = gtk::FileDialog::builder().title("Save attachment").initial_name(attachment_display_name(part)).build();
     let Ok(file) = dialog.save_future(Some(window)).await else { return };
     let result = file
@@ -748,7 +963,7 @@ pub(crate) fn discard_temp_attachment(state: &Rc<RefCell<UiState>>, path: &PathB
 /// XDG portal and lets the portal decide. The temp file is registered in
 /// `UiState::temp_attachment_files` and deleted when Lookout exits; a write
 /// or launch failure toasts and cleans up immediately.
-pub(crate) async fn open_attachment_temp(window: &adw::ApplicationWindow, state: &Rc<RefCell<UiState>>, toast_overlay: adw::ToastOverlay, part: &BodyPart, bytes: &[u8]) {
+pub(crate) async fn open_attachment_temp(window: &impl IsA<gtk::Window>, state: &Rc<RefCell<UiState>>, toast_overlay: adw::ToastOverlay, part: &BodyPart, bytes: &[u8]) {
     let path = match materialize_temp_attachment(state, part, bytes) {
         Ok(path) => path,
         Err(e) => {

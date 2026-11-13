@@ -667,6 +667,14 @@ pub(crate) fn handle_conversation_message(ctx: &ConversationContext, ui: &Rc<Con
             let Some(summary) = conversation_card_summary(state, card) else { return };
             open_message_menu(&ctx.menu, ui.web_view.upcast_ref(), Some((x, y)), MessageMenuTarget::Message(Box::new(summary)));
         }
+        ScriptMessage::AttachmentPreview { card, part } => {
+            let Some(summary) = conversation_card_summary(state, card) else { return; };
+            let body = state.borrow_mut().body_cache.get(&summary.mailbox, &summary.uid);
+            let parts = body.as_ref().map(|body| body.parts.clone()).unwrap_or_else(|| summary.structure.clone().unwrap_or_default());
+            let Some(part) = parts.into_iter().find(|p| p.part_number == part) else { return; };
+            let Some(parent) = ui.web_view.root().and_downcast::<gtk::Window>() else { return; };
+            start_attachment_preview(state, &parent, &summary.mailbox, summary.uid, &part);
+        }
         ScriptMessage::Attachment { card, part, x, y } => {
             let Some(summary) = conversation_card_summary(state, card) else { return };
             let body = state.borrow_mut().body_cache.get(&summary.mailbox, &summary.uid);

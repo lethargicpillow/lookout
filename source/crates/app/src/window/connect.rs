@@ -1000,6 +1000,7 @@ pub(crate) fn spawn_account_event_loop(
                         }
                     }
                     AccountEvent::PartFetched { mailbox, uid, part, bytes } => {
+                        attachment_preview_arrived(&state, &mailbox, uid, &part, &bytes);
                         // An inline `cid:` image request for this part (separate
                         // from the strip's one-at-a-time row actions): finish the
                         // WebKit request with the bytes. Keyed by part number and
@@ -1076,6 +1077,7 @@ pub(crate) fn spawn_account_event_loop(
                         part_number,
                         message,
                     } => {
+                        attachment_preview_failed(&state, &mailbox, uid, &part_number, &message);
                         // The session couldn't produce this attachment's bytes.
                         // Restore the row's button if this is still the outstanding
                         // request and tell the user what went wrong - never leave

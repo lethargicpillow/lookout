@@ -1459,6 +1459,8 @@ pub(crate) struct UiState {
     /// user navigates away first). One at a time; the strip's buttons ignore
     /// a click while one is outstanding. See `PendingAttachment`.
     pub(crate) pending_attachment: Option<PendingAttachment>,
+    /// Independent of the reading selection and the Open/Save/batch ledger.
+    pub(crate) attachment_preview: Option<AttachmentPreview>,
     /// A "Save all" / "Download as zip" run currently in flight (item 1.23) -
     /// the attachments' parts are fetched one at a time, then written together
     /// once the queue drains. One at a time; see `AttachmentBatch`.

@@ -107,7 +107,9 @@ pub enum ScriptMessage {
         x: f64,
         y: f64,
     },
-    /// An attachment tile was clicked.
+    /// The default attachment tile action: in-app preview.
+    AttachmentPreview { card: usize, part: String },
+    /// The separate attachment menu arrow.
     Attachment {
         card: usize,
         part: String,
@@ -142,6 +144,7 @@ pub fn parse_script_message(json: &str) -> Option<ScriptMessage> {
         "reply-all" => ScriptMessage::ReplyAll(card),
         "forward" => ScriptMessage::Forward(card),
         "menu" => ScriptMessage::Menu { card, x, y },
+        "attachment-preview" => ScriptMessage::AttachmentPreview { card, part: value.get("part")?.as_str()?.to_string() },
         "attachment" => ScriptMessage::Attachment {
             card,
             part: value.get("part")?.as_str()?.to_string(),
@@ -396,11 +399,12 @@ pub fn card_extras_html(card: &Card) -> String {
         out.push_str("<div class=\"attachments\">");
         for tile in &card.attachments {
             out.push_str(&format!(
-                "<button type=\"button\" class=\"tile\" data-action=\"attachment\" data-part=\"{}\" title=\"Open or save {}\"><span class=\"tile-name\">{}</span><span class=\"tile-size\">{}</span></button>",
+                "<div class=\"tile-group\"><button type=\"button\" class=\"tile\" data-action=\"attachment-preview\" data-part=\"{}\" title=\"Preview {}\"><span class=\"tile-name\">{}</span><span class=\"tile-size\">{}</span></button><button type=\"button\" class=\"tile-menu\" data-action=\"attachment\" data-part=\"{}\" title=\"Attachment actions\" aria-label=\"Attachment actions\">⋯</button></div>",
                 escape_html(&tile.part_number),
                 escape_html(&tile.name),
                 escape_html(&tile.name),
-                escape_html(&tile.size_label)
+                escape_html(&tile.size_label),
+                escape_html(&tile.part_number)
             ));
         }
         out.push_str("</div>");
@@ -557,6 +561,9 @@ button.link:hover { text-decoration: underline; }
 .attachments { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px; }
 .tile { display: flex; flex-direction: column; align-items: flex-start; max-width: 220px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); cursor: pointer; }
 .tile:hover { border-color: var(--accent); }
+.tile-group { display: flex; align-items: stretch; gap: 2px; }
+.tile-menu { border: 1px solid var(--line); border-radius: 6px; background: var(--card); padding: 0 8px; cursor: pointer; }
+.tile-menu:hover { border-color: var(--accent); }
 .tile-name { max-width: 200px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tile-size { color: var(--dim); font-size: 11px; }
 iframe.body { display: block; width: 100%; height: 40px; border: 0; background: #fff; border-radius: 4px; }

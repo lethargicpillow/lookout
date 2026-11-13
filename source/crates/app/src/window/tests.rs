@@ -848,6 +848,7 @@ fn test_state(accounts: Vec<(AccountId, Vec<Mailbox>)>) -> Rc<RefCell<UiState>> 
         body_fetch_error: None,
         body_fetch_generation: 0,
         pending_attachment: None,
+        attachment_preview: None,
         pending_attachment_batch: None,
         pending_raw_message: None,
         pending_report_phishing: None,
