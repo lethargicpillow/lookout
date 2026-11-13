@@ -3206,6 +3206,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .top_margin(12)
         .bottom_margin(12)
         .build();
+    crate::compose::bind_plain_page_theme(&text_view);
     let text_scroller = gtk::ScrolledWindow::builder().child(&text_view).build();
 
     // --- Reading-pane header: subject/sender/avatar/To/date, plus a second
@@ -12452,15 +12453,20 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let weak_state = Rc::downgrade(&state);
         let weak_button = button.downgrade();
         let weak_web = web_view.downgrade();
+        let weak_stack = reading_stack.downgrade();
+        let message_header = message_header.clone();
+        let message_list = message_list.clone();
         crate::settings::observe_page_dark(move |dark| {
             let (Some(state), Some(button), Some(web_view)) = (weak_state.upgrade(), weak_button.upgrade(), weak_web.upgrade()) else { return false };
-            {
+            let changed = {
                 let mut st = state.borrow_mut();
+                let changed = st.message_theme_override != dark;
                 st.message_theme_override = dark;
                 if st.settings.get_bool(crate::settings::MAIL_MESSAGE_THEME_DARK) != dark {
                     st.settings.set_bool(crate::settings::MAIL_MESSAGE_THEME_DARK, dark);
                 }
-            }
+                changed
+            };
             button.set_active(dark);
             button.set_icon_name(if dark {
                 themed_icon_name(&["weather-clear-symbolic", "display-brightness-symbolic"])
@@ -12469,6 +12475,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             });
             button.set_tooltip_text(Some(if dark { "View in Light Mode" } else { "View in Dark Mode" }));
             set_message_theme_armed(dark, &web_view, &user_content_manager, &theme_override_sheet);
+            if changed {
+                if let Some(stack) = weak_stack.upgrade() {
+                    if stack.visible_child_name().as_deref() == Some("message") {
+                        rerender_current_message(&state, &stack, &message_header, &message_list);
+                    }
+                }
+            }
             true
         });
     }
