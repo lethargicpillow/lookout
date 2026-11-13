@@ -1004,6 +1004,43 @@ pub(crate) fn wrap_message_with_csp(html: &str, images_allowed: bool, all_allowe
     out
 }
 
+/// A view-only stylesheet for common quoted-message structures. Outlook's
+/// Word-generated reply header often has a pale inline top border, which
+/// becomes almost black under the dark-message inversion. Mid-grey stays
+/// legible in either theme. Restrict the rules to reply/quote markup rather
+/// than altering arbitrary tables, signatures, and newsletter separators.
+const MAIL_QUOTE_CSS: &str = r#"
+#divRplyFwdMsg, #x_divRplyFwdMsg, .OutlookMessageHeader,
+div[style*="border-top" i]:has(> p.MsoNormal b, > p.MsoNormal strong):not(:has(#divRplyFwdMsg, #x_divRplyFwdMsg)):not(#divRplyFwdMsg *, #x_divRplyFwdMsg *) {
+    border-top: 1px solid #808080 !important;
+    margin-top: 18px !important;
+    padding-top: 10px !important;
+}
+hr:has(+ #divRplyFwdMsg, + #x_divRplyFwdMsg) {
+    display: none !important;
+}
+blockquote, .gmail_quote, .yahoo_quoted {
+    border-inline-start: 2px solid #808080 !important;
+    margin-block: 12px !important;
+    margin-inline: 0 !important;
+    padding-inline-start: 12px !important;
+}
+"#;
+
+/// Add presentation rules only to rendered mail, not the assistant's HTML
+/// or the stored MIME body. Keep the CSP first and the original doctype.
+pub(crate) fn wrap_mail_message_with_csp(html: &str, images_allowed: bool, all_allowed: bool) -> String {
+    let mut wrapped = wrap_message_with_csp(html, images_allowed, all_allowed);
+    // wrap_message_with_csp always emits this exact meta tag before the
+    // sender's content, either at the start or immediately after a doctype.
+    if let Some(start) = wrapped.find("<meta http-equiv=\"Content-Security-Policy\"") {
+        if let Some(end) = wrapped[start..].find('>') {
+            wrapped.insert_str(start + end + 1, &format!("<style>{MAIL_QUOTE_CSS}</style>"));
+        }
+    }
+    wrapped
+}
+
 /// Resolves the external-content load policy for a message: whether remote
 /// `image/*` subresources may load (`images_allowed`) and whether every
 /// remote subresource may (`all_allowed`). The inputs are the per-account
@@ -1476,7 +1513,7 @@ pub(crate) fn render_body(
         // before any content element - or right after a leading doctype so a
         // doctyped message keeps its standards-mode rendering (see
         // `wrap_message_with_csp`).
-        let loaded_html = wrap_message_with_csp(html, images_allowed, all_allowed);
+        let loaded_html = wrap_mail_message_with_csp(html, images_allowed, all_allowed);
         if let Some(web_view) = content_stack.child_by_name("html").and_downcast::<webkit::WebView>() {
             // Drop back to "empty" first, whether or not transitions are
             // animated: the WebView is a single long-lived widget reused for
