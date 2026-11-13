@@ -1940,7 +1940,7 @@ pub(crate) struct UiState {
     /// composer's signature menu "Manage Signatures…" item. Late-bound:
     /// `build_window` fills it in once the File page's open logic exists
     /// (same pattern as `composer_identities_refresh`).
-    pub(crate) manage_signatures: Option<Rc<dyn Fn()>>,
+    pub(crate) manage_signatures: Option<Rc<dyn Fn(&gtk::Widget, Option<AccountId>)>>,
     /// Opens File ▸ Options on the Mail → My Templates section - the
     /// composer's template menu "Manage Templates…" item (item 2.10 / C-17).
     /// Late-bound, like `manage_signatures`.
