@@ -1654,9 +1654,9 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, F
     // document isn't relied on here - this listener owns the whole path
     // explicitly, guarded so a second `load_html` (this composer never
     // re-loads, but this stays safe if that ever changes) doesn't double up.
-    // Drag-and-drop image insertion is out of scope: dropping is prevented
-    // outright rather than left to an unverified WebKit default (which could
-    // otherwise navigate the frame to a dropped file).
+    // Native HTML drag is deliberately disabled: selecting or moving over
+    // text must not leave a WebKit/GDK drag preview on the desktop. File
+    // drops are handled by the single GTK target on the composer content.
     {
         let web_view = web_view.clone();
         web_view.connect_load_changed(move |view, event| {
@@ -1682,8 +1682,18 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, F
                         return;
                     }
                 });
-                document.body.addEventListener('dragover', function (e) { e.preventDefault(); });
-                document.body.addEventListener('drop', function (e) { e.preventDefault(); });
+                // Cancel at the source, before WebKit starts a native drag.
+                // Ordinary selection, clipboard and keyboard editing remain.
+                document.addEventListener('dragstart', function (e) {
+                    e.preventDefault();
+                }, true);
+                document.addEventListener('dragover', function (e) {
+                    e.preventDefault();
+                    if (e.dataTransfer) e.dataTransfer.dropEffect = 'none';
+                }, true);
+                document.addEventListener('drop', function (e) {
+                    e.preventDefault();
+                }, true);
             })()"#;
             let view = view.clone();
             glib::spawn_future_local(async move {
@@ -2064,6 +2074,9 @@ async fn add_attachment_from_file(file: &gio::File, attachments: &Rc<RefCell<Vec
 /// onto the composer body is Outlook's drag-in gesture.
 fn install_file_drop_target(widget: &impl IsA<gtk::Widget>, attachments: Rc<RefCell<Vec<PendingAttachment>>>, flow: gtk::FlowBox) {
     let target = gtk::DropTarget::new(gtk::gdk::FileList::static_type(), gtk::gdk::DragAction::COPY);
+    // One ancestor target intercepts actual file drops before WebKit or
+    // GtkTextView can negotiate their own native drop operation.
+    target.set_propagation_phase(gtk::PropagationPhase::Capture);
     target.connect_drop(move |_target, value, _x, _y| {
         let Ok(files) = value.get::<gtk::gdk::FileList>() else {
             return false;
@@ -3299,9 +3312,9 @@ pub fn build_compose_view(
     // File drop (item 1.20 / C-15): dropping files onto the composer body
     // attaches them - on the plain-text and rich editors and the column
     // around them, so a drop anywhere in the message area is caught.
+    // A single capture-phase target covers both body modes and the rest of
+    // the content. Nested targets could negotiate/finish the same GDK drop.
     install_file_drop_target(&content, attachments.clone(), attachment_flow.clone());
-    install_file_drop_target(&body_view, attachments.clone(), attachment_flow.clone());
-    install_file_drop_target(&*rich_web_view, attachments.clone(), attachment_flow.clone());
 
     {
         let on_done = on_done.clone();

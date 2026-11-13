@@ -26,3 +26,6 @@
 @define-color lookout-calendar-header #2b2c30;
 @define-color lookout-calendar-outside #202124;
 @define-color lookout-calendar-event-text #e1e3e9;
+
+/* Brighter selected formatting on graphite, without changing the page. */
+@define-color lookout-format-active-bg mix(@lookout-icon-toolbar-bg, @accent_color, 0.58);

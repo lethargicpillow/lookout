@@ -118,3 +118,6 @@
 @define-color lookout-calendar-header @headerbar_bg_color;
 @define-color lookout-calendar-outside alpha(@view_fg_color, 0.035);
 @define-color lookout-calendar-event-text @view_fg_color;
+
+/* Active editor formatting controls, distinct from hover. */
+@define-color lookout-format-active-bg alpha(@accent_bg_color, 0.20);

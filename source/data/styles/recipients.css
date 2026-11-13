@@ -141,4 +141,9 @@ button.compose-send { padding: 4px 6px; }
 .compose-completion-panel row { padding: 2px; }
 
 /* Reflect formatting at the editor caret without changing button geometry. */
-button.compose-format-active { background-color: alpha(@accent_bg_color, 0.20); }
+button.compose-format-active,
+.compose-format-block button.compose-format-active,
+.compose-format-block button.compose-format-active:hover,
+.ribbon button.compose-format-active:hover {
+    background-color: @lookout-format-active-bg;
+}
