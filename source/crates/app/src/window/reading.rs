@@ -306,15 +306,8 @@ pub(crate) fn reveal_message_page(reading_stack: &gtk::Stack, content_stack: &gt
 /// children (attachment strip, body stack) with ones the header/action-bar
 /// widgets add around them.
 pub(crate) fn find_named_child(reading_stack: &gtk::Stack, name: &str) -> Option<gtk::Widget> {
-    let page = reading_stack.child_by_name("message").and_downcast::<gtk::Box>()?;
-    let mut child = page.first_child();
-    while let Some(c) = child {
-        if c.widget_name() == name {
-            return Some(c);
-        }
-        child = c.next_sibling();
-    }
-    None
+    let page = reading_stack.child_by_name("message")?;
+    find_named_descendant(&page, name)
 }
 
 /// Walks the widget tree under `root` depth-first looking for the first widget

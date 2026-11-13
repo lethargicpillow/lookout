@@ -3224,8 +3224,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     content_stack.add_named(&web_view, Some("html"));
     content_stack.add_named(&text_scroller, Some("text"));
     let message_page = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
+    // Message metadata can be arbitrarily tall (many recipients or files).
+    // Give it its own bounded viewport, not a minimum size for the window.
+    let message_details = gtk::Box::new(gtk::Orientation::Vertical, 0);
     message_page.append(&message_header.subject_bar);
-    message_page.append(&message_header.widget);
+    message_details.append(&message_header.widget);
     // The attachment strip and body content stack are named children -
     // `find_named_child` locates them by walk rather than relying on sibling
     // order, so `action_bar` can sit after the body without breaking
@@ -3238,7 +3241,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     attachment_strip.set_margin_top(8);
     attachment_strip.set_margin_bottom(4);
     attachment_strip.set_visible(false);
-    message_page.append(&attachment_strip);
+    message_details.append(&attachment_strip);
     // The iMIP invite-details card, between the attachments and the body.
     // The `adw::Banner` at the bottom of the page only fits a title and a
     // button, so this card carries what the invitation actually says - when,
@@ -3294,13 +3297,23 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     imip_join_button.set_widget_name("imip-join-button");
     imip_join_button.set_visible(false);
     imip_invite_card.append(&imip_join_button);
-    message_page.append(&imip_invite_card);
+    message_details.append(&imip_invite_card);
     // The delivery status notification card (M-27 / C-07), above the body:
     // a message that is an RFC 3464 report shows its verdict and per-recipient
     // outcome here, with the report's own prose still rendered below.
     // `render_delivery_report_card` fills it per message and hides it for
     // everything that isn't one.
-    message_page.append(&crate::window::build_delivery_report_card());
+    message_details.append(&crate::window::build_delivery_report_card());
+    let message_details_scroller = gtk::ScrolledWindow::builder()
+        .child(&message_details)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_height(true)
+        .max_content_height(240)
+        .vexpand(false)
+        .build();
+    message_page.append(&message_details_scroller);
+    content_stack.set_vexpand(true);
     message_page.append(&content_stack);
     // The List-Unsubscribe banner, between the header and the body: revealed
     // by `render_body` when the message's headers offer an unsubscribe
@@ -5429,8 +5442,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .orientation(gtk::Orientation::Vertical)
         .start_child(&folder_scroller)
         .end_child(&overview_scroller)
-        .resize_start_child(true)
-        .resize_end_child(false)
+        // Keep the user's divider at the same top-relative position when
+        // a message or background agenda update triggers a new allocation.
+        .resize_start_child(false)
+        .resize_end_child(true)
         .shrink_start_child(true)
         .shrink_end_child(true)
         .position(460)

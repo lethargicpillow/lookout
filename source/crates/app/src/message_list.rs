@@ -1358,6 +1358,7 @@ pub struct MessageListModel {
     /// The viewport attached by window.rs. Metadata-only refreshes use it
     /// to recover from a GTK scroll reset, never to force a jump to row zero.
     scroller: Rc<RefCell<Option<(gtk::ScrolledWindow, gtk::ListView)>>>,
+    scroll_interaction: Rc<Cell<u64>>,
     realized_rows: Rc<RefCell<Vec<glib::WeakRef<gtk::ListItem>>>>,
 }
 
@@ -1447,6 +1448,7 @@ impl MessageListModel {
             generation: Rc::new(Cell::new(0)),
             worker,
             scroller: Rc::new(RefCell::new(None)),
+            scroll_interaction: Rc::new(Cell::new(0)),
             realized_rows: Rc::new(RefCell::new(Vec::new())),
         }
     }
@@ -1455,6 +1457,29 @@ impl MessageListModel {
     /// position instead of letting a replaced GTK row reset the scroll.
     pub fn attach_scroller(&self, scroller: &gtk::ScrolledWindow, view: &gtk::ListView) {
         *self.scroller.borrow_mut() = Some((scroller.clone(), view.clone()));
+        // A pending metadata-only restore must never fight a new user scroll,
+        // scrollbar drag or keyboard navigation.
+        let epoch = self.scroll_interaction.clone();
+        let wheel = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+        wheel.set_propagation_phase(gtk::PropagationPhase::Capture);
+        wheel.connect_scroll(move |_, _, _| {
+            epoch.set(epoch.get().wrapping_add(1));
+            glib::Propagation::Proceed
+        });
+        scroller.add_controller(wheel);
+        let epoch = self.scroll_interaction.clone();
+        let click = gtk::GestureClick::new();
+        click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        click.connect_pressed(move |_, _, _, _| epoch.set(epoch.get().wrapping_add(1)));
+        scroller.add_controller(click);
+        let epoch = self.scroll_interaction.clone();
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        keys.connect_key_pressed(move |_, _, _, _| {
+            epoch.set(epoch.get().wrapping_add(1));
+            glib::Propagation::Proceed
+        });
+        scroller.add_controller(keys);
     }
 
     pub(crate) fn realized_rows(&self) -> Rc<RefCell<Vec<glib::WeakRef<gtk::ListItem>>>> {
@@ -1499,39 +1524,39 @@ impl MessageListModel {
     fn preserve_scroll(&self, value: f64, anchor: Option<(RowIdentity, bool)>) {
         let Some((scroller, view)) = self.scroller.borrow().clone() else { return; };
         let adjustment = scroller.vadjustment();
-        // A selected item that was visible before the splice must retain
-        // its focus, otherwise GTK can re-anchor to the first list row.
-        // Do not focus a selection that was off-screen or in another pane.
-        if let Some((identity, focus)) = anchor {
-            if let Some(pos) = (0..self.selection.n_items())
-                .find(|&pos| self.row_identity_at(pos).as_ref() == Some(&identity)) {
-                if focus || (value > 1.0 && adjustment.value() <= 1.0) {
+        // Restore focus only if the list has actually lost its anchor.
+        // Calling scroll_to on a still-visible selection can move the
+        // viewport by several rows, even if it has not reset to zero.
+        if value > 1.0 && adjustment.value() <= 1.0 {
+            if let Some((identity, focus)) = anchor {
+                if let Some(pos) = (0..self.selection.n_items())
+                    .find(|&pos| self.row_identity_at(pos).as_ref() == Some(&identity)) {
                     let flags = if focus { gtk::ListScrollFlags::FOCUS } else { gtk::ListScrollFlags::empty() };
                     view.scroll_to(pos, flags, None);
                 }
             }
         }
-        let restore_if_reset = |adjustment: &gtk::Adjustment| {
-            if value > 1.0 && adjustment.value() <= 1.0 {
-                adjustment.set_value(value);
+        fn restore(adjustment: &gtk::Adjustment, value: f64) {
+            let upper = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+            let target = value.clamp(adjustment.lower(), upper);
+            if (adjustment.value() - target).abs() > 0.5 {
+                adjustment.set_value(target);
             }
-        };
-        restore_if_reset(&adjustment);
-        if value <= 1.0 || !view.is_mapped() { return; }
+        }
+        restore(&adjustment, value);
+        if !view.is_mapped() { return; }
         let generation = self.generation.clone();
         let expected = generation.get();
+        let interaction = self.scroll_interaction.clone();
+        let expected_interaction = interaction.get();
         let weak = scroller.downgrade();
-        // The first frame may precede the layout that resets the anchor.
-        // Check once more on the next frame, then release the callback.
-        // Never override a nonzero position chosen in the meantime.
         let frames = Cell::new(0u8);
         view.add_tick_callback(move |_, _| {
-            if generation.get() != expected { return glib::ControlFlow::Break; }
-            let Some(scroller) = weak.upgrade() else { return glib::ControlFlow::Break; };
-            let adjustment = scroller.vadjustment();
-            if adjustment.value() <= 1.0 {
-                adjustment.set_value(value);
+            if generation.get() != expected || interaction.get() != expected_interaction {
+                return glib::ControlFlow::Break;
             }
+            let Some(scroller) = weak.upgrade() else { return glib::ControlFlow::Break; };
+            restore(&scroller.vadjustment(), value);
             frames.set(frames.get() + 1);
             if frames.get() >= 2 { glib::ControlFlow::Break } else { glib::ControlFlow::Continue }
         });
