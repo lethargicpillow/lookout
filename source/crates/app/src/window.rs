@@ -8109,11 +8109,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             // not stored entries (item 4.7.8), so the pane shows the selected
             // hit through its own renderer.
             if state.borrow().contacts_directory_active {
-                let person = {
+                let (person, account) = {
                     let st = state.borrow();
-                    st.contacts_directory_selected.and_then(|index| st.contacts_directory_results.get(index).cloned())
+                    (st.contacts_directory_selected.and_then(|index| st.contacts_directory_results.get(index).cloned()),
+                     st.contacts_directory_account.clone())
                 };
-                contacts_details.set_directory_person(person.as_ref(), &actions);
+                let oab_path = account.as_ref().and_then(|id| crate::oab_cache::existing_path(&id.0));
+                contacts_details.set_directory_person(person.as_ref(), &actions, oab_path, &worker);
                 return;
             }
             let entry = contacts_list

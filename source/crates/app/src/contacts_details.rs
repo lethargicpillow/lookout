@@ -211,7 +211,7 @@ impl ContactsDetailsPane {
     /// pane's four stored-contact tabs don't apply to someone who isn't in the
     /// address book, so the switcher is hidden and Overview carries the
     /// directory's fields plus Send email / Add to contacts.
-    pub fn set_directory_person(&self, person: Option<&DirectoryPerson>, actions: &ContactsDetailsActions) {
+    pub fn set_directory_person(&self, person: Option<&DirectoryPerson>, actions: &ContactsDetailsActions, oab_path: Option<std::path::PathBuf>, worker: &Rc<Worker>) {
         clear_box(&self.header_slot);
         clear_box(&self.actions_slot);
         for tab in [&self.overview, &self.contact_info, &self.emails, &self.files] {
@@ -231,6 +231,29 @@ impl ContactsDetailsPane {
         self.header_slot.append(&build_directory_header(person));
         self.actions_slot.append(&build_directory_actions(person, actions));
         fill_directory_overview(&self.overview, person);
+        if let Some(path) = oab_path {
+            let address = person.address.clone();
+            let name = person.name.clone().unwrap_or_default();
+            let (tx, rx) = async_channel::bounded(1);
+            worker.spawn(async move {
+                let result = tokio::task::spawn_blocking(move || crate::oab_cache::details(&path, &address, &name)).await;
+                let _ = tx.send(result).await;
+            });
+            let overview = self.overview.clone();
+            let generation = self.generation.clone();
+            let expected = generation.get();
+            glib::spawn_future_local(async move {
+                let result = rx.recv().await;
+                if generation.get() != expected { return; }
+                match result {
+                    Ok(Ok(Ok(Some(details)))) => fill_oab_details(&overview, &details),
+                    Ok(Ok(Ok(None))) => {},
+                    Ok(Ok(Err(e))) => tracing::warn!("GAL details read failed: {e}"),
+                    Ok(Err(e)) => tracing::warn!("GAL details task failed: {e}"),
+                    Err(_) => {},
+                }
+            });
+        }
     }
 
     /// Whether the pane is currently showing the inline editor (UX-65.7).
@@ -545,6 +568,29 @@ fn fill_directory_overview(container: &gtk::Box, person: &DirectoryPerson) {
     if let Some(company) = person.company.as_deref().map(str::trim).filter(|company| !company.is_empty()) {
         container.append(&section_heading("Company"));
         container.append(&info_value(company));
+    }
+}
+
+/// Additional fields from an account's local GAL. The existing overview
+/// owns email/title/company; don't repeat those fields in a second section.
+fn fill_oab_details(container: &gtk::Box, details: &crate::oab_cache::Details) {
+    let rows = [
+        ("First name", details.given_name.as_str()),
+        ("Last name", details.surname.as_str()),
+        ("Department", details.department.as_str()),
+        ("Office", details.office.as_str()),
+        ("Work phone", details.business_phone.as_str()),
+        ("Mobile phone", details.mobile_phone.as_str()),
+    ];
+    for (label, value) in rows {
+        if !value.trim().is_empty() {
+            container.append(&section_heading(label));
+            container.append(&info_value(value.trim()));
+        }
+    }
+    if details.object_type == Some(8) {
+        container.append(&section_heading("Object type"));
+        container.append(&info_value("Distribution group"));
     }
 }
 

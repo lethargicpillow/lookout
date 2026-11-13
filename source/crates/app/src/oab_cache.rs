@@ -96,6 +96,38 @@ fn write_book(path: &Path, book: &crate::oab_decode::Book) -> rusqlite::Result<(
     tx.commit()
 }
 
+/// Extended details already stored by the full OAB import. Keep this
+/// separate from the lightweight Graph/LDAP recipient suggestion model.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Details {
+    pub given_name: String,
+    pub surname: String,
+    pub department: String,
+    pub office: String,
+    pub business_phone: String,
+    pub mobile_phone: String,
+    pub object_type: Option<u32>,
+}
+
+pub(crate) fn details(path: &Path, address: &str, name: &str) -> rusqlite::Result<Option<Details>> {
+    use rusqlite::OptionalExtension;
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    // The name + SMTP pair is the same as the paged directory entry;
+    // gal_sort already indexes sort_name and smtp in existing caches.
+    conn.query_row(
+        "SELECT given_name,surname,department,office,business_phone,mobile_phone,object_type
+         FROM gal WHERE sort_name=?1 AND smtp=?2 ORDER BY rowid LIMIT 1",
+        params![name.to_lowercase(), address],
+        |row| Ok(Details {
+            given_name: row.get(0)?, surname: row.get(1)?,
+            department: row.get(2)?, office: row.get(3)?,
+            business_phone: row.get(4)?, mobile_phone: row.get(5)?,
+            object_type: row.get(6)?,
+        }),
+    ).optional()
+}
+
 pub(crate) struct Page {
     pub people: Vec<DirectoryPerson>,
     pub total: usize,
@@ -161,13 +193,21 @@ mod tests {
         let path = std::env::temp_dir().join(format!("lookout-gal-{}.sqlite",uuid::Uuid::new_v4()));
         let mut book = crate::oab_decode::Book { serial: 1, declared_records: 3, properties: vec![], contacts: vec![], present_counts: Default::default() };
         for (name, smtp, kind) in [("Борис","b@example.invalid",6),("Алиса","a@example.invalid",6),("Группа","g@example.invalid",8)] {
-            book.contacts.push(crate::oab_decode::Contact { display_name:name.into(),smtp:smtp.into(),object_type:Some(kind),..Default::default() });
+            book.contacts.push(crate::oab_decode::Contact { display_name:name.into(),smtp:smtp.into(),object_type:Some(kind),
+                department:"Engineering".into(),office:"101".into(),business_phone:"123".into(),mobile_phone:"456".into(),..Default::default() });
         }
         write_book(&path,&book).unwrap();
         let p = read_page(&path,"",0,2).unwrap();
         assert_eq!(p.total,3);
         assert_eq!(p.people[0].name.as_deref(),Some("Алиса"));
         assert_eq!(read_page(&path,"АЛИ",0,100).unwrap().total,1);
+        let d = details(&path,"a@example.invalid","Алиса").unwrap().unwrap();
+        assert_eq!(d.department,"Engineering");
+        assert_eq!(d.office,"101");
+        assert_eq!(d.business_phone,"123");
+        assert_eq!(d.mobile_phone,"456");
+        assert_eq!(d.object_type,Some(6));
+        assert!(details(&path,"a@example.invalid","Другой").unwrap().is_none());
         assert_eq!(read_page(&path,"",2,2).unwrap().people[0].title.as_deref(),Some("Distribution group"));
         book.contacts.truncate(1);
         write_book(&path,&book).unwrap();
