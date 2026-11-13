@@ -1843,6 +1843,7 @@ pub fn rebuild_contacts_list_ui(
     refresh_actions: &Rc<dyn Fn()>,
     details_refresh: &Rc<dyn Fn()>,
 ) {
+    let directory_list = state.borrow().contacts_directory_list.clone();
     // Remember which contact was showing before the rebuild so the details
     // pane (and the list selection) can stay on it across a star toggle or a
     // sync repaint.
@@ -1858,6 +1859,7 @@ pub fn rebuild_contacts_list_ui(
 
     let Some(choice) = categories.borrow().get(selected_category_index as usize).cloned() else {
         state.borrow_mut().contacts_directory_active = false;
+        if let Some(view) = &directory_list { view.show_stored(); }
         contacts.borrow_mut().clear();
         selected.borrow_mut().clear();
         refresh_actions();
@@ -1870,10 +1872,22 @@ pub fn rebuild_contacts_list_ui(
     // stored list/selection empty, so the bulk actions stay insensitive.
     if choice.is_directory() {
         state.borrow_mut().contacts_directory_active = true;
+        if state.borrow().contacts_directory_local {
+            if let Some(view) = &directory_list {
+                contacts.borrow_mut().clear();
+                selected.borrow_mut().clear();
+                refresh_actions();
+                view.render(state);
+                details_refresh();
+                return;
+            }
+        }
+        if let Some(view) = &directory_list { view.show_stored(); }
         rebuild_directory_list_ui(contact_list, state, contacts, selected, refresh_actions, details_refresh);
         return;
     }
     state.borrow_mut().contacts_directory_active = false;
+    if let Some(view) = &directory_list { view.show_stored(); }
 
     let category_label = contacts_bucket_label(&choice.kind);
     let favourites_only = matches!(choice.kind, ContactsBucketKind::Favourites);

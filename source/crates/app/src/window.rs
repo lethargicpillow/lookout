@@ -645,7 +645,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         contacts_refresh_all: None,
         contacts_directory_source: None,
         contacts_directory_account: None,
-        contacts_directory_offset: 0,
+        contacts_directory_list: None,
         contacts_directory_total: 0,
         contacts_directory_local: false,
         contacts_directory_query: String::new(),
@@ -4007,6 +4007,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .vexpand(true)
         .hscrollbar_policy(gtk::PolicyType::Never)
         .build();
+    let directory_list = Rc::new(crate::directory_list::DirectoryList::new(&contacts_scroller, &state));
+    state.borrow_mut().contacts_directory_list = Some(directory_list.clone());
     let contacts_right_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
     contacts_right_box.set_margin_start(8);
     contacts_right_box.set_margin_end(8);
@@ -4053,19 +4055,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     contacts_directory_search_entry.set_hexpand(true);
     let contacts_directory_search_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
     contacts_directory_search_row.append(&contacts_directory_search_entry);
-    let directory_prev = gtk::Button::from_icon_name("go-previous-symbolic");
-    let directory_next = gtk::Button::from_icon_name("go-next-symbolic");
-    let directory_page_label = gtk::Label::new(None);
-    directory_prev.set_tooltip_text(Some("Previous directory page"));
-    directory_next.set_tooltip_text(Some("Next directory page"));
-    directory_prev.set_sensitive(false);
-    directory_next.set_sensitive(false);
-    contacts_directory_search_row.append(&directory_prev);
-    contacts_directory_search_row.append(&directory_page_label);
-    contacts_directory_search_row.append(&directory_next);
+    let directory_count_label = gtk::Label::new(None);
+    directory_count_label.add_css_class("dim-label");
+    contacts_directory_search_row.append(&directory_count_label);
     contacts_directory_search_row.set_visible(false);
     contacts_right_box.append(&contacts_directory_search_row);
-    contacts_right_box.append(&contacts_scroller);
+    contacts_right_box.append(&directory_list.root);
 
     let contacts_left_card = card_section(&contacts_left_box);
     contacts_left_card.add_css_class("folder-pane");
@@ -7970,9 +7965,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let run_directory_search: Rc<dyn Fn(&str)> = {
         let state = state.clone();
         let worker = worker.clone();
-        let directory_prev = directory_prev.clone();
-        let directory_next = directory_next.clone();
-        let directory_page_label = directory_page_label.clone();
+        let directory_count_label = directory_count_label.clone();
         Rc::new(move |query: &str| {
             let query = query.trim().to_string();
             let account = state.borrow().contacts_directory_account.clone();
@@ -7980,7 +7973,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let generation = {
                 let mut st = state.borrow_mut();
                 st.contacts_directory_generation = st.contacts_directory_generation.wrapping_add(1);
-                if st.contacts_directory_query != query { st.contacts_directory_offset = 0; }
                 st.contacts_directory_query = query.clone();
                 st.contacts_directory_local = !paths.is_empty();
                 st.contacts_directory_total = 0;
@@ -7995,26 +7987,21 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     refresh();
                 }
             };
-            directory_prev.set_sensitive(false);
-            directory_next.set_sensitive(false);
-            directory_page_label.set_label("");
+            directory_count_label.set_label("");
             if !paths.is_empty() {
-                let offset = state.borrow().contacts_directory_offset;
                 state.borrow_mut().contacts_directory_searching = true;
                 repaint();
                 let (tx, rx) = async_channel::bounded(1);
                 let q = query.clone();
                 worker.spawn(async move {
-                    let result = tokio::task::spawn_blocking(move || crate::oab_cache::page(&paths, &q, offset, crate::oab_cache::PAGE_SIZE)).await;
+                    let result = tokio::task::spawn_blocking(move || crate::oab_cache::page(&paths, &q, 0, i64::MAX as usize)).await;
                     let _ = tx.send(result).await;
                 });
                 let state = state.clone();
-                let prev = directory_prev.clone();
-                let next = directory_next.clone();
-                let label = directory_page_label.clone();
+                let label = directory_count_label.clone();
                 glib::spawn_future_local(async move {
                     let result = rx.recv().await;
-                    let (total, count) = {
+                    let total = {
                         let mut st = state.borrow_mut();
                         if st.contacts_directory_generation != generation || !st.contacts_directory_active { return; }
                         st.contacts_directory_searching = false;
@@ -8026,11 +8013,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                             }
                             other => { tracing::warn!("local GAL page failed: {}", match other { Ok(Ok(Err(e))) => e, Ok(Err(e)) => e.to_string(), Err(e) => e.to_string(), _ => String::new() }); }
                         }
-                        (st.contacts_directory_total, st.contacts_directory_results.len())
+                        st.contacts_directory_total
                     };
-                    label.set_label(&format!("{}–{} / {}", if count == 0 { 0 } else { offset + 1 }, offset + count, total));
-                    prev.set_sensitive(offset > 0);
-                    next.set_sensitive(offset + count < total && count > 0);
+                    label.set_label(&format!("{total}"));
                     let refresh = state.borrow().contacts_list_refresh.clone();
                     if let Some(refresh) = refresh { refresh(); }
                 });
@@ -8074,21 +8059,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             );
         })
     };
-
-    for (button, forward) in [(&directory_prev, false), (&directory_next, true)] {
-        let state = state.clone();
-        let run = run_directory_search.clone();
-        button.connect_clicked(move |_| {
-            let query = {
-                let mut st = state.borrow_mut();
-                st.contacts_directory_offset = if forward {
-                    st.contacts_directory_offset.saturating_add(crate::oab_cache::PAGE_SIZE)
-                } else { st.contacts_directory_offset.saturating_sub(crate::oab_cache::PAGE_SIZE) };
-                st.contacts_directory_query.clone()
-            };
-            run(&query);
-        });
-    }
 
     // Repaints the details pane for whichever contact is selected in the
     // middle list (UX-65). Reads the row's stashed index (letter headers mean
@@ -8202,7 +8172,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         st.contacts_directory_account = directory_account;
                         st.contacts_directory_active = true;
                         st.contacts_directory_source = None;
-                        st.contacts_directory_offset = 0;
                     }
                     run_directory_search(&contacts_directory_search_entry.text());
                 }

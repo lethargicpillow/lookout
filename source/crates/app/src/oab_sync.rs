@@ -111,7 +111,6 @@ pub(crate) fn start(state: Rc<RefCell<UiState>>, worker: Rc<Worker>, refresh: Rc
                             let mut st = state.borrow_mut();
                             st.contacts_directory_source = None;
                             if st.contacts_directory_active && st.contacts_directory_account.as_ref().is_some_and(|a| a.0 == id) {
-                                st.contacts_directory_offset = 0;
                                 Some(st.contacts_directory_query.clone())
                             } else { None }
                         };
