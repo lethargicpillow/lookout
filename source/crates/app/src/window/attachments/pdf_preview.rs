@@ -134,6 +134,39 @@ fn set_scroll(adjustment: &gtk::Adjustment, value: f64) {
     adjustment.set_value(value.clamp(lower, (adjustment.upper() - adjustment.page_size()).max(lower)));
 }
 
+// GtkScrolledWindow installs both capture- and bubble-phase wheel
+// controllers (including kinetic deceleration). Keeping either active
+// permits an independent adjustment update during pointer-anchored zoom.
+// Preserve its layout, keyboard bindings and scrollbar drag gestures,
+// but route all wheel input through the preview's single dispatcher.
+fn disable_native_wheel(widget: &impl IsA<gtk::Widget>) {
+    let controllers = widget.observe_controllers();
+    for index in 0..controllers.n_items() {
+        if let Some(controller) = controllers.item(index)
+            .and_downcast::<gtk::EventControllerScroll>()
+        {
+            controller.set_propagation_phase(gtk::PropagationPhase::None);
+        }
+    }
+}
+
+// Scrollbars contain a range widget with its own wheel controller.
+// Disable those too, without interfering with click or drag gestures.
+fn disable_scrollbar_wheel(widget: &gtk::Widget) {
+    disable_native_wheel(widget);
+    let mut child = widget.first_child();
+    while let Some(current) = child {
+        child = current.next_sibling();
+        disable_scrollbar_wheel(&current);
+    }
+}
+
+fn scroll_pixels(dx: f64, dy: f64, surface: bool, shift: bool) -> (f64, f64) {
+    let factor = if surface { 1.0 } else { 48.0 };
+    let (dx, dy) = if shift && dx == 0.0 { (dy, 0.0) } else { (dx, dy) };
+    (dx * factor, dy * factor)
+}
+
 // A texture's intrinsic dimensions must not determine its GTK layout:
 // the same raster is drawn immediately at every slider position, including
 // zooming down, until Poppler supplies a sharper raster at the final zoom.
@@ -517,7 +550,12 @@ pub(super) fn show(content: &gtk::Box, bytes: &[u8]) {
         .hscrollbar_policy(gtk::PolicyType::Automatic)
         .vscrollbar_policy(gtk::PolicyType::Automatic)
         .propagate_natural_width(false).propagate_natural_height(false)
-        .overlay_scrolling(false).vexpand(true).hexpand(true).build();
+        .overlay_scrolling(false).kinetic_scrolling(false)
+        .vexpand(true).hexpand(true).build();
+    viewport.set_scroll_to_focus(false);
+    disable_native_wheel(&scroller);
+    disable_scrollbar_wheel(&scroller.hscrollbar());
+    disable_scrollbar_wheel(&scroller.vscrollbar());
     let document = gtk::Overlay::new();
     document.set_hexpand(true);
     document.set_vexpand(true);
@@ -649,9 +687,10 @@ pub(super) fn show(content: &gtk::Box, bytes: &[u8]) {
     }
     viewport.set_cursor_from_name(Some("grab"));
     viewport.add_controller(drag);
-    // Handle the raw scroll event in the ancestor capture phase. Unlike
-    // a discrete scroll controller, this consumes every Ctrl+scroll event
-    // (including smooth deltas and stop events) before GtkScrolledWindow.
+    // This is the sole wheel dispatcher. Native wheel controllers are
+    // disabled above, so no second adjustment update can race the zoom.
+    // Capture raw events to preserve smooth deltas, modifier state and
+    // the pointer position, and consume both ordinary and Ctrl scrolling.
     let scroll = gtk::EventControllerLegacy::new();
     scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
     let weak = Rc::downgrade(&preview);
@@ -661,32 +700,45 @@ pub(super) fn show(content: &gtk::Box, bytes: &[u8]) {
         let Some(event_scroll) = event.downcast_ref::<gtk::gdk::ScrollEvent>() else {
             return glib::Propagation::Proceed;
         };
-        let ctrl = event.modifier_state().contains(gtk::gdk::ModifierType::CONTROL_MASK);
-        let Some(preview) = weak.upgrade() else { return glib::Propagation::Proceed; };
-        if !ctrl {
-            smooth.set(0.0);
-            preview.cancel_anchor();
-            return glib::Propagation::Proceed;
-        }
+        let modifiers = event.modifier_state();
+        let ctrl = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK);
+        let shift = modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK);
+        let Some(preview) = weak.upgrade() else { return glib::Propagation::Stop; };
         if event_scroll.is_stop() {
             smooth.set(0.0);
             return glib::Propagation::Stop;
         }
-        let dy = match event_scroll.direction() {
-            gtk::gdk::ScrollDirection::Up => -1.0,
-            gtk::gdk::ScrollDirection::Down => 1.0,
-            gtk::gdk::ScrollDirection::Smooth => {
-                let (_, delta) = event_scroll.deltas();
-                let delta = if event_scroll.unit() == gtk::gdk::ScrollUnit::Surface {
-                    delta / 40.0
-                } else { delta };
-                let total = smooth.get() + delta;
-                let steps = total.trunc();
-                smooth.set(total - steps);
-                steps
-            }
-            _ => 0.0,
+        let direction = event_scroll.direction();
+        let (dx, dy) = match direction {
+            gtk::gdk::ScrollDirection::Up => (0.0, -1.0),
+            gtk::gdk::ScrollDirection::Down => (0.0, 1.0),
+            gtk::gdk::ScrollDirection::Left => (-1.0, 0.0),
+            gtk::gdk::ScrollDirection::Right => (1.0, 0.0),
+            gtk::gdk::ScrollDirection::Smooth => event_scroll.deltas(),
+            _ => (0.0, 0.0),
         };
+        let surface = direction == gtk::gdk::ScrollDirection::Smooth
+            && event_scroll.unit() == gtk::gdk::ScrollUnit::Surface;
+        tracing::debug!(ctrl, shift, dx, dy, "PDF wheel dispatch");
+        if !ctrl {
+            smooth.set(0.0);
+            preview.cancel_anchor();
+            if let Some(scroller) = preview.scroller.upgrade() {
+                let (x, y) = scroll_pixels(dx, dy, surface, shift);
+                let h = scroller.hadjustment();
+                let v = scroller.vadjustment();
+                set_scroll(&h, h.value() + x);
+                set_scroll(&v, v.value() + y);
+            }
+            return glib::Propagation::Stop;
+        }
+        let dy = if direction == gtk::gdk::ScrollDirection::Smooth {
+            let delta = if surface { dy / 40.0 } else { dy };
+            let total = smooth.get() + delta;
+            let steps = total.trunc();
+            smooth.set(total - steps);
+            steps
+        } else { dy };
         if preview.pages.get() > 0 && dy != 0.0 {
             let zoom = wheel_zoom(preview.zoom.get(), dy);
             if zoom != preview.zoom.get() {
@@ -733,6 +785,14 @@ mod tests {
         assert_eq!(p, 0.875);
         assert_eq!(anchor_position(p, 0.0, 800.0, 1600.0, 550.0), 800.0);
         assert_eq!(viewport_offset(Some((600.0, 120.0)), 800.0, 500.0), (600.0, 120.0));
+    }
+
+    #[test]
+    fn pdf_wheel_scroll_units_and_shift() {
+        assert_eq!(scroll_pixels(0.0, 1.0, false, false), (0.0, 48.0));
+        assert_eq!(scroll_pixels(0.0, -1.0, false, true), (-48.0, 0.0));
+        assert_eq!(scroll_pixels(12.0, -7.0, true, false), (12.0, -7.0));
+        assert_eq!(scroll_pixels(1.0, 2.0, false, true), (48.0, 96.0));
     }
 
     #[test]
