@@ -119,7 +119,24 @@ def discover(cfg):
         return {"status": "approval", "host": urlsplit(url).hostname}
     with requests.Session() as session:
         session.trust_env = False
-        while queue and len(seen) < 24:
+        while len(seen) < 24:
+            if not queue:
+                d = domain(address)
+                if d and d not in tried_fallback:
+                    tried_fallback.add(d)
+                    # HTTP is used ONLY to receive a redirect, without email,
+                    # credentials, cookies, or authorization.
+                    try:
+                        with requests.get("http://autodiscover." + d + PATH,
+                                          timeout=(4,5), allow_redirects=False, stream=True) as response:
+                            target = secure_url(response.headers.get("Location", "")) if response.is_redirect else None
+                            if target:
+                                queue.append((address, target))
+                    except requests.RequestException:
+                        pass
+                    queue.extend((address, u) for u in srv_candidates(d))
+            if not queue:
+                break
             address, url = queue.pop(0)
             if not secure_url(url) or (address, url) in seen:
                 continue
@@ -142,6 +159,8 @@ def discover(cfg):
                     challenge = response.headers.get("WWW-Authenticate", "").lower()
                     location = response.headers.get("Location", "")
                     data = read_xml(response) if status == 200 else None
+                if status == 401 and "bearer" in challenge and ("microsoftonline.com" in challenge or "outlook.com" in challenge):
+                    return {"status": "cloud"}
                 if status == 401 and ("ntlm" in challenge or "negotiate" in challenge or "basic" in challenge):
                     auth_needed = True
                     if not password:
@@ -191,21 +210,6 @@ def discover(cfg):
                         return result
             except (requests.RequestException, ValueError):
                 pass
-            if not queue:
-                d = domain(address)
-                if d and d not in tried_fallback:
-                    tried_fallback.add(d)
-                    # HTTP is used ONLY to receive a redirect, without email,
-                    # credentials, cookies, or authorization.
-                    try:
-                        with requests.get("http://autodiscover." + d + PATH,
-                                          timeout=(4,5), allow_redirects=False, stream=True) as response:
-                            target = secure_url(response.headers.get("Location", "")) if response.is_redirect else None
-                            if target:
-                                queue.append((address, target))
-                    except requests.RequestException:
-                        pass
-                    queue.extend((address, u) for u in srv_candidates(d))
         if first_untrusted:
             return approval(first_untrusted)
         if auth_needed and not password:
