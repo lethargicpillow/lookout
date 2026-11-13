@@ -8,11 +8,12 @@
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use adw::prelude::*;
+use gtk::{gio, glib};
 use lookout_core::{ContactList, EmailAddress};
 use lookout_graph::DirectoryPerson;
 
@@ -164,192 +165,134 @@ pub fn show_contact_picker(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>, di
         .margin_top(12)
         .build();
 
-    let list = gtk::ListBox::builder().css_classes(["boxed-list"]).build();
+    // Checked items outlive their visible rows and the current filter.
+    let selected: Rc<RefCell<HashMap<String, Item>>> = Rc::new(RefCell::new(HashMap::new()));
+    let count_label = gtk::Label::builder().label("0 selected").css_classes(["dim-label"]).build();
+    let store = gio::ListStore::new::<glib::BoxedAnyObject>();
+    let list = build_picker_list(&store, &selected, &count_label);
     let scroller = gtk::ScrolledWindow::builder()
         .child(&list)
+        .hscrollbar_policy(gtk::PolicyType::Never)
         .vexpand(true)
         .margin_start(12)
         .margin_end(12)
         .margin_top(6)
         .build();
 
-    // Keyed by the item's stable key rather than list position, so a check
-    // survives the list being rebuilt (filtered) out from under it.
-    let selected: Rc<RefCell<HashMap<String, Item>>> = Rc::new(RefCell::new(HashMap::new()));
-
-    // The directory hits currently shown, filled in asynchronously by the
-    // lookup below (item 4.7.7). Rebuilt row-by-row like `items`, but read-only
-    // and under their own header.
     let directory_items: Rc<RefCell<Vec<Item>>> = Rc::new(RefCell::new(Vec::new()));
+    let status = gtk::Label::builder().xalign(0.0).css_classes(["dim-label"])
+        .margin_start(12).margin_end(12).margin_top(6).build();
+    let generation = Rc::new(Cell::new(0u64));
+    let alive = Rc::new(Cell::new(true));
+    dialog.connect_close_request({
+        let alive = alive.clone();
+        move |_| { alive.set(false); glib::Propagation::Proceed }
+    });
 
-    let rebuild: Rc<RefCell<Box<dyn Fn()>>> = Rc::new(RefCell::new(Box::new(|| {})));
-    {
-        let items = items.clone();
+    let rebuild: Rc<dyn Fn(&str)> = {
+        let store = store.clone();
         let directory_items = directory_items.clone();
-        let list = list.clone();
-        let selected = selected.clone();
-        let search = search.clone();
-        *rebuild.borrow_mut() = Box::new(move || {
-            while let Some(child) = list.first_child() {
-                list.remove(&child);
+        Rc::new(move |query| {
+            let filter = query.trim().to_lowercase();
+            let local = items.iter().filter(|item| item.matches(&filter));
+            let hits = directory_items.borrow();
+            let mut rows: Vec<glib::BoxedAnyObject> = local.cloned()
+                .map(|item| glib::BoxedAnyObject::new(PickerRow::Item(item))).collect();
+            if !hits.is_empty() {
+                rows.push(glib::BoxedAnyObject::new(PickerRow::Header("Global Address List")));
+                rows.extend(hits.iter().cloned().map(|item| glib::BoxedAnyObject::new(PickerRow::Item(item))));
             }
-            let filter = search.text().to_string().to_lowercase();
-            // Owned clones, so the directory list isn't borrowed across the
-            // rebuild (its `RefCell` may be written by an in-flight lookup).
-            let matches: Vec<Item> = items.iter().filter(|item| item.matches(&filter)).cloned().collect();
-            // Directory results have already been matched by the server (which may
-            // search aliases or other attributes not in the displayed name).
-            let directory_matches: Vec<Item> = directory_items.borrow().clone();
+            store.splice(0, store.n_items(), &rows);
+        })
+    };
 
-            if matches.is_empty() && directory_matches.is_empty() {
-                let empty = gtk::Label::builder()
-                    .label(if items.is_empty() && directory_items.borrow().is_empty() {
-                        "Search the corporate directory by name or email"
-                    } else {
-                        "No contacts found"
-                    })
-                    .wrap(true)
-                    .halign(gtk::Align::Start)
-                    .css_classes(["dim-label"])
-                    .margin_top(12)
-                    .margin_bottom(12)
-                    .margin_start(10)
-                    .margin_end(10)
-                    .build();
-                crate::privacy::mark_ui(&empty);
-                list.append(&empty);
-                return;
-            }
-
-            for candidate in &matches {
-                append_picker_row(&list, candidate, &selected);
-            }
-            if !directory_matches.is_empty() {
-                append_section_header(&list, "Global Address List");
-                for candidate in &directory_matches {
-                    append_picker_row(&list, candidate, &selected);
-                }
-            }
-        });
-    }
-    (rebuild.borrow())();
-    let page_bar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).margin_start(12).margin_end(12).margin_top(6).build();
-    page_bar.set_visible(!gal_paths.is_empty());
-    let prev = gtk::Button::from_icon_name("go-previous-symbolic");
-    let next = gtk::Button::from_icon_name("go-next-symbolic");
-    let page_label = gtk::Label::new(None);
-    page_bar.append(&prev);
-    page_bar.append(&page_label);
-    page_bar.append(&next);
-    if !gal_paths.is_empty() {
-        let offset = Rc::new(std::cell::Cell::new(0usize));
-        let generation = Rc::new(std::cell::Cell::new(0u64));
-        let load: Rc<dyn Fn()> = Rc::new({
-            let search = search.clone();
-            let prev = prev.clone();
-            let next = next.clone();
-            let page_label = page_label.clone();
-            let offset = offset.clone();
-            let generation = generation.clone();
-            let directory_items = directory_items.clone();
-            let rebuild = rebuild.clone();
-            move || {
-                let query = search.text().to_string();
-                let start = offset.get();
-                let token = generation.get().wrapping_add(1);
-                generation.set(token);
-                prev.set_sensitive(false);
-                next.set_sensitive(false);
-                page_label.set_label("Loading GAL…");
-                directory_items.borrow_mut().clear();
-                (rebuild.borrow())();
-                let (tx, rx) = async_channel::bounded(1);
-                let paths = gal_paths.clone();
-                std::thread::spawn(move || {
-                    let result = crate::oab_cache::page(&paths, &query, start, crate::oab_cache::PAGE_SIZE);
-                    let _ = tx.send_blocking(result);
-                });
-                let generation = generation.clone();
-                let directory_items = directory_items.clone();
-                let rebuild = rebuild.clone();
-                let prev = prev.clone();
-                let next = next.clone();
-                let page_label = page_label.clone();
-                gtk::glib::spawn_future_local(async move {
-                    let result = rx.recv().await;
-                    if generation.get() != token { return; }
-                    match result {
-                        Ok(Ok(page)) => {
-                            let count = page.people.len();
-                            *directory_items.borrow_mut() = page.people.into_iter().map(Item::Directory).collect();
-                            page_label.set_label(&format!("GAL: {}–{} / {}", if count == 0 { 0 } else { start + 1 }, start + count, page.total));
-                            prev.set_sensitive(start > 0);
-                            next.set_sensitive(count > 0 && start + count < page.total);
-                        }
-                        _ => page_label.set_label("Could not read local GAL"),
-                    }
-                    (rebuild.borrow())();
-                });
-            }
-        });
-        search.connect_search_changed({
-            let offset = offset.clone();
-            let load = load.clone();
-            move |_| { offset.set(0); load(); }
-        });
-        for (button, forward) in [(&prev,false),(&next,true)] {
-            let offset = offset.clone();
-            let load = load.clone();
-            button.connect_clicked(move |_| {
-                offset.set(if forward { offset.get().saturating_add(crate::oab_cache::PAGE_SIZE) } else { offset.get().saturating_sub(crate::oab_cache::PAGE_SIZE) });
-                load();
-            });
-        }
-        load();
-    } else {
+    // The remote lookup remains available without an OAB, and as a fallback
+    // when a local query has no hits or the snapshot cannot be read.
+    let load: Rc<dyn Fn(String)> = {
         let rebuild = rebuild.clone();
         let directory_items = directory_items.clone();
-        search.connect_search_changed(move |entry| {
-            (rebuild.borrow())();
-            let Some(directory) = directory.clone() else { return };
-            let query = entry.text().trim().to_string();
-            if query.is_empty() {
-                // Nothing typed: drop the last query's hits rather than leave
-                // them under an empty search box.
-                directory_items.borrow_mut().clear();
-                (rebuild.borrow())();
-                return;
-            }
-            // The lookup answers from its cache on this call or, for a fresh
-            // prefix, after its debounce; its own keystroke generation guard
-            // means only the newest query delivers, so a stale reply can't
-            // overwrite the rows. The text check is a second guard against a
-            // cached reply landing after a newer keystroke.
-            let entry = entry.clone();
-            let issued = query.clone();
-            directory(
-                &query,
-                Rc::new({
-                    let directory_items = directory_items.clone();
-                    let rebuild = rebuild.clone();
-                    move |suggestions| {
-                        if entry.text().trim() != issued.as_str() {
-                            return;
-                        }
-                        let hits: Vec<Item> = suggestions
-                            .into_iter()
-                            .filter_map(|suggestion| match suggestion {
+        let generation = generation.clone();
+        let alive = alive.clone();
+        let status = status.clone();
+        Rc::new(move |query| {
+            let query = query.trim().to_owned();
+            let token = generation.get().wrapping_add(1);
+            generation.set(token);
+            directory_items.borrow_mut().clear();
+            rebuild(&query);
+            let remote: Rc<dyn Fn()> = {
+                let directory = directory.clone();
+                let query = query.clone();
+                let generation = generation.clone();
+                let alive = alive.clone();
+                let status = status.clone();
+                let directory_items = directory_items.clone();
+                let rebuild = rebuild.clone();
+                Rc::new(move || {
+                    let Some(lookup) = directory.as_ref().filter(|_| query.chars().count() >= crate::directory::DIRECTORY_MIN_CHARS) else {
+                        status.set_label(if query.is_empty() { "Search the directory by name or email" } else { "No directory matches" });
+                        return;
+                    };
+                    status.set_label("Searching directory…");
+                    lookup(&query, Rc::new({
+                        let query = query.clone();
+                        let generation = generation.clone();
+                        let alive = alive.clone();
+                        let status = status.clone();
+                        let directory_items = directory_items.clone();
+                        let rebuild = rebuild.clone();
+                        move |suggestions| {
+                            if !alive.get() || generation.get() != token { return; }
+                            let hits: Vec<Item> = suggestions.into_iter().filter_map(|s| match s {
                                 Suggestion::Directory(person) => Some(Item::Directory(person)),
                                 _ => None,
-                            })
-                            .collect();
-                        *directory_items.borrow_mut() = hits;
-                        (rebuild.borrow())();
+                            }).collect();
+                            status.set_label(&format!("Directory: {}", hits.len()));
+                            *directory_items.borrow_mut() = hits;
+                            rebuild(&query);
+                        }
+                    }));
+                })
+            };
+            if gal_paths.is_empty() { remote(); return; }
+            status.set_label("Loading GAL…");
+            let (tx, rx) = async_channel::bounded(1);
+            let paths = gal_paths.clone();
+            let query_for_read = query.clone();
+            std::thread::spawn(move || {
+                let result = crate::oab_cache::page(&paths, &query_for_read, 0, i64::MAX as usize);
+                let _ = tx.send_blocking(result);
+            });
+            let generation = generation.clone();
+            let alive = alive.clone();
+            let directory_items = directory_items.clone();
+            let status = status.clone();
+            let rebuild = rebuild.clone();
+            glib::spawn_future_local(async move {
+                let result = rx.recv().await;
+                if !alive.get() || generation.get() != token { return; }
+                match result {
+                    Ok(Ok(page)) => {
+                        status.set_label(&format!("GAL: {}", page.total));
+                        *directory_items.borrow_mut() = page.people.into_iter().map(Item::Directory).collect();
+                        rebuild(&query);
+                        if directory_items.borrow().is_empty() && query.chars().count() >= crate::directory::DIRECTORY_MIN_CHARS {
+                            remote();
+                        }
                     }
-                }),
-            );
-        });
-    }
+                    _ => {
+                        status.set_label("Could not read local GAL");
+                        if query.chars().count() >= crate::directory::DIRECTORY_MIN_CHARS { remote(); }
+                    }
+                }
+            });
+        })
+    };
+    search.connect_search_changed({
+        let load = load.clone();
+        move |entry| load(entry.text().to_string())
+    });
+    load(String::new());
 
     let cancel_button = gtk::Button::builder().label("Cancel").build();
     let add_button = gtk::Button::builder().label("Add").css_classes(["suggested-action"]).build();
@@ -378,6 +321,7 @@ pub fn show_contact_picker(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>, di
         .margin_start(12)
         .margin_end(12)
         .build();
+    action_row.append(&count_label);
     action_row.append(&cancel_button);
     action_row.append(&add_button);
 
@@ -385,7 +329,7 @@ pub fn show_contact_picker(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>, di
     let heading = gtk::Label::builder().label("Address Book — Contacts and Global Address List").xalign(0.0).margin_start(12).margin_top(12).css_classes(["heading"]).build();
     root.append(&heading);
     root.append(&search);
-    root.append(&page_bar);
+    root.append(&status);
     root.append(&scroller);
     root.append(&action_row);
     dialog.set_child(Some(&root));
@@ -393,85 +337,105 @@ pub fn show_contact_picker(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>, di
     search.grab_focus();
 }
 
-/// Appends one pickable row (checkbox + label + optional subtitle) to the
-/// picker's list, wired to the shared `selected` set by the item's stable key.
-fn append_picker_row(list: &gtk::ListBox, candidate: &Item, selected: &Rc<RefCell<HashMap<String, Item>>>) {
-    let row = gtk::ListBoxRow::new();
-    let row_box = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
-        .margin_top(6)
-        .margin_bottom(6)
-        .margin_start(10)
-        .margin_end(10)
-        .build();
-
-    let checkbox = gtk::CheckButton::builder().valign(gtk::Align::Center).build();
-    let key = candidate.key();
-    checkbox.set_active(selected.borrow().contains_key(&key));
-    {
-        let selected = selected.clone();
-        let key = key.clone();
-        let candidate = candidate.clone();
-        checkbox.connect_toggled(move |btn| {
-            if btn.is_active() {
-                selected.borrow_mut().insert(key.clone(), candidate.clone());
-            } else {
-                selected.borrow_mut().remove(&key);
-            }
-        });
-    }
-
-    let name = gtk::Label::builder().label(candidate.label()).xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).build();
-    // Picker rows name people/addresses: blurred by privacy mode.
-    crate::privacy::mark(&name);
-    let text_box = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(2)
-        .hexpand(true)
-        .valign(gtk::Align::Center)
-        .build();
-    text_box.append(&name);
-    if let Some(subtitle) = candidate.subtitle() {
-        let subtitle = gtk::Label::builder()
-            .label(&subtitle)
-            .xalign(0.0)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .css_classes(["dim-label", "caption"])
-            .build();
-        crate::privacy::mark(&subtitle);
-        text_box.append(&subtitle);
-    }
-
-    row_box.append(&checkbox);
-    row_box.append(&text_box);
-    row.set_child(Some(&row_box));
-    // Clicking the name is equivalent to clicking its checkbox.
-    let checkbox_for_row = checkbox.clone();
-    let click = gtk::GestureClick::new();
-    click.connect_released(move |_, _, _, _| checkbox_for_row.set_active(!checkbox_for_row.is_active()));
-    text_box.add_controller(click);
-    list.append(&row);
+/// Data-only model. GtkListView owns a bounded pool of actual row widgets.
+#[derive(Clone)]
+enum PickerRow {
+    Header(&'static str),
+    Item(Item),
 }
 
-/// Appends a non-selectable section header (currently only "Directory") to the
-/// picker's list.
-fn append_section_header(list: &gtk::ListBox, label: &str) {
-    let header = gtk::Label::builder()
-        .label(label)
-        .xalign(0.0)
-        .css_classes(["heading"])
-        .margin_top(8)
-        .margin_bottom(2)
-        .margin_start(10)
-        .margin_end(10)
-        .build();
-    crate::privacy::mark_ui(&header);
-    let row = gtk::ListBoxRow::new();
-    row.set_child(Some(&header));
-    row.set_selectable(false);
-    row.set_activatable(false);
-    list.append(&row);
+fn build_picker_list(
+    store: &gio::ListStore,
+    selected: &Rc<RefCell<HashMap<String, Item>>>,
+    count: &gtk::Label,
+) -> gtk::ListView {
+    let factory = gtk::SignalListItemFactory::new();
+    // Guard programmatic set_active during bind, never interpreting a recycled
+    // checkbox's old state as a new user selection.
+    let binding = Rc::new(Cell::new(false));
+    factory.connect_setup({
+        let selected = selected.clone();
+        let count = count.clone();
+        let binding = binding.clone();
+        move |_, object| {
+            let Some(item) = object.downcast_ref::<gtk::ListItem>() else { return };
+            let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
+                .spacing(8).margin_top(6).margin_bottom(6).margin_start(10).margin_end(10).build();
+            let check = gtk::CheckButton::builder().valign(gtk::Align::Center).build();
+            let text = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2)
+                .hexpand(true).valign(gtk::Align::Center).build();
+            let name = gtk::Label::builder().xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).build();
+            let subtitle = gtk::Label::builder().xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End)
+                .css_classes(["dim-label", "caption"]).build();
+            crate::privacy::mark(&name);
+            crate::privacy::mark(&subtitle);
+            text.append(&name);
+            text.append(&subtitle);
+            row.append(&check);
+            row.append(&text);
+            item.set_child(Some(&row));
+
+            let weak_item = item.downgrade();
+            let selected = selected.clone();
+            let count = count.clone();
+            let binding = binding.clone();
+            check.connect_toggled(move |check| {
+                if binding.get() { return; }
+                let Some(item) = weak_item.upgrade() else { return };
+                let Some(object) = item.item().and_downcast::<glib::BoxedAnyObject>() else { return };
+                let row = object.borrow::<PickerRow>();
+                let PickerRow::Item(candidate) = &*row else { return };
+                let mut selected = selected.borrow_mut();
+                if check.is_active() { selected.insert(candidate.key(), candidate.clone()); }
+                else { selected.remove(&candidate.key()); }
+                count.set_label(&format!("{} selected", selected.len()));
+            });
+            let click = gtk::GestureClick::new();
+            let weak_check = check.downgrade();
+            click.connect_released(move |_, _, _, _| {
+                if let Some(check) = weak_check.upgrade() {
+                    if check.is_visible() { check.set_active(!check.is_active()); }
+                }
+            });
+            text.add_controller(click);
+        }
+    });
+    factory.connect_bind({
+        let selected = selected.clone();
+        let binding = binding.clone();
+        move |_, object| {
+            let Some(item) = object.downcast_ref::<gtk::ListItem>() else { return };
+            let Some(model) = item.item().and_downcast::<glib::BoxedAnyObject>() else { return };
+            let Some(row) = item.child().and_downcast::<gtk::Box>() else { return };
+            let Some(check) = row.first_child().and_downcast::<gtk::CheckButton>() else { return };
+            let Some(text) = row.last_child().and_downcast::<gtk::Box>() else { return };
+            let Some(name) = text.first_child().and_downcast::<gtk::Label>() else { return };
+            let Some(subtitle) = text.last_child().and_downcast::<gtk::Label>() else { return };
+            let model = model.borrow::<PickerRow>();
+            binding.set(true);
+            match &*model {
+                PickerRow::Header(label) => {
+                    check.set_visible(false);
+                    check.set_active(false);
+                    name.set_label(label);
+                    name.add_css_class("heading");
+                    subtitle.set_visible(false);
+                }
+                PickerRow::Item(candidate) => {
+                    check.set_visible(true);
+                    check.set_active(selected.borrow().contains_key(&candidate.key()));
+                    name.remove_css_class("heading");
+                    name.set_label(&candidate.label());
+                    let detail = candidate.subtitle();
+                    subtitle.set_label(detail.as_deref().unwrap_or(""));
+                    subtitle.set_visible(detail.is_some());
+                }
+            }
+            binding.set(false);
+        }
+    });
+    let selection = gtk::NoSelection::new(Some(store.clone()));
+    gtk::ListView::new(Some(selection), Some(factory))
 }
 
 #[cfg(test)]
