@@ -683,6 +683,7 @@ fn style_control(content: &gtk::Box, image: &gtk::Image, label: &gtk::Label, loo
         "Send/Receive All Folders" => Some("Send/Receive\nAll Folders"),
         "New mail" => Some("New\nmail"),
         "Address Book" => Some("Address\nBook"),
+        "Attach Files" => Some("Attach\nFiles"),
         "Quick steps" => Some("Quick\nsteps"),
         _ => None,
     };
@@ -1143,13 +1144,23 @@ impl OverflowInner {
                 let mut groups: Vec<(usize, i32)> = state.groups.iter().enumerate()
                     .filter_map(|(i, group)| group.container.as_ref().and_then(|c| c.upgrade()).map(|c| (i, c.measure(gtk::Orientation::Horizontal, -1).1)))
                     .collect();
-                // Preserve the actual formatting panel on a typical compose
-                // window. Collapse secondary groups before Basic Text.
+                // In the composer, preserve the actual formatting panel
+                // and the two frequent inclusion commands before secondary
+                // groups. Other ribbon pages retain their width-based order.
+                let is_compose = state.groups.iter().any(|group| group.title.as_ref()
+                    .and_then(|title| title.upgrade())
+                    .is_some_and(|title| title.label().as_str() == "Basic Text"));
                 groups.sort_by_key(|(i, width)| {
-                    let basic_text = state.groups[*i].title.as_ref()
-                        .and_then(|title| title.upgrade())
-                        .is_some_and(|title| title.label().as_str() == "Basic Text");
-                    (basic_text, std::cmp::Reverse(*width))
+                    let title = state.groups[*i].title.as_ref().and_then(|title| title.upgrade());
+                    let priority = if is_compose {
+                        match title.as_ref().map(|title| title.label()).as_deref() {
+                            Some("Draft") => 0,
+                            Some("Include") => 2,
+                            Some("Basic Text") => 3,
+                            _ => 1,
+                        }
+                    } else { 1 };
+                    (priority, std::cmp::Reverse(*width))
                 });
                 for (index, _) in groups {
                     if root.measure(gtk::Orientation::Horizontal, -1).1 <= available { break; }
@@ -1564,6 +1575,11 @@ mod tests {
         assert!(image.has_css_class("ribbon-tone-blue"));
         style_control(&content, &image, &label, Look::Simplified);
         assert_eq!(label.text().as_str(), "Send/Receive All Folders");
+        let (content, image, label) = build_content("mail-attachment-symbolic", "Attach Files");
+        style_control(&content, &image, &label, Look::Large);
+        assert_eq!(label.text().as_str(), "Attach\nFiles");
+        style_control(&content, &image, &label, Look::Simplified);
+        assert_eq!(label.text().as_str(), "Attach Files");
     }
 
     #[test]

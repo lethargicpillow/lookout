@@ -2544,11 +2544,12 @@ pub fn build_compose_view(
     // Outlook's Basic Text is one compact formatting surface. Both rows
     // share the same height across font and paragraph commands.
     editor_band.group("Basic Text", |group| {
-        // One grid, ten equal-width columns and two equal-height rows.
-        // No independent Font/Paragraph boxes or expansion by a long font
-        // name. The selectors occupy the same six cells as B/I/U/S/clear/color.
+        // One grid with two equal-height rows. Keep selectors spanning
+        // the same cells as B/I/U/S/clear/color, but let their columns
+        // measure independently: a wide colour or font-size selector must
+        // not inflate all ten columns and collapse Include unnecessarily.
         let block = gtk::Grid::builder()
-            .row_homogeneous(true).column_homogeneous(true)
+            .row_homogeneous(true).column_homogeneous(false)
             .row_spacing(2).column_spacing(2)
             // Fill the command area internally, without requesting spare
             // vertical space from the ribbon or the editor window.
@@ -2571,6 +2572,7 @@ pub fn build_compose_view(
 
         let place = |button: &gtk::Button, col: i32, row: i32| {
             button.add_css_class("compose-format-button");
+            button.set_width_request(28);
             button.set_halign(gtk::Align::Fill);
             button.set_valign(gtk::Align::Fill);
             button.set_vexpand(true);
