@@ -418,13 +418,17 @@ impl RibbonGroup {
     /// Persistent app-wide theme command. Use the application action explicitly
     /// because the floating composer is a bare adw::Window.
     pub(crate) fn theme_switch(&self) {
+        self.theme_switch_named("Light / Dark");
+    }
+
+    pub(crate) fn theme_switch_named(&self, label: &str) {
         let button = gtk::Button::new();
         button.connect_clicked(|_| {
             if let Some(app) = gio::Application::default() {
                 app.activate_action("toggle-theme", None);
             }
         });
-        let icon = self.button(&button, "display-brightness-symbolic", "Light / Dark");
+        let icon = self.button(&button, "display-brightness-symbolic", label);
         let manager = adw::StyleManager::default();
         let refresh = |image: &gtk::Image, button: &gtk::Button, dark: bool| {
             let name = if dark {
@@ -449,6 +453,24 @@ impl RibbonGroup {
                 manager.disconnect(handler);
             }
         });
+    }
+
+    /// Dress the shared page toggle exactly like the app theme command.
+    pub(crate) fn page_theme_switch(&self) -> gtk::ToggleButton {
+        let button = crate::compose::page_background_button();
+        let icon = self.toggle(&button, "display-brightness-symbolic", "Page");
+        let weak_image = icon.image.downgrade();
+        crate::settings::observe_page_dark(move |dark| {
+            let Some(image) = weak_image.upgrade() else { return false };
+            let name = if dark {
+                crate::window::themed_icon_name(&["weather-clear-symbolic", "display-brightness-symbolic"])
+            } else {
+                crate::window::themed_icon_name(&["weather-clear-night-symbolic", "night-light-symbolic", "weather-clear-symbolic"])
+            };
+            image.set_icon_name(Some(name));
+            true
+        });
+        button
     }
 
     /// Dress a plain button with `icon` and `label`, as a large control.
