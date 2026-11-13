@@ -146,8 +146,8 @@ enum ContactsBucketKind {
     Category(String),
     /// One of the desktop's address books (E1.5), by display name.
     DesktopBook(String),
-    /// The live company-directory search (item 4.7.8).
-    Directory,
+    /// Read-only company directory owned by a specific account.
+    Directory(AccountId),
 }
 
 fn contacts_bucket_label(kind: &ContactsBucketKind) -> String {
@@ -156,7 +156,7 @@ fn contacts_bucket_label(kind: &ContactsBucketKind) -> String {
         ContactsBucketKind::Favourites => "Favourites".to_string(),
         ContactsBucketKind::ContactLists => "Your contact lists".to_string(),
         ContactsBucketKind::Deleted => "Deleted".to_string(),
-        ContactsBucketKind::Directory => "Directory".to_string(),
+        ContactsBucketKind::Directory(_) => "Global Address List".to_string(),
         ContactsBucketKind::Category(name) | ContactsBucketKind::DesktopBook(name) => name.clone(),
     }
 }
@@ -184,7 +184,11 @@ impl ContactsCategoryChoice {
     /// Whether this row is the live Directory search (item 4.7.8) rather than
     /// a stored-contact bucket. Its `contacts` list is always empty.
     pub(crate) fn is_directory(&self) -> bool {
-        matches!(self.kind, ContactsBucketKind::Directory)
+        matches!(self.kind, ContactsBucketKind::Directory(_))
+    }
+
+    pub(crate) fn directory_account(&self) -> Option<&AccountId> {
+        match &self.kind { ContactsBucketKind::Directory(id) => Some(id), _ => None }
     }
 
     #[cfg(test)]
@@ -875,6 +879,7 @@ fn show_create_contact_with_seed(
     }
     let (books, book_accounts, fallback_account) = {
         let st = state.borrow();
+        let directory_accounts = crate::directory::directory_accounts(&st);
         let mut accounts: Vec<(&AccountId, &ContactsAccountSnapshot)> = st.contacts_by_account.iter().collect();
         accounts.sort_by_key(|(_, snapshot)| snapshot.display_name.to_lowercase());
         // The email's own account's books come first, so the picker defaults
@@ -1583,6 +1588,9 @@ pub fn refresh_contacts_category_ui(
     refresh_actions: &Rc<dyn Fn()>,
     details_refresh: &Rc<dyn Fn()>,
 ) {
+    // Keep the selected directory by account identity when sync adds/removes
+    // other account rows and shifts numerical indices.
+    let selected_directory = selected_index.and_then(|index| categories.borrow().get(index as usize).and_then(|choice| choice.directory_account().cloned()));
     while let Some(child) = category_list.first_child() {
         category_list.remove(&child);
     }
@@ -1663,22 +1671,19 @@ pub fn refresh_contacts_category_ui(
         // is applied live in `rebuild_contacts_list_ui`. The Directory row is
         // a marker with no members: its results are live `DirectoryPerson`s
         // rendered by `rebuild_directory_list_ui`.
-        let mut fixed_kinds = vec![
+        let fixed_kinds = vec![
             ContactsBucketKind::Favourites,
             ContactsBucketKind::AllContacts,
             ContactsBucketKind::ContactLists,
             ContactsBucketKind::Deleted,
         ];
-        if crate::directory::directory_configured_for_state(&st) {
-            fixed_kinds.push(ContactsBucketKind::Directory);
-        }
         for kind in fixed_kinds {
             let members = match kind {
                 ContactsBucketKind::Favourites => favourite_candidates.clone(),
                 ContactsBucketKind::AllContacts => all_contacts.clone(),
                 ContactsBucketKind::ContactLists => all_lists.clone(),
                 ContactsBucketKind::Deleted => all_deleted.clone(),
-                ContactsBucketKind::Directory => Vec::new(),
+                ContactsBucketKind::Directory(_) => Vec::new(),
                 ContactsBucketKind::Category(_) | ContactsBucketKind::DesktopBook(_) => continue,
             };
             let label = contacts_bucket_label(&kind);
@@ -1686,7 +1691,7 @@ pub fn refresh_contacts_category_ui(
             row_widgets.push((append_contacts_choice_row(category_list, &label, true), Some(rows.len() - 1)));
         }
 
-        for (&(_, account), (account_contacts, deleted)) in accounts.iter().zip(per_account) {
+        for (&(account_id, account), (account_contacts, deleted)) in accounts.iter().zip(per_account) {
             let lists: Vec<ContactMember> = account_contacts.iter().filter(|(_, _, record)| record.card.is_contact_list()).cloned().collect();
 
             // The header row shows the account's display name/address, so it
@@ -1726,6 +1731,20 @@ pub fn refresh_contacts_category_ui(
                 append_contacts_choice_row(category_list, &contacts_bucket_label(&ContactsBucketKind::Deleted), true),
                 Some(rows.len() - 1),
             ));
+            if directory_accounts.iter().any(|(id, _)| id == account_id) {
+                let kind = ContactsBucketKind::Directory(account_id.clone());
+                row_widgets.push((append_contacts_choice_row(category_list, &contacts_bucket_label(&kind), true), Some(rows.len())));
+                rows.push(ContactsCategoryChoice { kind, contacts: Vec::new() });
+            }
+        }
+        // A GAL is usable offline even if CardDAV has not synced yet.
+        for (id, label) in directory_accounts.iter().filter(|(id, _)| !st.contacts_by_account.contains_key(id)) {
+            let header = append_contacts_header_row(category_list, label);
+            crate::privacy::mark(&header);
+            row_widgets.push((header, None));
+            let kind = ContactsBucketKind::Directory(id.clone());
+            row_widgets.push((append_contacts_choice_row(category_list, &contacts_bucket_label(&kind), true), Some(rows.len())));
+            rows.push(ContactsCategoryChoice { kind, contacts: Vec::new() });
         }
 
         if !desktop_books.is_empty() {
@@ -1795,7 +1814,11 @@ pub fn refresh_contacts_category_ui(
         .iter()
         .position(|choice| matches!(choice.kind, ContactsBucketKind::AllContacts))
         .unwrap_or(0) as i32;
-    let desired = selected_index.unwrap_or(default_index).clamp(0, categories.borrow().len() as i32 - 1);
+    let desired = if let Some(id) = selected_directory {
+        categories.borrow().iter().position(|choice| choice.directory_account() == Some(&id)).map(|index| index as i32).unwrap_or(default_index)
+    } else {
+        selected_index.unwrap_or(default_index).clamp(0, categories.borrow().len() as i32 - 1)
+    };
     if let Some((row, _)) = row_widgets.iter().find(|(_, idx)| *idx == Some(desired as usize)) {
         category_list.select_row(Some(row));
     }
@@ -3735,11 +3758,12 @@ mod tests {
     #[test]
     fn the_directory_bucket_is_a_marker_with_no_stored_members() {
         let choice = ContactsCategoryChoice {
-            kind: ContactsBucketKind::Directory,
+            kind: ContactsBucketKind::Directory(AccountId("exchange-test".into())),
             contacts: Vec::new(),
         };
         assert!(choice.is_directory());
-        assert_eq!(choice.label(), "Directory");
+        assert_eq!(choice.label(), "Global Address List");
+        assert_eq!(choice.directory_account(), Some(&AccountId("exchange-test".into())));
         assert!(choice.members().is_empty());
         // Every stored bucket stays a non-directory row.
         assert!(!ContactsCategoryChoice {

@@ -323,7 +323,11 @@ pub(crate) fn directory_source(state: &Rc<RefCell<UiState>>, account: Option<Acc
 /// twice. The source is unioned across accounts, like the attendee field's:
 /// the People Directory row isn't tied to a sending account.
 pub(crate) fn people_directory_source(state: &Rc<RefCell<UiState>>, worker: Rc<Worker>) -> DirectorySource {
-    assemble_directory_source(state, None, worker, false)
+    people_directory_source_for_account(state, None, worker)
+}
+
+pub(crate) fn people_directory_source_for_account(state: &Rc<RefCell<UiState>>, account: Option<AccountId>, worker: Rc<Worker>) -> DirectorySource {
+    assemble_directory_source(state, account, worker, false)
 }
 
 /// Builds a source over the configured backends. `include_desktop` is the one
@@ -427,19 +431,40 @@ pub(crate) fn directory_configured(config: &AppConfig, graph_accounts: &[Account
 /// [`directory_configured`] for the running window: the Graph-capable
 /// accounts are the ones that own a Microsoft 365 mailbox (`graph_pin`).
 pub(crate) fn directory_configured_for_state(state: &UiState) -> bool {
+    !directory_accounts(state).is_empty()
+}
+
+/// Account identity, not the displayed label, owns a directory. Include
+/// directory-only accounts even before their contacts snapshot has arrived.
+pub(crate) fn directory_accounts(state: &UiState) -> Vec<(AccountId, String)> {
     let config = state.app_config.borrow();
-    let graph_accounts: Vec<AccountId> = state
-        .accounts
-        .iter()
-        .filter(|(_, handle)| handle.graph_pin.is_some())
-        .map(|(account_id, _)| account_id.clone())
-        .collect();
-    directory_configured(&config, &graph_accounts) || config.other_accounts.iter().any(|account| {
+    let mut ids = HashSet::new();
+    for (id, handle) in &state.accounts {
+        if handle.graph_pin.is_some() && config.directory_enabled_for(id) {
+            ids.insert(id.clone());
+        }
+    }
+    for directory in &config.ldap_directories {
+        if directory.enabled { ids.insert(directory.account_id.clone()); }
+    }
+    for account in &config.other_accounts {
         let id = AccountId(account.id.clone());
-        state.account_enabled(&id)
-            && !config.ldap_directories.iter().any(|directory| directory.account_id == id)
-            && crate::other_accounts::davmail_accounts(account).is_some()
-    })
+        if crate::other_accounts::davmail_accounts(account).is_some()
+            && (crate::oab_cache::existing_path(&account.id).is_some()
+                || !config.ldap_directories.iter().any(|d| d.account_id == id))
+        {
+            ids.insert(id);
+        }
+    }
+    let mut accounts: Vec<_> = ids.into_iter().filter(|id| state.account_enabled(id)).map(|id| {
+        let label = state.contacts_by_account.get(&id).map(|a| a.display_name.clone())
+            .or_else(|| state.accounts.get(&id).map(|a| a.display_name.clone()))
+            .or_else(|| config.other_accounts.iter().find(|a| a.id == id.0).map(|a| a.display_name.clone()))
+            .unwrap_or_else(|| id.0.clone());
+        (id, label)
+    }).collect();
+    accounts.sort_by_cached_key(|(id,label)| (label.to_lowercase(),id.0.clone()));
+    accounts
 }
 
 /// Maps a source's hits to the read-only picker suggestions of item 4.7.7.

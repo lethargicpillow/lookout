@@ -644,6 +644,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         contacts_details_refresh: None,
         contacts_refresh_all: None,
         contacts_directory_source: None,
+        contacts_directory_account: None,
         contacts_directory_offset: 0,
         contacts_directory_total: 0,
         contacts_directory_local: false,
@@ -7974,7 +7975,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let directory_page_label = directory_page_label.clone();
         Rc::new(move |query: &str| {
             let query = query.trim().to_string();
-            let paths = crate::oab_cache::local_paths(&state, None);
+            let account = state.borrow().contacts_directory_account.clone();
+            let paths = crate::oab_cache::local_paths(&state, account.as_ref());
             let generation = {
                 let mut st = state.borrow_mut();
                 st.contacts_directory_generation = st.contacts_directory_generation.wrapping_add(1);
@@ -8043,7 +8045,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 match existing {
                     Some(source) => source,
                     None => {
-                        let source = crate::directory::people_directory_source(&state, worker.clone());
+                        let source = crate::directory::people_directory_source_for_account(&state, account.clone(), worker.clone());
                         state.borrow_mut().contacts_directory_source = Some(source.clone());
                         source
                     }
@@ -8162,11 +8164,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             // `refresh_contacts_category_ui`.
             let Some(idx) = (unsafe { row.data::<usize>("contacts-choice-index") }) else { return };
             let idx = unsafe { *idx.as_ref() };
-            let (label, is_directory) = {
+            let (label, directory_account) = {
                 let categories = contacts_categories.borrow();
                 let Some(choice) = categories.get(idx) else { return };
-                (choice.label(), choice.is_directory())
+                (choice.label(), choice.directory_account().cloned())
             };
+            let is_directory = directory_account.is_some();
             contacts_heading_label.set_label(&label);
             // Directory mode swaps the People search row for its own live
             // search box; the stored-contact search is untouched (4.7.8).
@@ -8176,7 +8179,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 // A rail rebuild (a contacts sync, say) re-selects the row
                 // without the query having changed; repaint the existing hits
                 // rather than issuing the same lookup again.
-                if state.borrow().contacts_directory_active {
+                let same_account = {
+                    let st = state.borrow();
+                    st.contacts_directory_active && st.contacts_directory_account == directory_account
+                };
+                if same_account {
                     rebuild_contacts_list_ui(
                         &contacts_list,
                         &contacts_categories,
@@ -8188,6 +8195,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         &contacts_details_refresh,
                     );
                 } else {
+                    {
+                        let mut st = state.borrow_mut();
+                        st.contacts_directory_account = directory_account;
+                        st.contacts_directory_active = true;
+                        st.contacts_directory_source = None;
+                        st.contacts_directory_offset = 0;
+                    }
                     run_directory_search(&contacts_directory_search_entry.text());
                 }
                 return;
@@ -8227,7 +8241,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             // the title-bar path clears the mode before asking for `None`.
             let selected_index = selected_index.or_else(|| {
                 if state.borrow().contacts_directory_active {
-                    contacts_categories.borrow().iter().position(ContactsCategoryChoice::is_directory).map(|index| index as i32)
+                    let account = state.borrow().contacts_directory_account.clone();
+                    contacts_categories.borrow().iter().position(|choice| choice.directory_account() == account.as_ref()).map(|index| index as i32)
                 } else {
                     None
                 }

@@ -760,6 +760,7 @@ fn test_state(accounts: Vec<(AccountId, Vec<Mailbox>)>) -> Rc<RefCell<UiState>> 
         contacts_details_refresh: None,
         contacts_refresh_all: None,
         contacts_directory_source: None,
+        contacts_directory_account: None,
         contacts_directory_offset: 0,
         contacts_directory_total: 0,
         contacts_directory_local: false,
