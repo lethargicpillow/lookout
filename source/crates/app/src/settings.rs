@@ -1040,6 +1040,28 @@ pub fn default_reminder_at(index: u32) -> i32 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn page_background_observers_share_state_and_ignore_echoes() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let original = super::page_dark();
+        let values = Rc::new(RefCell::new(Vec::new()));
+        let weak = Rc::downgrade(&values);
+        super::observe_page_dark(move |dark| {
+            let Some(values) = weak.upgrade() else { return false };
+            values.borrow_mut().push(dark);
+            // Synchronizing a toggle can emit its change signal immediately.
+            super::set_page_dark(dark);
+            true
+        });
+        super::set_page_dark(!original);
+        super::set_page_dark(!original);
+        super::set_page_dark(original);
+        assert_eq!(&*values.borrow(), &[original, !original, original]);
+        drop(values);
+    }
     use super::*;
 
     #[test]
