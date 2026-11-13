@@ -795,11 +795,13 @@ pub(crate) fn install_web_view_zoom(web_view: &webkit::WebView) {
 /// toggle handler, every navigation reset, and the close-pane reset all
 /// route through this.
 pub(crate) fn set_message_theme_armed(enabled: bool, web_view: &webkit::WebView, user_content_manager: &webkit::UserContentManager, theme_override_sheet: &webkit::UserStyleSheet) {
+    // Remove first: navigation and the global observer may apply the
+    // same state several times. Never accumulate duplicate sheets.
+    user_content_manager.remove_style_sheet(theme_override_sheet);
     if enabled {
         user_content_manager.add_style_sheet(theme_override_sheet);
-        web_view.set_background_color(&gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0));
+        web_view.set_background_color(&gtk::gdk::RGBA::new(0.13, 0.13, 0.15, 1.0));
     } else {
-        user_content_manager.remove_style_sheet(theme_override_sheet);
         web_view.set_background_color(&gtk::gdk::RGBA::new(1.0, 1.0, 1.0, 1.0));
     }
 }
