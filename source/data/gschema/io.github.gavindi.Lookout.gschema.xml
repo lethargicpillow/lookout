@@ -238,6 +238,16 @@
       <summary>Single-line message list columns</summary>
       <description>The visible columns of the single-line (wide) message list, in order: importance, attachment, from, to, subject, received, size. Empty shows Outlook's default set.</description>
     </key>
+    <key name="mail-sent-list-columns" type="as">
+      <default>[]</default>
+      <summary>Sent message list columns</summary>
+      <description>The visible columns of the single-line Sent Items list, in order. Empty uses the recipient-first default set.</description>
+    </key>
+    <key name="mail-list-column-widths" type="as">
+      <default>[]</default>
+      <summary>Message list column widths</summary>
+      <description>Preferred column widths in logical pixels, stored as column-id=width entries and shared across mail profiles. Empty uses default widths.</description>
+    </key>
     <key name="mail-list-style" type="s">
       <choices>
         <choice value='auto'/>
