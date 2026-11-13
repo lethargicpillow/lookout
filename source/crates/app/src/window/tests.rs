@@ -618,6 +618,26 @@ fn wrap_message_with_csp_prepends_to_fragments_and_slips_past_the_doctype() {
     assert!(wrapped.starts_with("<!doctype html><meta"));
 }
 
+#[test]
+fn mail_quote_style_preserves_message_markup_and_security_policy() {
+    let html = r#"<!doctype html><html><body><p>New reply</p><div id="divRplyFwdMsg"><b>From:</b> Original sender</div><p>Original body</p></body></html>"#;
+    let wrapped = wrap_mail_message_with_csp(html, false, false);
+    assert!(wrapped.starts_with("<!doctype html><meta"));
+    assert!(wrapped.contains("script-src 'none'"));
+    assert!(wrapped.contains("border-top: 1px solid #808080"));
+    assert!(wrapped.contains("#divRplyFwdMsg"));
+    assert!(wrapped.ends_with(&html["<!doctype html>".len()..]));
+    assert!(!wrap_message_with_csp(html, false, false).contains("border-top: 1px solid #808080"));
+}
+
+#[test]
+fn narrow_pane_clamp_does_not_change_the_saved_full_width_target() {
+    let preferred = pane_width_percent(560, 1600).unwrap();
+    assert_eq!(paned_position_for_percent(preferred, 1600, 1350, 150, 300, None), Some(560));
+    assert_eq!(paned_position_for_percent(preferred, 850, 550, 150, 300, None), Some(250));
+    assert_eq!(paned_position_for_percent(preferred, 1600, 1350, 150, 300, None), Some(560));
+}
+
 /// A minimal vCard with one email field, for contact-lookup tests.
 fn test_contact(address: &str) -> VCard {
     VCard {
