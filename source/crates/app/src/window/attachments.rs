@@ -413,6 +413,41 @@ pub(crate) fn attachment_preview_arrived(state: &Rc<RefCell<UiState>>, mailbox: 
 mod preview_tests {
     use super::*;
     #[test]
+    fn save_all_preserves_existing_files_and_symlinks() {
+        // A private test directory, never the user's downloads or mail cache.
+        struct TestDir(std::path::PathBuf);
+        impl Drop for TestDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = TestDir(std::env::temp_dir().join(format!("lookout-test-{}", uuid::Uuid::new_v4())));
+        std::fs::create_dir(&dir.0).unwrap();
+        std::fs::write(dir.0.join("report.pdf"), b"original").unwrap();
+        std::fs::write(dir.0.join("target.txt"), b"keep").unwrap();
+        std::os::unix::fs::symlink("target.txt", dir.0.join("link.txt")).unwrap();
+
+        let folder = gio::File::for_path(&dir.0);
+        let attachments = vec![
+            ("report.pdf".to_string(), b"new report".to_vec()),
+            ("link.txt".to_string(), b"new link contents".to_vec()),
+            ("notes.txt".to_string(), b"notes".to_vec()),
+        ];
+        let context = glib::MainContext::new();
+        let result = context.with_thread_default(|| {
+            context.block_on(save_batch_to_folder(&folder, &attachments))
+        }).unwrap().unwrap();
+
+        assert!(result.contains("2 renamed"));
+        assert_eq!(std::fs::read(dir.0.join("report.pdf")).unwrap(), b"original");
+        assert_eq!(std::fs::read(dir.0.join("report (2).pdf")).unwrap(), b"new report");
+        assert_eq!(std::fs::read(dir.0.join("target.txt")).unwrap(), b"keep");
+        assert!(std::fs::symlink_metadata(dir.0.join("link.txt")).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(dir.0.join("link (2).txt")).unwrap(), b"new link contents");
+        assert_eq!(std::fs::read(dir.0.join("notes.txt")).unwrap(), b"notes");
+    }
+
+    #[test]
     fn attachment_collision_candidates_preserve_extensions() {
         assert_eq!(attachment_name_candidate("report.pdf", 1), "report.pdf");
         assert_eq!(attachment_name_candidate("report.pdf", 2), "report (2).pdf");
