@@ -2084,9 +2084,9 @@ pub fn build_compose_view(
 
     // --- Sensitivity: RFC 2156 `Sensitivity` (Normal / Personal / Private /
     // Company-Confidential), written by `build_raw_message` when it isn't
-    // Normal. A dropdown trailing the importance buttons in the editor
-    // toolbar, which the window layer moves as a whole into a pop-out window,
-    // so it needs no reparenting of its own.
+    // Normal. The dropdown lives on Options, while frequently used
+    // importance commands live on Message. Both travel with the editor
+    // when it moves to a pop-out window.
     let sensitivity_model = gtk::StringList::new(&SENSITIVITY_LABELS);
     let sensitivity_dropdown = gtk::DropDown::builder().model(&sensitivity_model).tooltip_text("Sensitivity").build();
     sensitivity_dropdown.set_selected(sensitivity_index(prefill.sensitivity));
@@ -2603,15 +2603,27 @@ pub fn build_compose_view(
         });
         group.button(&address_book, crate::window::themed_icon_name(&["x-office-address-book-symbolic", "address-book-symbolic", "avatar-default-symbolic"]), "Address Book");
     });
+    // Keep the two common inclusion commands prominent, like Outlook.
+    // Insertion into the body belongs on Insert, not beside attachments.
     editor_band.group("Include", |group| {
-        group.small_button(&attach_button, "mail-attachment-symbolic", "Attach Files");
-        group.small_button(&format.link, "insert-link-symbolic", "Link");
-        group.small_button(&signature_button, signature_icon, "Signature");
+        group.button(&attach_button, "mail-attachment-symbolic", "Attach Files");
+        group.button(&signature_button, signature_icon, "Signature");
     });
-    insert_band.group("Insert", |group| {
+    editor_band.group("Tags", |group| {
+        group.small_toggle(&high_importance_toggle, "emblem-important-symbolic", "High Importance");
+        group.small_toggle(&low_importance_toggle, "go-down-symbolic", "Low Importance");
+    });
+    insert_band.group("Templates", |group| {
         group.button(&templates_button, "edit-copy-symbolic", "Templates");
-        group.small_button(&format.table, "view-grid-symbolic", "Table");
-        group.small_button(&format.image, "insert-image-symbolic", "Picture");
+    });
+    insert_band.group("Illustrations", |group| {
+        group.button(&format.image, "insert-image-symbolic", "Picture");
+        group.button(&format.table, "view-grid-symbolic", "Table");
+    });
+    insert_band.group("Links", |group| {
+        group.button(&format.link, "insert-link-symbolic", "Link");
+    });
+    insert_band.group("Symbols", |group| {
         group.small_menu(&format.emoji, "face-smile-symbolic", "Emoji");
         group.small_button(&format.horizontal_rule, "insert-hr-symbolic", "Horizontal Line");
     });
@@ -2626,9 +2638,7 @@ pub fn build_compose_view(
         group.small_toggle(&read_receipt_toggle, "mark-location-symbolic", "Read Receipt");
         group.small_toggle(&delivery_receipt_toggle, "document-send-symbolic", "Delivery Receipt");
     });
-    options_band.group("Tags", |group| {
-        group.small_toggle(&high_importance_toggle, "emblem-important-symbolic", "High Importance");
-        group.small_toggle(&low_importance_toggle, "go-down-symbolic", "Low Importance");
+    options_band.group("Sensitivity", |group| {
         group.widget(&sensitivity_dropdown);
     });
     options_band.group("Format", |group| {
