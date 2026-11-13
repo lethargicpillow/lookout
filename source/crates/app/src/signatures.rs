@@ -17,7 +17,7 @@ use lookout_core::Signature;
 use crate::app_config::AppConfig;
 
 /// Manage the saved signatures and the two per-account defaults in a
-/// single modal window, without leaving the active composer.
+/// single nonmodal transient window, without leaving the active composer.
 pub(crate) fn show_manager(
     anchor: &gtk::Widget,
     app_config: Rc<RefCell<AppConfig>>,
@@ -27,11 +27,26 @@ pub(crate) fn show_manager(
 ) {
     accounts.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.0.cmp(&b.0.0)));
     let accounts = Rc::new(accounts);
-    let dialog = gtk::Window::builder().title("Signatures and Stationery").modal(true)
-        .default_width(780).default_height(520).build();
-    if let Some(win) = anchor.root().and_downcast::<gtk::Window>() {
-        dialog.set_transient_for(Some(&win));
+    let Some(parent) = anchor.root().and_downcast::<gtk::Window>() else { return; };
+    // Only one manager per composer window. A nonmodal transient stays with
+    // its parent without blocking the other Lookout windows.
+    let toplevels = gtk::Window::toplevels();
+    for index in 0..toplevels.n_items() {
+        if let Some(existing) = toplevels.item(index).and_downcast::<gtk::Window>() {
+            if existing.widget_name() == "lookout-signature-manager"
+                && existing.transient_for().as_ref() == Some(&parent)
+                && existing.is_visible()
+            {
+                existing.present();
+                return;
+            }
+        }
     }
+    let dialog = gtk::Window::builder().title("Signatures and Stationery")
+        .modal(false).destroy_with_parent(true)
+        .default_width(780).default_height(520).build();
+    dialog.set_widget_name("lookout-signature-manager");
+    dialog.set_transient_for(Some(&parent));
     let root = gtk::Box::builder().orientation(gtk::Orientation::Vertical)
         .spacing(12).margin_top(16).margin_bottom(16).margin_start(16).margin_end(16).build();
     let columns = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(16).vexpand(true).build();
