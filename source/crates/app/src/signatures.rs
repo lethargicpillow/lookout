@@ -193,7 +193,7 @@ pub(crate) fn show_manager(
     }
     {
         let dialog = dialog.clone();
-        done.connect_clicked(move |_| dialog.close());
+        done.connect_clicked(move |_| { dialog.close(); });
     }
     refresh();
     tracing::debug!("signature manager: presenting embedded dialog");
