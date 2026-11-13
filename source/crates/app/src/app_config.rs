@@ -878,6 +878,10 @@ mod tests {
                 imap_security: Some(Security::ImplicitTls),
                 smtp_security: Some(Security::StartTls),
             }],
+            oab_urls: std::collections::HashMap::from([(
+                format!("{OTHER_ACCOUNT_ID_PREFIX}abc"),
+                "https://exchange.example.com/OAB/test/oab.xml".into(),
+            )]),
             shared_mailboxes: vec![SharedMailbox {
                 id: "shared:abc".into(),
                 parent_account: AccountId("account_1".into()),
@@ -956,27 +960,7 @@ mod tests {
                 // Duplicates the account's own address - must be dropped.
                 Identity::new(account.clone(), "The Account Itself", "ME@example.com"),
             ],
-            signatures: Vec::new(),
-            signature_defaults: std::collections::HashMap::new(),
-            folder_role_overrides: Vec::new(),
-            webcal_subscriptions: Vec::new(),
-            other_accounts: Vec::new(),
-            shared_mailboxes: Vec::new(),
-            shared_calendars: Vec::new(),
-            categories: Vec::new(),
-            rules: Vec::new(),
-            templates: Vec::new(),
-            automatic_replies: Vec::new(),
-            quick_steps: Vec::new(),
-            quick_steps_seeded: false,
-            search_folders: Vec::new(),
-            search_folders_seeded: false,
-            local_task_lists: Vec::new(),
-            directory_accounts: Vec::new(),
-            graph_mail_accounts: Vec::new(),
-            ldap_directories: Vec::new(),
-            calendar_groups: Vec::new(),
-            hidden_calendars: Vec::new(),
+            ..AppConfig::default()
         };
 
         let identities = config.identities_for_account(&account, "My Name", "me@example.com");
