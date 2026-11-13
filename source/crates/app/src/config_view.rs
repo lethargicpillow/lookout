@@ -1675,7 +1675,7 @@ pub fn refresh(
             view.mail_group.add(&new_default);
             view.signature_default_rows.borrow_mut().push(new_default);
             let reply_default = signature_default_dropdown(
-                "Default for replies &amp; forwards",
+                "Default for replies & forwards",
                 "Use this signature when replying to or forwarding from this account",
                 &info.account_id,
                 account_defaults.reply,
@@ -2001,7 +2001,7 @@ pub(crate) fn signature_default_dropdown(
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     let selected_index = ids.iter().position(|id| *id == default).unwrap_or(0) as u32;
 
-    let row = adw::ComboRow::builder().title(title).subtitle(subtitle).build();
+    let row = adw::ComboRow::builder().use_markup(false).title(title).subtitle(subtitle).build();
     let model = gtk::StringList::new(&name_refs);
     row.set_model(Some(&model));
     row.set_selected(selected_index);
@@ -2148,10 +2148,10 @@ mod tests {
         });
 
         let set_default: SetAccountSignatureDefault = Rc::new(|_, _, _| {});
-        let row = signature_default_dropdown("Default for replies &amp; forwards", "subtitle", "acct", None, &[], SignatureDefault::Reply, &set_default);
+        let row = signature_default_dropdown("Default for replies & forwards", "subtitle", "acct", None, &[], SignatureDefault::Reply, &set_default);
 
         glib::log_remove_handler(Some("Gtk"), handler_id);
-        assert_eq!(row.title(), "Default for replies & forwards", "the markup escape must render back to a plain ampersand");
+        assert_eq!(row.title(), "Default for replies & forwards", "the title must remain plain text");
         assert!(
             warnings.lock().unwrap().is_empty(),
             "setting the title must not trip a markup-parsing Gtk-WARNING: {:?}",
