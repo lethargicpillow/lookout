@@ -587,55 +587,57 @@ fn text_to_html(text: &str) -> String {
 /// disables.
 const DARK_VIEW_STYLE_ID: &str = "lookout-dark-view";
 
-/// Shows the rich editor's page in light mode (`true`: black text on a white
-/// page, as most recipients will see it) or following the app's scheme over
-/// the pane (`false`, the default). Only the view changes, never the message.
-fn set_light_view(web_view: &webkit::WebView, light: bool) {
-    let canvas = if light {
-        gtk::gdk::RGBA::new(1.0, 1.0, 1.0, 1.0)
+/// Page appearance is a view-only property shared by every editor.
+fn sync_dark_view(web_view: &webkit::WebView) {
+    let dark = crate::settings::page_dark();
+    let canvas = if dark {
+        gtk::gdk::RGBA::new(0.13, 0.13, 0.15, 1.0)
     } else {
-        gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0)
+        gtk::gdk::RGBA::new(1.0, 1.0, 1.0, 1.0)
     };
     web_view.set_background_color(&canvas);
-    let script = format!("var el = document.getElementById('{DARK_VIEW_STYLE_ID}'); if (el) el.disabled = {light};");
+    let media = if dark { "all" } else { "not all" };
+    let script = format!("var el = document.getElementById('{DARK_VIEW_STYLE_ID}'); if (el) {{ el.disabled = false; el.media = '{media}'; }}");
     let web_view = web_view.clone();
     glib::spawn_future_local(async move {
         let _ = web_view.evaluate_javascript_future(&script, None, None).await;
     });
 }
 
-/// Whether the rich editor sits on a dark surface, judged from the GTK
-/// foreground colour its neighbours' text is drawn in (light text means a
-/// dark surface). WebKit's own `prefers-color-scheme` can't be used: under
-/// libadwaita it stays `light` even when the app is dark.
-fn on_dark_surface(widget: &impl IsA<gtk::Widget>) -> bool {
-    let fg = widget.as_ref().color();
-    0.2126 * fg.red() + 0.7152 * fg.green() + 0.0722 * fg.blue() > 0.5
+/// A shared toggle usable in the composer, signature and template editors.
+pub(crate) fn page_background_button() -> gtk::ToggleButton {
+    let button = gtk::ToggleButton::builder().css_classes(["flat"]).build();
+    let weak = button.downgrade();
+    crate::settings::observe_page_dark(move |dark| {
+        let Some(button) = weak.upgrade() else { return false };
+        button.set_active(dark);
+        if button.child().is_none() || button.icon_name().is_some() {
+            button.set_icon_name(crate::window::themed_icon_name(if dark {
+                &["weather-clear-symbolic", "display-brightness-symbolic"]
+            } else {
+                &["weather-clear-night-symbolic", "night-light-symbolic", "weather-clear-symbolic"]
+            }));
+        }
+        button.set_tooltip_text(Some(if dark { "View in Light Mode" } else { "View in Dark Mode" }));
+        true
+    });
+    button.connect_toggled(|button| crate::settings::set_page_dark(button.is_active()));
+    button
 }
 
-/// Arms the editor page's dark view to match [`on_dark_surface`]. Run when
-/// the page finishes loading, whenever the editor is mapped (including after
-/// popping out or back in) and when the app's scheme flips. "View in Light
-/// Mode" sits on top of this, via the element's `disabled`.
-fn sync_dark_view(web_view: &webkit::WebView) {
-    let media = if adw::StyleManager::default().is_dark() { "all" } else { "not all" };
-    let script = format!("var el = document.getElementById('{DARK_VIEW_STYLE_ID}'); if (el) el.media = '{media}';");
-    let web_view = web_view.clone();
-    glib::spawn_future_local(async move {
-        let _ = web_view.evaluate_javascript_future(&script, None, None).await;
+/// Native text-only editors and previews use the same page palette.
+pub(crate) fn bind_plain_page_theme(view: &gtk::TextView) {
+    let weak = view.downgrade();
+    crate::settings::observe_page_dark(move |dark| {
+        let Some(view) = weak.upgrade() else { return false };
+        view.remove_css_class("lookout-page-dark");
+        view.remove_css_class("lookout-page-light");
+        view.add_css_class(if dark { "lookout-page-dark" } else { "lookout-page-light" });
+        true
     });
 }
 
-/// Wraps the editor's body HTML in a full document for `WebView::load_html`,
-/// with a minimal stylesheet so quoted text stays visually distinct while
-/// composing. The page is laid out in the light scheme over a transparent
-/// background; on a dark surface (`dark`, later kept current by
-/// [`sync_dark_view`]) the reading pane's message-theme override
-/// ([`crate::window::MESSAGE_THEME_OVERRIDE_CSS`]) inverts it, so typed text
-/// and forwarded HTML, signatures and pasted text with their own dark inline
-/// colours turn light exactly as they do in the reading pane. "View in Light
-/// Mode" disables that override (see [`set_light_view`]). None of this is
-/// sent, since `read_content` reads only the body's contents.
+/// Wraps editable HTML in a document whose style is outside the saved body.
 fn html_document(body: &str, dark: bool) -> String {
     let dark_view = crate::window::MESSAGE_THEME_OVERRIDE_CSS;
     let media = if dark { "all" } else { "not all" };
@@ -1320,21 +1322,14 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, F
     let initial_body = if initial_html.trim().is_empty() { "<p><br></p>".to_string() } else { initial_html };
     // A first guess before the editor is placed in the window; `map` and the
     // finished load correct it against the surface it actually lands on.
-    web_view.load_html(&html_document(&initial_body, on_dark_surface(web_view.as_ref())), None);
+    web_view.load_html(&html_document(&initial_body, crate::settings::page_dark()), None);
     web_view.connect_map(sync_dark_view);
     {
         let weak = web_view.downgrade();
-        let style_manager = adw::StyleManager::default();
-        let handler = style_manager.connect_dark_notify(move |_| {
-            if let Some(view) = weak.upgrade() {
-                sync_dark_view(&view);
-            }
-        });
-        let handler = Cell::new(Some(handler));
-        web_view.connect_destroy(move |_| {
-            if let Some(handler) = handler.take() {
-                style_manager.disconnect(handler);
-            }
+        crate::settings::observe_page_dark(move |_| {
+            let Some(view) = weak.upgrade() else { return false };
+            sync_dark_view(&view);
+            true
         });
     }
 
@@ -2834,34 +2829,9 @@ pub fn build_compose_view(
     // back into the reading pane (see the `root-notify` handler below).
     let moving = Rc::new(Cell::new(false));
     let popped_out = Rc::new(Cell::new(false));
-    // "View in Light Mode", as in the reading pane: the rich body normally
-    // follows the app's scheme; this shows it as most recipients will see
-    // it. Per composer, and only for the rich editor.
-    let light_view_button = gtk::ToggleButton::builder().css_classes(["flat"]).build();
-    let sync_light_view_button = |button: &gtk::ToggleButton| {
-        // The icon and tooltip name what clicking does next, as the reading
-        // pane's do.
-        if button.is_active() {
-            button.set_icon_name(crate::window::themed_icon_name(&[
-                "weather-clear-night-symbolic",
-                "night-light-symbolic",
-                "weather-clear-symbolic",
-            ]));
-            button.set_tooltip_text(Some("View in Dark Mode"));
-        } else {
-            button.set_icon_name(crate::window::themed_icon_name(&["weather-clear-symbolic", "display-brightness-symbolic"]));
-            button.set_tooltip_text(Some("View in Light Mode"));
-        }
-    };
-    sync_light_view_button(&light_view_button);
-    {
-        let web_view = rich_web_view.clone();
-        light_view_button.connect_toggled(move |button| {
-            sync_light_view_button(button);
-            set_light_view(&web_view, button.is_active());
-        });
-    }
-    rich_toggle.bind_property("active", &light_view_button, "sensitive").sync_create().build();
+    // Both rich and plain-text pages follow the global appearance.
+    let light_view_button = page_background_button();
+    bind_plain_page_theme(&body_view);
     let pop_out_button = gtk::Button::from_icon_name(crate::window::themed_icon_name(&["popout1", "window-new-symbolic", "view-restore-symbolic"]));
     pop_out_button.set_tooltip_text(Some("Pop out compose window"));
     pop_out_button.set_visible(on_pop_out.is_some());
