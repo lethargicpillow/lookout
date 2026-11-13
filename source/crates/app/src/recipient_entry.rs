@@ -183,8 +183,9 @@ pub struct RecipientEntry {
     /// this is the title row above the chips; in plain mode there is no
     /// separate title row, so it's `root` itself.
     header: gtk::Box,
-    /// Wraps chips onto further lines as they accumulate, with the text entry
-    /// as the final child so typing always continues after the last chip.
+    /// Wraps committed chips onto further lines as they accumulate.
+    /// The calendar also keeps its text entry in this flow; the composer
+    /// uses a separate expanding text row beneath the chips.
     /// `None` in plain mode, which has no chips to wrap.
     flow: Option<gtk::FlowBox>,
     entry: gtk::Text,
@@ -232,21 +233,39 @@ impl RecipientEntry {
         Self::build(title, false)
     }
 
-    /// Composer variant: chips and the editable text occupy one inline
-    /// flow, wrapping only when the address list runs out of horizontal space.
+    /// Composer variant: a full-width text editor, with committed chips
+    /// in a wrapping flow above it. GtkFlowBox does not allocate its spare
+    /// width to an expanding child, so the text editor must not live inside
+    /// it (even when the flow contains only that editor).
     pub fn new_compose(title: &str) -> Self {
         let this = Self::build(title, false);
         let flow = this.flow.as_ref().expect("chip mode");
         this.root.remove(flow);
+
+        let wrapper = this.entry.parent().and_downcast::<gtk::FlowBoxChild>()
+            .expect("entry flow wrapper");
+        wrapper.set_child(None::<&gtk::Widget>);
+        flow.remove(&wrapper);
         flow.set_hexpand(true);
         flow.set_halign(gtk::Align::Fill);
         flow.set_row_spacing(2);
         flow.set_column_spacing(3);
-        flow.add_css_class("compose-address-surface");
-        this.entry.set_width_request(100);
+        flow.add_css_class("compose-chip-flow");
+        flow.set_visible(false);
+
+        this.entry.set_width_request(-1);
+        this.entry.set_hexpand(true);
+        this.entry.set_halign(gtk::Align::Fill);
         this.entry.set_placeholder_text(None);
         this.entry.add_css_class("compose-address-input");
-        this.header.append(flow);
+
+        let surface = gtk::Box::builder().orientation(gtk::Orientation::Vertical)
+            .spacing(2).hexpand(true).halign(gtk::Align::Fill)
+            .css_classes(["compose-address-surface"]).build();
+        surface.append(flow);
+        surface.append(&this.entry);
+        this.header.set_hexpand(true);
+        this.header.append(&surface);
         this
     }
 
@@ -678,9 +697,9 @@ impl RecipientEntry {
             }
             child = next;
         }
-        // Everything except the entry is gone; re-insert chips ahead of it.
-        // An expanded list contributes its member chips right after its own
-        // list chip.
+        // In the calendar the entry stays at the end of the flow. In the
+        // composer only chips are in the flow, and the text stays in its
+        // own full-width row. Expanded lists contribute member chips.
         let chips = self.tokens.borrow().clone();
         let mut position = 0i32;
         for (index, chip) in chips.iter().enumerate() {
@@ -703,6 +722,9 @@ impl RecipientEntry {
                     }
                 }
             }
+        }
+        if flow.has_css_class("compose-chip-flow") {
+            flow.set_visible(flow.first_child().is_some());
         }
     }
 
@@ -1128,17 +1150,22 @@ mod tests {
         if !crate::gtk_test::gtk_ready() { return; }
         let field = RecipientEntry::new_compose("");
         let flow = field.flow.as_ref().unwrap();
-        assert!(flow.has_css_class("compose-address-surface"));
-        assert!(flow.property::<bool>("hexpand"));
-        assert_eq!(flow.parent().unwrap(), field.header.clone().upcast::<gtk::Widget>());
-        let entry_wrapper = field.entry.parent().unwrap();
-        assert_eq!(entry_wrapper.parent().unwrap(), flow.clone().upcast::<gtk::Widget>());
-        assert_eq!(flow.last_child().unwrap(), entry_wrapper);
+        let surface = field.entry.parent().and_downcast::<gtk::Box>().unwrap();
+        assert!(surface.has_css_class("compose-address-surface"));
+        assert!(surface.property::<bool>("hexpand"));
+        assert!(field.entry.property::<bool>("hexpand"));
+        assert_eq!(field.entry.halign(), gtk::Align::Fill);
+        assert_eq!(surface.parent().unwrap(), field.header.clone().upcast::<gtk::Widget>());
+        assert_eq!(flow.parent().unwrap(), surface.clone().upcast::<gtk::Widget>());
+        assert_eq!(surface.last_child().unwrap(), field.entry.clone().upcast::<gtk::Widget>());
+        assert!(!flow.is_visible());
         field.set_from_text("ada@x.com, bob@y.com");
-        assert_eq!(flow.last_child().unwrap(), entry_wrapper);
+        assert!(flow.is_visible());
+        assert_eq!(surface.last_child().unwrap(), field.entry.clone().upcast::<gtk::Widget>());
         assert_eq!(field.addresses(), vec!["ada@x.com", "bob@y.com"]);
         field.set_from_text("");
-        assert_eq!(flow.first_child().unwrap(), entry_wrapper);
+        assert!(flow.first_child().is_none());
+        assert!(!flow.is_visible());
         assert!(field.addresses().is_empty());
     }
 
