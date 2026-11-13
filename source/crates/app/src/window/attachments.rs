@@ -233,14 +233,31 @@ enum PreviewKind { Image, Text, Pdf, Office(office_preview::OfficeKind), Unsuppo
 fn preview_kind(mime: &str, name: &str) -> PreviewKind {
     let mime = mime.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
     let ext = name.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase()).unwrap_or_default();
-    if mime == "application/pdf" || (mime == "application/octet-stream" && ext == "pdf") {
+    use office_preview::OfficeKind;
+    // Exchange and DavMail sometimes use generic ZIP, binary or legacy
+    // Office MIME types for OOXML. The file extension is the better hint
+    // here; the conversion worker checks the actual container contents.
+    // Explicit macro-enabled formats stay outside built-in preview.
+    if mime.contains("macroenabled") || matches!(ext.as_str(), "docm" | "xlsm" | "dotm" | "xltm" | "xlsb") {
+        return PreviewKind::Unsupported;
+    }
+    let office = match ext.as_str() {
+        "docx" => Some(OfficeKind::Docx),
+        "xlsx" => Some(OfficeKind::Xlsx),
+        "doc" => Some(OfficeKind::Doc),
+        "xls" => Some(OfficeKind::Xls),
+        _ => match mime.as_str() {
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => Some(OfficeKind::Docx),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => Some(OfficeKind::Xlsx),
+            "application/msword" => Some(OfficeKind::Doc),
+            "application/vnd.ms-excel" => Some(OfficeKind::Xls),
+            _ => None,
+        },
+    };
+    if let Some(kind) = office {
+        PreviewKind::Office(kind)
+    } else if mime == "application/pdf" || (mime == "application/octet-stream" && ext == "pdf") {
         PreviewKind::Pdf
-    } else if mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        || (mime == "application/octet-stream" && ext == "docx") {
-        PreviewKind::Office(office_preview::OfficeKind::Docx)
-    } else if mime == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        || (mime == "application/octet-stream" && ext == "xlsx") {
-        PreviewKind::Office(office_preview::OfficeKind::Xlsx)
     } else if mime.starts_with("text/") || matches!(mime.as_str(), "application/json" | "application/xml" | "application/javascript")
         || matches!(ext.as_str(), "txt" | "md" | "log" | "csv" | "json" | "xml" | "html" | "htm" | "css" | "js" | "rs" | "py" | "ini" | "yaml" | "yml") {
         PreviewKind::Text
@@ -255,8 +272,8 @@ pub(crate) fn attachment_icon(part: &BodyPart) -> &'static str {
         PreviewKind::Image => "image-x-generic-symbolic",
         PreviewKind::Text => "text-x-generic-symbolic",
         PreviewKind::Pdf => "application-pdf-symbolic",
-        PreviewKind::Office(office_preview::OfficeKind::Docx) => "x-office-document-symbolic",
-        PreviewKind::Office(office_preview::OfficeKind::Xlsx) => "x-office-spreadsheet-symbolic",
+        PreviewKind::Office(office_preview::OfficeKind::Docx | office_preview::OfficeKind::Doc) => "x-office-document-symbolic",
+        PreviewKind::Office(office_preview::OfficeKind::Xlsx | office_preview::OfficeKind::Xls) => "x-office-spreadsheet-symbolic",
         PreviewKind::Unsupported => "mail-attachment-symbolic",
     }
 }
@@ -417,7 +434,11 @@ pub(crate) fn attachment_preview_arrived(state: &Rc<RefCell<UiState>>, mailbox: 
         }
         PreviewKind::Pdf => pdf_preview::show(&content, bytes),
         PreviewKind::Office(kind) => office_preview::show(&content, bytes, kind),
-        PreviewKind::Unsupported => preview_status(&content, "No built-in preview for this file type. Use Open, Open With or Save."),
+        PreviewKind::Unsupported => {
+            // Log only the format, never the attachment name or contents.
+            tracing::debug!(mime = %part.content_type, "Unsupported attachment preview format");
+            preview_status(&content, "No built-in preview for this file type. Use Open, Open With or Save.");
+        }
     }
 }
 
@@ -477,7 +498,14 @@ mod preview_tests {
         assert_eq!(preview_kind("application/octet-stream", "sheet.XLSX"), PreviewKind::Office(OfficeKind::Xlsx));
         assert_eq!(preview_kind("application/vnd.ms-word.document.macroEnabled.12", "macro.docm"), PreviewKind::Unsupported);
         assert_eq!(preview_kind("application/vnd.ms-excel.sheet.macroEnabled.12", "macro.xlsm"), PreviewKind::Unsupported);
-        assert_eq!(preview_kind("application/zip", "archive.docx"), PreviewKind::Unsupported);
+        assert_eq!(preview_kind("application/zip", "report.docx"), PreviewKind::Office(OfficeKind::Docx));
+        assert_eq!(preview_kind("application/msword", "report.docx"), PreviewKind::Office(OfficeKind::Docx));
+        assert_eq!(preview_kind("application/vnd.ms-excel", "report.xlsx"), PreviewKind::Office(OfficeKind::Xlsx));
+        assert_eq!(preview_kind("application/force-download", "report.XLSX"), PreviewKind::Office(OfficeKind::Xlsx));
+        assert_eq!(preview_kind("application/msword", "report.doc"), PreviewKind::Office(OfficeKind::Doc));
+        assert_eq!(preview_kind("application/octet-stream", "report.XLS"), PreviewKind::Office(OfficeKind::Xls));
+        assert_eq!(preview_kind("application/zip", "archive.zip"), PreviewKind::Unsupported);
+        assert_eq!(preview_kind("application/octet-stream", "report.docm"), PreviewKind::Unsupported);
     }
 
     #[test]

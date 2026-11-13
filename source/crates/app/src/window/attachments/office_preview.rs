@@ -1,4 +1,4 @@
-//! Convert untrusted OOXML attachments to a temporary PDF and hand it to the
+//! Convert untrusted Office attachments to a temporary PDF and hand it to the
 //! existing PDF viewer. The original bytes remain in AttachmentPreview for
 //! Open/Save. Never fall back to an unsandboxed office process.
 
@@ -20,14 +20,14 @@ const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum OfficeKind { Docx, Xlsx }
+pub(super) enum OfficeKind { Docx, Xlsx, Doc, Xls }
 
 impl OfficeKind {
     fn extension(self) -> &'static str {
-        match self { Self::Docx => "docx", Self::Xlsx => "xlsx" }
+        match self { Self::Docx => "docx", Self::Xlsx => "xlsx", Self::Doc => "doc", Self::Xls => "xls" }
     }
     fn filter(self) -> &'static str {
-        match self { Self::Docx => "pdf:writer_pdf_Export", Self::Xlsx => "pdf:calc_pdf_Export" }
+        match self { Self::Docx | Self::Doc => "pdf:writer_pdf_Export", Self::Xlsx | Self::Xls => "pdf:calc_pdf_Export" }
     }
 }
 
@@ -136,7 +136,36 @@ fn stop_conversion(unit: &str) {
         .status();
 }
 
+/// Extension and MIME are routing hints, not proof of an Office document.
+/// Inspect only the ZIP central directory; do not inflate document contents
+/// in the mail process. Actual parsing is confined to the limited sandbox.
+fn validate_container(bytes: &[u8], kind: OfficeKind) -> Result<(), String> {
+    const OLE: &[u8] = &[0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
+    let invalid = || "The attachment is not a supported Office document, or is damaged or encrypted. Use Open or Save.".to_string();
+    let required = match kind {
+        OfficeKind::Doc | OfficeKind::Xls => {
+            return if bytes.starts_with(OLE) { Ok(()) } else { Err(invalid()) };
+        }
+        OfficeKind::Docx => "word/document.xml",
+        OfficeKind::Xlsx => "xl/workbook.xml",
+    };
+    let archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|_| invalid())?;
+    // Very large central directories are not useful for a preview.
+    if archive.len() > 10_000 { return Err(invalid()); }
+    let mut has_manifest = false;
+    let mut has_document = false;
+    for name in archive.file_names() {
+        if name == "[Content_Types].xml" { has_manifest = true; }
+        if name == required { has_document = true; }
+        if name.to_ascii_lowercase().ends_with("vbaproject.bin") {
+            return Err("Macro-enabled Office documents are not supported in preview. Use Open or Save.".into());
+        }
+    }
+    if has_manifest && has_document { Ok(()) } else { Err(invalid()) }
+}
+
 fn convert(bytes: &[u8], kind: OfficeKind, cancelled: &AtomicBool) -> Result<Vec<u8>, String> {
+    validate_container(bytes, kind)?;
     if !Path::new(SOFFICE).is_file() {
         return Err("Office preview requires LibreOffice Writer and Calc. Use Open or Save.".into());
     }
@@ -246,10 +275,34 @@ mod tests {
     }
 
     #[test]
+    fn office_container_check_distinguishes_documents_from_ordinary_archives() {
+        use std::io::Write;
+        fn package(entries: &[&str]) -> Vec<u8> {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            for &entry in entries {
+                writer.start_file(entry, zip::write::SimpleFileOptions::default()).unwrap();
+                writer.write_all(b"fixture").unwrap();
+            }
+            writer.finish().unwrap().into_inner()
+        }
+        let docx = package(&["[Content_Types].xml", "word/document.xml"]);
+        let xlsx = package(&["[Content_Types].xml", "xl/workbook.xml"]);
+        let macro_doc = package(&["[Content_Types].xml", "word/document.xml", "word/vbaProject.bin"]);
+        assert!(validate_container(&docx, OfficeKind::Docx).is_ok());
+        assert!(validate_container(&xlsx, OfficeKind::Xlsx).is_ok());
+        assert!(validate_container(&docx, OfficeKind::Xlsx).is_err());
+        assert!(validate_container(&package(&["notes.txt"]), OfficeKind::Docx).is_err());
+        assert!(validate_container(&macro_doc, OfficeKind::Docx).is_err());
+        assert!(validate_container(b"not a document", OfficeKind::Doc).is_err());
+    }
+
+    #[test]
     fn office_sandbox_keeps_documents_isolated() {
         for (kind, filter, extension) in [
             (OfficeKind::Docx, "pdf:writer_pdf_Export", "docx"),
             (OfficeKind::Xlsx, "pdf:calc_pdf_Export", "xlsx"),
+            (OfficeKind::Doc, "pdf:writer_pdf_Export", "doc"),
+            (OfficeKind::Xls, "pdf:calc_pdf_Export", "xls"),
         ] {
             let cmd = sandbox_command(Path::new("/tmp/lookout-test"), kind);
             assert_eq!(cmd.get_program(), BWRAP);
