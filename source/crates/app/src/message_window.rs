@@ -634,7 +634,7 @@ fn render_data(state: &Rc<RefCell<UiState>>, entry: &Rc<RefCell<MessageWindowSta
         };
         let scan = lookout_core::html_remote_content_scan(html);
         let remote_blocked = (scan.has_images && !images_allowed) || (scan.has_other && !all_allowed);
-        let loaded = crate::window::wrap_message_with_csp(&rewritten, images_allowed, all_allowed);
+        let loaded = crate::window::wrap_mail_message_with_csp(&rewritten, images_allowed, all_allowed);
         web_view.load_html(&loaded, None);
         content_stack.set_visible_child_name("html");
         // The load-changed handler reveals the page once WebKit finishes
