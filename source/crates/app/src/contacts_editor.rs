@@ -99,9 +99,8 @@ fn build_field_row(initial: &str, initial_type: Option<&str>) -> FieldRow {
 fn build_typed_field_row(initial: &str, initial_type: Option<&str>, choices: &[&str]) -> FieldRow {
     let boxed = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
 
-    let entry = gtk::Entry::new();
+    let entry = form_entry("contact-value");
     entry.set_text(initial);
-    entry.set_hexpand(true);
     boxed.append(&entry);
 
     let type_list = gtk::StringList::new(choices);
@@ -128,15 +127,15 @@ fn build_typed_field_row(initial: &str, initial_type: Option<&str>, choices: &[&
 /// Builds an address row: a street entry, a city entry and a remove button.
 fn build_address_row(street: &str, city: &str) -> FieldRow {
     let boxed = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
-    let street_entry = gtk::Entry::new();
+    let street_entry = form_entry("contact-street");
     street_entry.set_placeholder_text(Some("Street"));
     street_entry.set_text(street);
     street_entry.set_hexpand(true);
     boxed.append(&street_entry);
-    let city_entry = gtk::Entry::new();
+    let city_entry = form_entry("contact-city");
     city_entry.set_placeholder_text(Some("City"));
     city_entry.set_text(city);
-    city_entry.set_width_chars(14);
+    city_entry.set_width_chars(8);
     boxed.append(&city_entry);
     let remove = remove_button();
     boxed.append(&remove);
@@ -168,12 +167,12 @@ fn build_url_row(url: &str) -> FieldRow {
 /// wiring works unchanged.
 fn build_custom_row(name: &str, value: &str) -> FieldRow {
     let boxed = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
-    let name_entry = gtk::Entry::new();
+    let name_entry = form_entry("contact-custom-name");
     name_entry.set_placeholder_text(Some("Field"));
     name_entry.set_text(name);
-    name_entry.set_width_chars(14);
+    name_entry.set_width_chars(8);
     boxed.append(&name_entry);
-    let value_entry = gtk::Entry::new();
+    let value_entry = form_entry("contact-custom-value");
     value_entry.set_placeholder_text(Some("Value"));
     value_entry.set_text(value);
     value_entry.set_hexpand(true);
@@ -235,34 +234,22 @@ pub fn build_contact_form(seed: Option<&VCard>, books: Option<&[(String, String)
         crate::privacy::mark_content(dropdown);
     }
 
-    // --- Single-valued fields.
-    let name_row = adw::EntryRow::new();
-    name_row.set_title("Full name");
-    let given_row = adw::EntryRow::new();
-    given_row.set_title("First name");
-    let family_row = adw::EntryRow::new();
-    family_row.set_title("Last name");
-    let org_row = adw::EntryRow::new();
-    org_row.set_title("Organization");
-    let department_row = adw::EntryRow::new();
-    department_row.set_title("Department");
-    let office_row = adw::EntryRow::new();
-    office_row.set_title("Office");
-    let title_row = adw::EntryRow::new();
-    title_row.set_title("Title");
-    // P-07: the per-contact "File as" override. Empty means the contact is
-    // filed by the global preference (Settings → People).
-    let file_as_row = adw::EntryRow::new();
-    file_as_row.set_title("File as");
-    let birthday_row = adw::EntryRow::new();
-    birthday_row.set_title("Birthday");
-    let anniversary_row = adw::EntryRow::new();
-    anniversary_row.set_title("Anniversary");
-    let groups_row = adw::EntryRow::new();
-    groups_row.set_title("Groups");
-    let notes_entry = adw::EntryRow::new();
-    notes_entry.set_title("Notes");
-    notes_entry.set_show_apply_button(true);
+    // Ordinary desktop entries, shared by the modal and inline editors.
+    // The labels live in the form grid rather than inside AdwEntryRows.
+    let name_row = form_entry("contact-full-name");
+    let given_row = form_entry("contact-first-name");
+    let family_row = form_entry("contact-last-name");
+    let org_row = form_entry("contact-organization");
+    let department_row = form_entry("contact-department");
+    let office_row = form_entry("contact-office");
+    let title_row = form_entry("contact-title");
+    let file_as_row = form_entry("contact-file-as");
+    let birthday_row = form_entry("contact-birthday");
+    birthday_row.set_placeholder_text(Some("YYYY-MM-DD or MM-DD"));
+    let anniversary_row = form_entry("contact-anniversary");
+    anniversary_row.set_placeholder_text(Some("YYYY-MM-DD or MM-DD"));
+    let groups_row = form_entry("contact-groups");
+    let notes_entry = form_entry("contact-notes");
 
     let emails: Rc<RefCell<Vec<FieldRow>>> = Rc::new(RefCell::new(Vec::new()));
     let phones: Rc<RefCell<Vec<FieldRow>>> = Rc::new(RefCell::new(Vec::new()));
@@ -301,13 +288,21 @@ pub fn build_contact_form(seed: Option<&VCard>, books: Option<&[(String, String)
     let photo_state: Rc<RefCell<Option<Photo>>> = Rc::new(RefCell::new(seed.as_ref().and_then(|card| card.photo.clone())));
     let photo_picture = gtk::Picture::builder()
         .content_fit(gtk::ContentFit::Cover)
-        .width_request(96)
-        .height_request(96)
+        .width_request(76)
+        .height_request(76)
+        .can_shrink(true)
         .css_classes(["contact-photo"])
         .build();
+    let photo_placeholder = gtk::Image::from_icon_name("avatar-default-symbolic");
+    photo_placeholder.set_pixel_size(64);
+    let photo_stack = gtk::Stack::builder().width_request(76).height_request(76).build();
+    photo_stack.add_named(&photo_placeholder, Some("placeholder"));
+    photo_stack.add_named(&photo_picture, Some("photo"));
+    crate::privacy::mark(&photo_picture);
     let refresh_photo: Rc<dyn Fn()> = {
         let photo_state = photo_state.clone();
         let photo_picture = photo_picture.clone();
+        let photo_stack = photo_stack.clone();
         Rc::new(move || {
             let texture = photo_state
                 .borrow()
@@ -315,8 +310,14 @@ pub fn build_contact_form(seed: Option<&VCard>, books: Option<&[(String, String)
                 .and_then(|photo| photo.data.clone())
                 .and_then(|data| gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(data)).ok());
             match texture {
-                Some(texture) => photo_picture.set_paintable(Some(&texture)),
-                None => photo_picture.set_paintable(None::<&gtk::gdk::Texture>),
+                Some(texture) => {
+                    photo_picture.set_paintable(Some(&texture));
+                    photo_stack.set_visible_child_name("photo");
+                }
+                None => {
+                    photo_picture.set_paintable(None::<&gtk::gdk::Texture>);
+                    photo_stack.set_visible_child_name("placeholder");
+                }
             }
         })
     };
@@ -394,8 +395,25 @@ pub fn build_contact_form(seed: Option<&VCard>, books: Option<&[(String, String)
         }
     }
 
+    // A new contact can be typed immediately, without first adding rows.
+    // Blank rows are ignored by the existing vCard writer.
+    if emails.borrow().is_empty() {
+        let row = build_field_row("", Some("work"));
+        wire_remove(&row, &emails, &emails_box);
+        emails_box.append(&row.boxed);
+        emails.borrow_mut().push(row);
+    }
+    if phones.borrow().is_empty() {
+        for kind in ["work", "cell"] {
+            let row = build_typed_field_row("", Some(kind), &PHONE_TYPES);
+            wire_remove(&row, &phones, &phones_box);
+            phones_box.append(&row.boxed);
+            phones.borrow_mut().push(row);
+        }
+    }
+
     // --- Add-row buttons.
-    let add_email = gtk::Button::with_label("Add email");
+    let add_email = compact_add_button("Add email");
     add_email.connect_clicked({
         let emails = emails.clone();
         let emails_box = emails_box.clone();
@@ -407,7 +425,7 @@ pub fn build_contact_form(seed: Option<&VCard>, books: Option<&[(String, String)
         }
     });
 
-    let add_phone = gtk::Button::with_label("Add phone");
+    let add_phone = compact_add_button("Add phone");
     add_phone.connect_clicked({
         let phones = phones.clone();
         let phones_box = phones_box.clone();
@@ -419,7 +437,7 @@ pub fn build_contact_form(seed: Option<&VCard>, books: Option<&[(String, String)
         }
     });
 
-    let add_address = gtk::Button::with_label("Add address");
+    let add_address = compact_add_button("Add address");
     add_address.connect_clicked({
         let addresses = addresses.clone();
         let addresses_box = addresses_box.clone();
@@ -431,7 +449,7 @@ pub fn build_contact_form(seed: Option<&VCard>, books: Option<&[(String, String)
         }
     });
 
-    let add_website = gtk::Button::with_label("Add website");
+    let add_website = compact_add_button("Add website");
     add_website.connect_clicked({
         let websites = websites.clone();
         let websites_box = websites_box.clone();
@@ -443,7 +461,7 @@ pub fn build_contact_form(seed: Option<&VCard>, books: Option<&[(String, String)
         }
     });
 
-    let add_im = gtk::Button::with_label("Add IM");
+    let add_im = compact_add_button("Add IM");
     add_im.connect_clicked({
         let ims = ims.clone();
         let ims_box = ims_box.clone();
@@ -455,7 +473,7 @@ pub fn build_contact_form(seed: Option<&VCard>, books: Option<&[(String, String)
         }
     });
 
-    let add_custom = gtk::Button::with_label("Add field");
+    let add_custom = compact_add_button("Add field");
     add_custom.connect_clicked({
         let customs = customs.clone();
         let customs_box = customs_box.clone();
@@ -468,7 +486,8 @@ pub fn build_contact_form(seed: Option<&VCard>, books: Option<&[(String, String)
     });
 
     // --- Photo controls: pick an image file, or clear the current photo.
-    let set_photo_button = gtk::Button::with_label("Set photo…");
+    let set_photo_button = gtk::Button::builder().icon_name("document-open-symbolic")
+        .tooltip_text("Set photo…").css_classes(["flat"]).build();
     set_photo_button.connect_clicked({
         let photo_state = photo_state.clone();
         let refresh_photo = refresh_photo.clone();
@@ -501,7 +520,8 @@ pub fn build_contact_form(seed: Option<&VCard>, books: Option<&[(String, String)
             });
         }
     });
-    let remove_photo_button = gtk::Button::with_label("Remove photo");
+    let remove_photo_button = gtk::Button::builder().icon_name("user-trash-symbolic")
+        .tooltip_text("Remove photo").css_classes(["flat"]).build();
     remove_photo_button.connect_clicked({
         let photo_state = photo_state.clone();
         let refresh_photo = refresh_photo.clone();
@@ -511,62 +531,63 @@ pub fn build_contact_form(seed: Option<&VCard>, books: Option<&[(String, String)
         }
     });
 
-    // --- Assemble the form body.
-    let content_box = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(10)
-        .margin_top(12)
-        .margin_bottom(12)
-        .margin_start(12)
-        .margin_end(12)
-        .build();
-
-    let photo_buttons = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).valign(gtk::Align::Center).build();
-    photo_buttons.append(&set_photo_button);
-    photo_buttons.append(&remove_photo_button);
-    let photo_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(12).build();
-    photo_row.append(&photo_picture);
-    photo_row.append(&photo_buttons);
+    // --- Assemble the form body. Keep the main identity and contact
+    // information visible; less frequently edited fields live in Details.
+    let content_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical)
+        .spacing(10).margin_top(12).margin_bottom(12).margin_start(12).margin_end(12)
+        .hexpand(true).build();
+    content_box.add_css_class("contact-editor");
 
     if let Some(book_dropdown) = &book_dropdown {
-        let book_row = adw::ActionRow::builder().title("Address book").build();
-        book_row.add_suffix(book_dropdown);
-        let book_group = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).css_classes(["boxed-list"]).build();
-        book_group.append(&book_row);
-        content_box.append(&book_group);
+        let book_grid = form_grid();
+        book_dropdown.set_hexpand(true);
+        attach_form_field(&book_grid, 0, "Address book", book_dropdown);
+        content_box.append(&book_grid);
     }
-    content_box.append(&section_header("Photo"));
-    content_box.append(&photo_row);
-    // AdwEntryRow is a GtkListBoxRow: its parent must be a ListBox,
-    // including when the same form is used inside the inline editor.
-    let identity_group = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).css_classes(["boxed-list"]).build();
-    for row in [&name_row, &given_row, &family_row, &org_row, &department_row, &office_row, &title_row, &file_as_row, &birthday_row, &anniversary_row] {
-        identity_group.append(row);
+
+    let identity = form_grid();
+    for (index, (label, entry)) in [
+        ("Full name", &name_row), ("First name", &given_row),
+        ("Last name", &family_row), ("Organization", &org_row),
+        ("Department", &department_row), ("Title", &title_row), ("Office", &office_row),
+    ].iter().enumerate() {
+        attach_form_field(&identity, index as i32, label, *entry);
     }
-    content_box.append(&identity_group);
-    content_box.append(&section_header("Emails"));
-    content_box.append(&emails_box);
-    content_box.append(&add_email);
-    content_box.append(&section_header("Phones"));
-    content_box.append(&phones_box);
-    content_box.append(&add_phone);
-    content_box.append(&section_header("Addresses"));
-    content_box.append(&addresses_box);
-    content_box.append(&add_address);
-    content_box.append(&section_header("Websites"));
-    content_box.append(&websites_box);
-    content_box.append(&add_website);
-    content_box.append(&section_header("Instant messaging"));
-    content_box.append(&ims_box);
-    content_box.append(&add_im);
-    content_box.append(&section_header("Custom fields"));
-    content_box.append(&customs_box);
-    content_box.append(&add_custom);
-    content_box.append(&section_header("Notes"));
-    let notes_group = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).css_classes(["boxed-list"]).build();
-    notes_group.append(&notes_entry);
-    notes_group.append(&groups_row);
-    content_box.append(&notes_group);
+    let photo_buttons = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
+        .spacing(2).halign(gtk::Align::Center).build();
+    photo_buttons.append(&set_photo_button);
+    photo_buttons.append(&remove_photo_button);
+    let photo_column = gtk::Box::builder().orientation(gtk::Orientation::Vertical)
+        .spacing(4).valign(gtk::Align::Start).build();
+    photo_column.append(&photo_stack);
+    photo_column.append(&photo_buttons);
+    let identity_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
+        .spacing(12).build();
+    identity_row.append(&photo_column);
+    identity_row.append(&identity);
+    content_box.append(&identity_row);
+
+    content_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    content_box.append(&section_header("Contact information"));
+    let contact_grid = form_grid();
+    attach_dynamic_group(&contact_grid, 0, "Email", &emails_box, &add_email);
+    attach_dynamic_group(&contact_grid, 1, "Phone", &phones_box, &add_phone);
+    content_box.append(&contact_grid);
+
+    let details_grid = form_grid();
+    attach_form_field(&details_grid, 0, "File as", &file_as_row);
+    attach_form_field(&details_grid, 1, "Birthday", &birthday_row);
+    attach_form_field(&details_grid, 2, "Anniversary", &anniversary_row);
+    attach_dynamic_group(&details_grid, 3, "Addresses", &addresses_box, &add_address);
+    attach_dynamic_group(&details_grid, 4, "Websites", &websites_box, &add_website);
+    attach_dynamic_group(&details_grid, 5, "IM", &ims_box, &add_im);
+    attach_dynamic_group(&details_grid, 6, "Custom fields", &customs_box, &add_custom);
+    attach_form_field(&details_grid, 7, "Notes", &notes_entry);
+    attach_form_field(&details_grid, 8, "Groups", &groups_row);
+    details_grid.set_margin_top(8);
+    let details = gtk::Expander::builder().label("Additional details").child(&details_grid)
+        .expanded(false).build();
+    content_box.append(&details);
 
     // --- Build the card from the form (clone of the seed card, only the
     // exposed fields rewritten). `None` on invalid input (no name, bad
@@ -769,8 +790,8 @@ pub fn show_contact_editor(
         .transient_for(window)
         .modal(true)
         .title(if has_existing { "Edit contact" } else { "New contact" })
-        .default_width(560)
-        .default_height(640)
+        .default_width(680)
+        .default_height(680)
         .build();
 
     let form = build_contact_form(seed.as_ref(), Some(prefill.books), has_existing);
@@ -781,6 +802,9 @@ pub fn show_contact_editor(
         .hscrollbar_policy(gtk::PolicyType::Never)
         .build();
     let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
+    let header = adw::HeaderBar::new();
+    header.set_title_widget(Some(&adw::WindowTitle::new(if has_existing { "Edit contact" } else { "New contact" }, "")));
+    content.append(&header);
     content.append(&scroller);
     // Inline refusal for Work Offline (M-40): People has no mutation queue, so
     // the form stays open with an explanation instead of closing on a write
@@ -896,9 +920,78 @@ fn parse_date_entry(text: &str) -> Option<Option<lookout_core::Birthday>> {
     None
 }
 
+fn form_entry(name: &str) -> gtk::Entry {
+    let entry = gtk::Entry::builder().hexpand(true).width_chars(8)
+        .max_width_chars(24).build();
+    entry.set_widget_name(name);
+    crate::privacy::mark(&entry);
+    entry
+}
+
+fn form_grid() -> gtk::Grid {
+    gtk::Grid::builder().column_spacing(10).row_spacing(4)
+        .hexpand(true).build()
+}
+
+fn form_label(text: &str) -> gtk::Label {
+    let label = gtk::Label::builder().label(text).xalign(0.0)
+        .valign(gtk::Align::Center).width_request(94).build();
+    crate::privacy::mark_ui(&label);
+    label
+}
+
+fn attach_form_field(grid: &gtk::Grid, row: i32, text: &str, field: &impl IsA<gtk::Widget>) {
+    grid.attach(&form_label(text), 0, row, 1, 1);
+    grid.attach(field, 1, row, 1, 1);
+}
+
+fn compact_add_button(tooltip: &str) -> gtk::Button {
+    gtk::Button::builder().icon_name("list-add-symbolic").tooltip_text(tooltip)
+        .css_classes(["flat"]).valign(gtk::Align::Start).build()
+}
+
+fn attach_dynamic_group(grid: &gtk::Grid, row: i32, text: &str, fields: &gtk::Box, add: &gtk::Button) {
+    let label = form_label(text);
+    label.set_valign(gtk::Align::Start);
+    label.set_margin_top(7);
+    let line = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
+        .spacing(4).hexpand(true).build();
+    fields.set_hexpand(true);
+    line.append(fields);
+    line.append(add);
+    grid.attach(&label, 0, row, 1, 1);
+    grid.attach(&line, 1, row, 1, 1);
+}
+
 fn section_header(label: &str) -> gtk::Label {
     let header = gtk::Label::builder().label(label).xalign(0.0).css_classes(["heading"]).build();
     crate::privacy::mark_ui(&header);
     header.set_margin_top(4);
     header
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn desktop_form_preserves_seed_and_empty_contact_rows() {
+        if !crate::gtk_test::gtk_ready() { return; }
+        let seed = VCard::parse("BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Ada Lovelace\r\nN:Lovelace;Ada;;;\r\nORG:Example;Engineering\r\nADR;TYPE=work:;101;Main Street;City;;12345;Country\r\nEMAIL;TYPE=work:ada@example.invalid\r\nTEL;TYPE=cell:123\r\nNOTE:Test note\r\nEND:VCARD\r\n").unwrap();
+        let form = build_contact_form(Some(&seed), None, true);
+        let result = (form.build_card)().unwrap();
+        assert_eq!(result.full_name.as_deref(), Some("Ada Lovelace"));
+        assert_eq!(result.organization, seed.organization);
+        assert_eq!(contact_office(&result), "101");
+        assert_eq!(result.addresses[0].street, "Main Street");
+        assert_eq!(result.emails[0].address, "ada@example.invalid");
+        assert_eq!(result.telephones[0].types, vec!["cell"]);
+        assert_eq!(result.note, seed.note);
+
+        let seed = VCard::parse("BEGIN:VCARD\r\nVERSION:3.0\r\nFN:New contact\r\nEND:VCARD\r\n").unwrap();
+        let form = build_contact_form(Some(&seed), None, false);
+        let result = (form.build_card)().unwrap();
+        assert!(result.emails.is_empty());
+        assert!(result.telephones.is_empty());
+    }
 }
