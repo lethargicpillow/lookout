@@ -843,7 +843,7 @@ pub fn show_create_contact_for(
 /// Opens the create form prefilled from a company-directory hit (item 4.7.8),
 /// keeping the title and company the directory knows. A person already in the
 /// stored contacts is reported rather than duplicated.
-pub fn show_create_contact_from_directory(window: &adw::ApplicationWindow, state: &Rc<RefCell<UiState>>, toast_overlay: &adw::ToastOverlay, person: &DirectoryPerson) {
+pub fn show_create_contact_from_directory(window: &adw::ApplicationWindow, state: &Rc<RefCell<UiState>>, toast_overlay: &adw::ToastOverlay, person: &DirectoryPerson, worker: &Rc<Worker>) {
     let address = person.address.trim();
     if address.is_empty() {
         return;
@@ -854,8 +854,45 @@ pub fn show_create_contact_from_directory(window: &adw::ApplicationWindow, state
         toast_overlay.add_toast(adw::Toast::new(&text));
         return;
     }
-    let seed = directory_person_seed(person);
-    show_create_contact_with_seed(window, state, toast_overlay, seed, None);
+    let (account, path) = {
+        let st = state.borrow();
+        let account = st.contacts_directory_account.clone();
+        let path = if st.contacts_directory_local {
+            account.as_ref().and_then(|id| crate::oab_cache::existing_path(&id.0))
+        } else { None };
+        (account, path)
+    };
+    let Some(path) = path else {
+        show_create_contact_with_seed(window, state, toast_overlay, directory_person_seed(person), account);
+        return;
+    };
+    let person = person.clone();
+    let address = person.address.clone();
+    let name = person.name.clone().unwrap_or_default();
+    let (tx, rx) = async_channel::bounded(1);
+    worker.spawn(async move {
+        let result = tokio::task::spawn_blocking(move || crate::oab_cache::details(&path, &address, &name)).await;
+        let _ = tx.send(result).await;
+    });
+    let window = window.clone();
+    let state = state.clone();
+    let toast_overlay = toast_overlay.clone();
+    glib::spawn_future_local(async move {
+        let details = match rx.recv().await {
+            Ok(Ok(Ok(Some(details)))) => details,
+            _ => {
+                toast_overlay.add_toast(adw::Toast::new("Could not read the full directory contact. Refresh the directory and try again."));
+                return;
+            }
+        };
+        // A second click or a contact sync may have added it while reading.
+        if find_contact_by_address(&state, &person.address, None).is_some() {
+            toast_overlay.add_toast(adw::Toast::new("This person is already in your contacts."));
+            return;
+        }
+        let seed = directory_person_seed_with_details(&person, &details);
+        show_create_contact_with_seed(&window, &state, &toast_overlay, seed, account);
+    });
 }
 
 /// The shared "new contact" flow behind `show_create_contact_for` and the
@@ -1385,6 +1422,40 @@ pub(crate) fn directory_person_seed(person: &DirectoryPerson) -> VCard {
         categories: Vec::new(),
         other: Vec::new(),
     }
+}
+
+/// Copy only the populated OAB properties into a new, independent vCard.
+/// An SMTP distribution alias remains an addressable contact, not a fabricated
+/// contact list (the OAB snapshot does not contain group membership).
+fn directory_person_seed_with_details(person: &DirectoryPerson, details: &crate::oab_cache::Details) -> VCard {
+    let mut card = directory_person_seed(person);
+    let given = details.given_name.trim();
+    let family = details.surname.trim();
+    if !given.is_empty() || !family.is_empty() {
+        card.name = Some(lookout_core::Name {
+            given: given.into(), family: family.into(),
+            additional: String::new(), prefix: String::new(), suffix: String::new(),
+        });
+    }
+    let department = details.department.trim();
+    if !department.is_empty() {
+        let org = card.organization.get_or_insert_with(|| vec![String::new()]);
+        org.push(department.into());
+    }
+    let office = details.office.trim();
+    if !office.is_empty() {
+        card.other.push(lookout_core::OtherProperty {
+            name: "X-MS-OFFICELOCATION".into(), params: Vec::new(), value: office.into(),
+        });
+    }
+    for (number, kind) in [(&details.business_phone, "work"), (&details.mobile_phone, "cell")] {
+        if !number.trim().is_empty() {
+            card.telephones.push(lookout_core::TelephoneField {
+                types: vec![kind.into()], number: number.trim().into(),
+            });
+        }
+    }
+    card
 }
 
 pub fn merge_contact_suggestions(
@@ -3785,6 +3856,25 @@ mod tests {
             contacts: Vec::new(),
         }
         .is_directory());
+    }
+
+    #[test]
+    fn oab_seed_preserves_structured_contact_fields() {
+        let person = DirectoryPerson { id: None, name: Some("Иван Иванов".into()),
+            address: "ivan@example.invalid".into(), title: Some("Engineer".into()), company: Some("Company".into()) };
+        let details = crate::oab_cache::Details {
+            given_name: "Иван".into(), surname: "Иванов".into(), department: "Lab".into(),
+            office: "101".into(), business_phone: "123".into(), mobile_phone: "456".into(),
+            object_type: Some(6),
+        };
+        let card = directory_person_seed_with_details(&person, &details);
+        let card = VCard::parse(&card.serialize()).unwrap();
+        assert_eq!(card.name.as_ref().unwrap().given, "Иван");
+        assert_eq!(card.name.as_ref().unwrap().family, "Иванов");
+        assert_eq!(card.organization.unwrap(), vec!["Company", "Lab"]);
+        assert_eq!(card.telephones[0].types, vec!["work"]);
+        assert_eq!(card.telephones[1].types, vec!["cell"]);
+        assert_eq!(card.other.iter().find(|p| p.name == "X-MS-OFFICELOCATION").unwrap().value, "101");
     }
 
     #[test]

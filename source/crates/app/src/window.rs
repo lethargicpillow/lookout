@@ -7940,8 +7940,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let window = window.clone();
             let state = state.clone();
             let toast_overlay = toast_overlay.clone();
+            let worker = worker.clone();
             Rc::new(move |person| {
-                crate::contacts_view::show_create_contact_from_directory(&window, &state, &toast_overlay, person);
+                crate::contacts_view::show_create_contact_from_directory(&window, &state, &toast_overlay, person, &worker);
             })
         };
         crate::contacts_details::ContactsDetailsActions {

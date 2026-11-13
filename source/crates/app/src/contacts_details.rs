@@ -697,7 +697,10 @@ fn fill_contact_info(container: &gtk::Box, card: &VCard) {
     block(
         container,
         "Custom fields",
-        card.other.iter().map(|property| format!("{}: {}", property.name, property.value.trim())).collect(),
+        card.other.iter().map(|property| {
+            let label = if property.name.eq_ignore_ascii_case("X-MS-OFFICELOCATION") { "Office" } else { &property.name };
+            format!("{label}: {}", property.value.trim())
+        }).collect(),
         &mut any,
     );
     if let Some(note) = &card.note {

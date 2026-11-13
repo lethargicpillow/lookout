@@ -71,6 +71,8 @@ pub struct ContactEditorPrefill<'a> {
 
 /// The type choices for a dynamic email/phone row.
 const FIELD_TYPES: [&str; 3] = ["work", "home", "other"];
+const PHONE_TYPES: [&str; 4] = ["work", "home", "other", "cell"];
+const OFFICE_PROPERTY: &str = "X-MS-OFFICELOCATION";
 
 /// One dynamic email/phone/address row: its text entries, type dropdown and
 /// remove button, kept by identity so rows can be removed and read back
@@ -90,6 +92,10 @@ struct FieldRow {
 /// Builds one dynamic email/phone/IM row: a text entry, a `TYPE` dropdown
 /// (`work` / `home` / `other`) and a remove button.
 fn build_field_row(initial: &str, initial_type: Option<&str>) -> FieldRow {
+    build_typed_field_row(initial, initial_type, &FIELD_TYPES)
+}
+
+fn build_typed_field_row(initial: &str, initial_type: Option<&str>, choices: &[&str]) -> FieldRow {
     let boxed = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
 
     let entry = gtk::Entry::new();
@@ -97,10 +103,10 @@ fn build_field_row(initial: &str, initial_type: Option<&str>) -> FieldRow {
     entry.set_hexpand(true);
     boxed.append(&entry);
 
-    let type_list = gtk::StringList::new(&FIELD_TYPES);
+    let type_list = gtk::StringList::new(choices);
     let dropdown = gtk::DropDown::builder().model(&type_list).valign(gtk::Align::Center).build();
     let selected = initial_type
-        .and_then(|t| FIELD_TYPES.iter().position(|candidate| candidate.eq_ignore_ascii_case(t)))
+        .and_then(|t| choices.iter().position(|candidate| candidate.eq_ignore_ascii_case(t)))
         .unwrap_or(0);
     dropdown.set_selected(selected as u32);
     boxed.append(&dropdown);
@@ -228,8 +234,16 @@ pub fn build_contact_form(seed: Option<&VCard>, books: Option<&[(String, String)
     // --- Single-valued fields.
     let name_row = adw::EntryRow::new();
     name_row.set_title("Full name");
+    let given_row = adw::EntryRow::new();
+    given_row.set_title("First name");
+    let family_row = adw::EntryRow::new();
+    family_row.set_title("Last name");
     let org_row = adw::EntryRow::new();
     org_row.set_title("Organization");
+    let department_row = adw::EntryRow::new();
+    department_row.set_title("Department");
+    let office_row = adw::EntryRow::new();
+    office_row.set_title("Office");
     let title_row = adw::EntryRow::new();
     title_row.set_title("Title");
     // P-07: the per-contact "File as" override. Empty means the contact is
@@ -307,7 +321,13 @@ pub fn build_contact_form(seed: Option<&VCard>, books: Option<&[(String, String)
     // --- Repopulate from the existing card (or the create prefill).
     if let Some(card) = &seed {
         name_row.set_text(card.full_name.as_deref().unwrap_or(""));
+        if let Some(name) = &card.name {
+            given_row.set_text(&name.given);
+            family_row.set_text(&name.family);
+        }
         org_row.set_text(card.organization.as_ref().and_then(|org| org.first()).map(String::as_str).unwrap_or(""));
+        department_row.set_text(card.organization.as_ref().and_then(|org| org.get(1)).map(String::as_str).unwrap_or(""));
+        office_row.set_text(card.other.iter().find(|p| p.name.eq_ignore_ascii_case(OFFICE_PROPERTY)).map(|p| p.value.as_str()).unwrap_or(""));
         title_row.set_text(card.title.as_deref().unwrap_or(""));
         file_as_row.set_text(card.file_as.as_deref().unwrap_or(""));
         if let Some(birthday) = card.birthday {
@@ -333,7 +353,8 @@ pub fn build_contact_form(seed: Option<&VCard>, books: Option<&[(String, String)
             emails.borrow_mut().push(row);
         }
         for phone in &card.telephones {
-            let row = build_field_row(&phone.number, phone.types.first().map(String::as_str));
+            let phone_type = phone.types.iter().find(|t| t.eq_ignore_ascii_case("cell")).or_else(|| phone.types.first());
+            let row = build_typed_field_row(&phone.number, phone_type.map(String::as_str), &PHONE_TYPES);
             wire_remove(&row, &phones, &phones_box);
             phones_box.append(&row.boxed);
             phones.borrow_mut().push(row);
@@ -357,6 +378,7 @@ pub fn build_contact_form(seed: Option<&VCard>, books: Option<&[(String, String)
             ims.borrow_mut().push(row);
         }
         for property in &card.other {
+            if property.name.eq_ignore_ascii_case(OFFICE_PROPERTY) { continue; }
             let row = build_custom_row(&property.name, &property.value);
             wire_remove(&row, &customs, &customs_box);
             customs_box.append(&row.boxed);
@@ -382,7 +404,7 @@ pub fn build_contact_form(seed: Option<&VCard>, books: Option<&[(String, String)
         let phones = phones.clone();
         let phones_box = phones_box.clone();
         move |_| {
-            let row = build_field_row("", None);
+            let row = build_typed_field_row("", None, &PHONE_TYPES);
             wire_remove(&row, &phones, &phones_box);
             phones_box.append(&row.boxed);
             phones.borrow_mut().push(row);
@@ -506,7 +528,11 @@ pub fn build_contact_form(seed: Option<&VCard>, books: Option<&[(String, String)
     content_box.append(&section_header("Photo"));
     content_box.append(&photo_row);
     content_box.append(&name_row);
+    content_box.append(&given_row);
+    content_box.append(&family_row);
     content_box.append(&org_row);
+    content_box.append(&department_row);
+    content_box.append(&office_row);
     content_box.append(&title_row);
     content_box.append(&file_as_row);
     content_box.append(&birthday_row);
@@ -567,8 +593,27 @@ pub fn build_contact_form(seed: Option<&VCard>, books: Option<&[(String, String)
         }
         card.full_name = Some(full_name);
 
+        let given = given_row.text().trim().to_string();
+        let family = family_row.text().trim().to_string();
+        if card.name.is_some() || !given.is_empty() || !family.is_empty() {
+            let mut name = card.name.take().unwrap_or_else(|| lookout_core::Name {
+                family: String::new(), given: String::new(), additional: String::new(),
+                prefix: String::new(), suffix: String::new(),
+            });
+            name.given = given;
+            name.family = family;
+            if [&name.given, &name.family, &name.additional, &name.prefix, &name.suffix].iter().any(|v| !v.is_empty()) {
+                card.name = Some(name);
+            }
+        }
         let org = org_row.text().trim().to_string();
-        card.organization = if org.is_empty() { None } else { Some(vec![org]) };
+        let department = department_row.text().trim().to_string();
+        let mut parts = card.organization.take().unwrap_or_default();
+        parts.resize(parts.len().max(2), String::new());
+        parts[0] = org;
+        parts[1] = department;
+        while parts.last().is_some_and(|v| v.is_empty()) { parts.pop(); }
+        card.organization = (!parts.is_empty()).then_some(parts);
         let title = title_row.text().trim().to_string();
         card.title = if title.is_empty() { None } else { Some(title) };
 
@@ -592,7 +637,7 @@ pub fn build_contact_form(seed: Option<&VCard>, books: Option<&[(String, String)
             if number.is_empty() {
                 continue;
             }
-            let types = vec![FIELD_TYPES[row.dropdown.selected() as usize].to_string()];
+            let types = vec![PHONE_TYPES[row.dropdown.selected() as usize].to_string()];
             phones_out.push(TelephoneField { types, number });
         }
         card.telephones = phones_out;
@@ -667,6 +712,12 @@ pub fn build_contact_form(seed: Option<&VCard>, books: Option<&[(String, String)
                 .map(|property| property.params.clone())
                 .unwrap_or_default();
             other_out.push(OtherProperty { name, params, value });
+        }
+        let office = office_row.text().trim().to_string();
+        if !office.is_empty() {
+            let params = original_custom.iter().find(|p| p.name.eq_ignore_ascii_case(OFFICE_PROPERTY))
+                .map(|p| p.params.clone()).unwrap_or_default();
+            other_out.push(OtherProperty { name: OFFICE_PROPERTY.into(), params, value: office });
         }
         card.other = other_out;
 
