@@ -75,6 +75,27 @@ pub(crate) fn fingerprint(account_id: &str) -> Option<String> {
     conn.query_row("SELECT fingerprint FROM gal_sync LIMIT 1", [], |r| r.get(0)).ok()
 }
 
+/// Successful server checks (including unchanged manifests) are recorded
+/// separately from the imported data. Older databases need no migration
+/// until their first successful check.
+pub(crate) fn last_check(account_id: &str) -> Option<i64> {
+    let conn = Connection::open_with_flags(path_for(account_id), OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    conn.query_row("SELECT checked_at FROM gal_check LIMIT 1", [], |r| r.get(0)).ok()
+}
+
+pub(crate) fn record_check(account_id: &str, checked_at: i64) -> rusqlite::Result<()> {
+    write_check(&path_for(account_id), checked_at)
+}
+
+fn write_check(path: &Path, checked_at: i64) -> rusqlite::Result<()> {
+    let mut conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let tx = conn.transaction()?;
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS gal_check (checked_at INTEGER NOT NULL); DELETE FROM gal_check;")?;
+    tx.execute("INSERT INTO gal_check VALUES (?1)", [checked_at])?;
+    tx.commit()
+}
+
 #[cfg(test)]
 fn write_book(path: &Path, book: &crate::oab_decode::Book) -> rusqlite::Result<()> {
     write_book_with_fingerprint(path, book, None)
@@ -95,7 +116,8 @@ fn write_book_with_fingerprint(path: &Path, book: &crate::oab_decode::Book, fing
         );
         CREATE INDEX IF NOT EXISTS gal_sort ON gal(sort_name,smtp);
         CREATE TABLE IF NOT EXISTS gal_sync (fingerprint TEXT NOT NULL);
-        DELETE FROM gal; DELETE FROM gal_meta; DELETE FROM gal_sync;")?;
+        CREATE TABLE IF NOT EXISTS gal_check (checked_at INTEGER NOT NULL);
+        DELETE FROM gal; DELETE FROM gal_meta; DELETE FROM gal_sync; DELETE FROM gal_check;")?;
     if let Some(value) = fingerprint {
         tx.execute("INSERT INTO gal_sync VALUES (?1)", [value])?;
     }
@@ -228,6 +250,18 @@ mod tests {
         book.contacts.truncate(1);
         write_book(&path,&book).unwrap();
         assert_eq!(read_page(&path,"",0,10).unwrap().total,1);
+        write_check(&path, 123).unwrap();
+        write_check(&path, 456).unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            assert_eq!(conn.query_row("SELECT checked_at FROM gal_check", [], |r| r.get::<_, i64>(0)).unwrap(), 456);
+            assert_eq!(conn.query_row("SELECT count(*) FROM gal_check", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        }
+        write_book(&path,&book).unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            assert_eq!(conn.query_row("SELECT count(*) FROM gal_check", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        }
         std::fs::remove_file(path).unwrap();
     }
 }

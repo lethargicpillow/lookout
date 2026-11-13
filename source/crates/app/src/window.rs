@@ -4058,8 +4058,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let directory_count_label = gtk::Label::new(None);
     directory_count_label.add_css_class("dim-label");
     contacts_directory_search_row.append(&directory_count_label);
+    let gal_refresh_button = gtk::Button::builder().icon_name("view-refresh-symbolic")
+        .tooltip_text("Check Exchange for an updated address book")
+        .css_classes(["flat"]).valign(gtk::Align::Center).visible(false).build();
+    contacts_directory_search_row.append(&gal_refresh_button);
     contacts_directory_search_row.set_visible(false);
     contacts_right_box.append(&contacts_directory_search_row);
+    let gal_status_label = gtk::Label::builder().xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End)
+        .css_classes(["dim-label", "caption"]).visible(false).build();
+    contacts_right_box.append(&gal_status_label);
     contacts_right_box.append(&directory_list.root);
 
     let contacts_left_card = card_section(&contacts_left_box);
@@ -8318,7 +8325,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         contacts_directory_search_entry.connect_search_changed(move |entry| run_directory_search(&entry.text()));
     }
     refresh_contacts_ui(None);
-    crate::oab_sync::start(state.clone(), worker.clone(), run_directory_search.clone());
+    let refresh_gal_status = crate::oab_sync::start(
+        state.clone(), worker.clone(), run_directory_search.clone(), &gal_refresh_button, &gal_status_label,
+    );
+    contacts_category_list.connect_row_selected(move |_, _| refresh_gal_status());
     // The Filter/Sort ▾ menu (UX-65), rebuilt on each open so the category
     // list is always current. Sort writes the shared "File contacts as"
     // preference; the filters live on `contacts_filter_options` and repaint
