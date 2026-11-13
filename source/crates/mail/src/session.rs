@@ -1257,14 +1257,24 @@ async fn queue_outbox_message(
     client_token: Option<u64>,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
     let queue_failed = |message: String| AccountEvent::OutboxFailed { id: 0, client_token, message };
-    let payload = match serde_json::to_vec(&OutboxMessage::from_composed(message)) {
-        Ok(payload) => payload,
-        Err(e) => {
+    tracing::debug!(attachments = message.attachments.len(), attachment_bytes = message.attachments.iter().map(|a| a.bytes.len()).sum::<usize>(), "send pipeline: building outbox MIME");
+    // MIME encoding and JSON/base64 can take substantial CPU and memory for
+    // attachments. Keep that work off the async I/O executor.
+    let composed = message.clone();
+    let payload = match tokio::task::spawn_blocking(move || serde_json::to_vec(&OutboxMessage::from_composed(&composed))).await {
+        Ok(Ok(payload)) => payload,
+        Ok(Err(e)) => {
             tracing::warn!("couldn't serialize outgoing message: {e}");
             let _ = events.send(queue_failed(format!("Couldn't queue message: {e}"))).await;
             return None;
         }
+        Err(e) => {
+            tracing::warn!("outbox MIME worker failed: {e}");
+            let _ = events.send(queue_failed("Couldn't prepare outgoing message".to_string())).await;
+            return None;
+        }
     };
+    tracing::debug!(payload_bytes = payload.len(), "send pipeline: MIME prepared; persisting outbox");
     let due = not_before.unwrap_or_else(chrono::Utc::now);
     let queued = cache_op(cache, {
         let account_id = account_id.clone();
@@ -1273,6 +1283,7 @@ async fn queue_outbox_message(
     .await;
     match queued {
         Some(Ok(id)) => {
+            tracing::debug!(id, "send pipeline: outbox persisted");
             let _ = events
                 .send(AccountEvent::OutboxQueued {
                     id,
@@ -2181,12 +2192,14 @@ async fn connect_and_run(
                     cache_op(cache, move |c| c.delete_outbox(id)).await;
                     continue;
                 };
+                tracing::debug!(id, bytes = raw.len(), attempts, "send pipeline: SMTP starting");
                 let sent = match credentials.smtp_credential().await {
                     Ok(cred) => send_smtp(&config.smtp, cred, &message.from, &message.recipients, &raw, message.request_delivery_receipt).await,
                     Err(e) => Err(Error::LoginFailed(e)),
                 };
                 match sent {
                     Ok(()) => {
+                        tracing::debug!(id, "send pipeline: SMTP accepted");
                         // The transport accepted the message, so the row has
                         // done its job: delete it *before* the archive and
                         // draft round trips. A crash, quit or lost network in
@@ -3183,16 +3196,39 @@ async fn connect_and_run(
                 AccountCommand::SaveDraft { msg, replace } => {
                     let had_drafts_folder = drafts_path(&folders, &account_id).is_some();
                     let draft_id = msg.message_id.clone().unwrap_or_default();
-                    match save_draft(&mut session, &folders, &account_id, *msg, replace, has_uidplus).await {
-                        Ok(message_id) => {
+                    tracing::debug!(attachments = msg.attachments.len(), attachment_bytes = msg.attachments.iter().map(|a| a.bytes.len()).sum::<usize>(), "send pipeline: IMAP draft save starting");
+                    // A blocked APPEND must not indefinitely hold the only
+                    // session that can accept an outgoing message. On expiry
+                    // abandon the IMAP connection (its protocol state is
+                    // uncertain), not the user's pending Send command.
+                    let result = tokio::time::timeout(Duration::from_secs(120), save_draft(&mut session, &folders, &account_id, *msg, replace, has_uidplus)).await;
+                    match result {
+                        Ok(Ok(message_id)) => {
+                            tracing::debug!("send pipeline: IMAP draft saved");
                             let _ = events.send(AccountEvent::DraftSaved { message_id }).await;
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             tracing::warn!("draft save failed: {e}");
                             let _ = events.send(AccountEvent::DraftSaveFailed {
                                 message_id: draft_id,
                                 message: "The draft could not be saved to the server.".into(),
                             }).await;
+                        }
+                        Err(_) => {
+                            tracing::warn!("IMAP draft save timed out; reconnecting");
+                            let _ = events.send(AccountEvent::DraftSaveFailed {
+                                message_id: draft_id,
+                                message: "Draft upload timed out; reconnecting to the mail server.".into(),
+                            }).await;
+                            // Commands already pulled into the local deque
+                            // may include a Send. Persist those before dropping
+                            // the broken connection so the message survives.
+                            while let Some(command) = pending.pop_front() {
+                                if let AccountCommand::SendMessage { message, not_before, client_token } = command {
+                                    let _ = queue_outbox_message(cache, events, &account_id, &message, not_before, client_token).await;
+                                }
+                            }
+                            return Err(Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "IMAP draft upload timed out")));
                         }
                     }
                     // The draft path SELECTs the Drafts mailbox; bring the
@@ -6458,7 +6494,8 @@ async fn save_draft(
             "Drafts".to_string()
         }
     };
-    let (raw, message_id, _) = build_draft_raw_message(&msg);
+    let (raw, message_id, _) = tokio::task::spawn_blocking(move || build_draft_raw_message(&msg))
+        .await.map_err(|e| Error::Io(std::io::Error::other(format!("draft MIME worker failed: {e}"))))?;
     session.select(&path).await?;
     // Capture the old UIDs before APPEND, including a copy that may have
     // landed during a previous ambiguous connection failure. Never search
@@ -6480,7 +6517,9 @@ async fn save_draft(
         }
         _ => None,
     };
+    tracing::debug!(bytes = raw.len(), "send pipeline: IMAP APPEND starting");
     session.append(&path, Some("(\\Draft \\Seen)"), None, raw.as_slice()).await?;
+    tracing::debug!("send pipeline: IMAP APPEND accepted");
     purge_uids(session, &previous, has_uidplus).await?;
     if let Some((source_path, uid)) = source {
         session.select(&source_path).await?;
