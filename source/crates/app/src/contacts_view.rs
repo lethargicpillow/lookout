@@ -101,6 +101,20 @@ impl ContactsAccountSnapshot {
     pub(crate) fn same_content(&self, other: &ContactsAccountSnapshot) -> bool {
         self.display_name == other.display_name && self.books == other.books && self.contacts == other.contacts
     }
+
+    /// Apply a confirmed remote deletion to the published account snapshot.
+    /// Exact href, not display name/UID/email: another card can share those.
+    fn remove_confirmed_contact(&mut self, href: &str) -> bool {
+        let before = self.contacts.len();
+        self.contacts.retain(|record| record.href != href);
+        if self.contacts.len() == before {
+            return false;
+        }
+        let addresses = self.contacts.iter().flat_map(|record| record.card.email_addresses()).collect();
+        self.suggestions = dedupe_addresses(addresses, usize::MAX);
+        self.contact_lists = resolve_contact_lists(&self.contacts);
+        true
+    }
 }
 
 /// A bare snapshot for tests: no books (the write path's pickers aren't
@@ -2664,14 +2678,23 @@ pub fn sync_contacts_account(
         // full contact set deltas are applied to, and the RFC 6578 sync-token /
         // Graph delta-link store. Best-effort - a failed open just means no
         // cache (full refetches every poll, no fast paint), never an error.
-        let cache = ContactsCache::open(&cache_account_id).ok();
+        let mut cache = match ContactsCache::open(&cache_account_id) {
+            Ok(cache) => Some(cache),
+            Err(e) => {
+                tracing::warn!(account = %cache_account_id, "contacts cache unavailable: {e}");
+                None
+            }
+        };
         // The Graph transport, built once per session; `None` for CardDAV.
         let graph = graph_backend.then(|| ContactsClient::new(GraphClient::new(MicrosoftOAuth::for_account(&account.account_id))));
         let mut first = true;
+        let mut initial_live_sync = true;
+        let mut last_snapshot: Option<ContactsAccountSnapshot> = None;
         // Render whatever the previous session cached immediately, so the
         // People screen shows data before the first live poll completes.
         if let Some(cache) = cache.as_ref() {
             if let Some(snapshot) = snapshot_from_cache(&account, cache) {
+                last_snapshot = Some(snapshot.clone());
                 if tx.send((first, Ok(snapshot))).await.is_err() {
                     return;
                 }
@@ -2683,7 +2706,9 @@ pub fn sync_contacts_account(
             // Park before the first poll or any write, answer write commands
             // with the offline error, and resync as soon as the signal goes
             // back online.
-            let mut force_resync = false;
+            // A cached first paint must not postpone the first server poll.
+            let mut force_resync = initial_live_sync;
+            initial_live_sync = false;
             if *offline_rx.borrow() {
                 if !wait_offline(&cmd_rx, &mut offline_rx).await {
                     break;
@@ -2746,13 +2771,32 @@ pub fn sync_contacts_account(
                     ContactCommand::Delete { href, etag, reply } => {
                         let result = match &graph {
                             Some(client) => graph_delete_contact(client, &href, etag.as_deref()).await,
-                            None => delete_contact(goa_client.clone(), account.clone(), href, etag).await,
+                            None => delete_contact(goa_client.clone(), account.clone(), href.clone(), etag).await,
                         };
-                        // Refresh Google even after a refused delete: its
-                        // membership may have changed since the UI snapshot.
-                        // The sync's verified listing, not a failed mutation,
-                        // decides whether a cached record can be removed.
-                        if result.is_ok() || (graph.is_none() && account.provider_type.as_deref() == Some("google")) {
+                        if result.is_ok() {
+                            // The server confirmed deletion (or verified absence).
+                            // Don't leave the live UI dependent on a later full
+                            // poll, which may fail or be delayed. Keep the sync
+                            // cursor intact: the server delta can replay DELETE.
+                            if let Some(current_cache) = cache.as_ref() {
+                                if let Err(e) = current_cache.remove_confirmed_contact(&href) {
+                                    tracing::warn!(account = %account.account_id, "confirmed contact deletion could not update cache: {e}; using live snapshots for this session");
+                                    cache = None;
+                                }
+                            }
+                            if let Some(snapshot) = last_snapshot.as_mut() {
+                                if snapshot.remove_confirmed_contact(&href) {
+                                    tracing::debug!(account = %account.account_id, remaining = snapshot.contacts.len(), "published confirmed contact deletion");
+                                    if tx.send((false, Ok(snapshot.clone()))).await.is_err() {
+                                        let _ = reply.send(result).await;
+                                        return;
+                                    }
+                                }
+                            }
+                            resync = true;
+                        } else if graph.is_none() && account.provider_type.as_deref() == Some("google") {
+                            // A refused deletion is not a local deletion.
+                            // Refresh to reconcile the server's actual state.
                             resync = true;
                         }
                         let _ = reply.send(result).await;
@@ -2775,6 +2819,9 @@ pub fn sync_contacts_account(
                 Some(client) => fetch_graph_contacts(client, &account, cache.as_ref()).await,
                 None => fetch_carddav_contacts(goa_client.clone(), account.clone(), cache.as_ref()).await,
             };
+            if let Ok(snapshot) = &result {
+                last_snapshot = Some(snapshot.clone());
+            }
             if tx.send((first, result)).await.is_err() {
                 break;
             }
@@ -3079,17 +3126,16 @@ async fn fetch_carddav_contacts(goa_client: Option<GoaClient>, account: GoaConta
     let mut addresses = Vec::new();
     let mut contacts = Vec::new();
     for book in &books {
-        match client.fetch_addressbook_contacts_with_meta(book, &credential).await {
-            Ok(records) => {
-                for record in &records {
-                    addresses.extend(record.card.email_addresses());
-                }
-                contacts.extend(records);
-            }
-            Err(e) => {
-                tracing::warn!("CardDAV addressbook fetch failed for {:?}: {e}", book.display_name);
-            }
-        }
+        // A cacheless Google poll must also verify the full membership.
+        // Never publish a partial account snapshot as a set of deletions.
+        let records = if client.uses_google_contacts() {
+            client.fetch_addressbook_etag_snapshot(book, &credential, &HashMap::new()).await
+                .map(|(_, records)| records)
+        } else {
+            client.fetch_addressbook_contacts_with_meta(book, &credential).await
+        }.map_err(|e| format!("CardDAV addressbook fetch failed for {:?}: {e}", book.display_name))?;
+        addresses.extend(records.iter().flat_map(|record| record.card.email_addresses()));
+        contacts.extend(records);
     }
     tracing::debug!("CardDAV sync for {}: {} total vcard(s)", account.display_name, contacts.len());
 
@@ -3557,6 +3603,23 @@ mod tests {
             etag: None,
             card,
         }
+    }
+
+    #[test]
+    fn confirmed_delete_updates_snapshot_and_derived_suggestions() {
+        let make = |href: &str, uid: &str, email: &str| ContactRecord {
+            href: href.into(), etag: Some("1".into()), card: person_card(uid, email),
+        };
+        let mut snapshot = test_snapshot("Work", vec![
+            make("/book/ann", "ann", "ann@example.com"),
+            make("/book/bob", "bob", "bob@example.com"),
+        ]);
+        assert!(snapshot.remove_confirmed_contact("/book/ann"));
+        assert_eq!(snapshot.contacts.len(), 1);
+        assert_eq!(snapshot.contacts[0].href, "/book/bob");
+        assert_eq!(snapshot.suggestions.len(), 1);
+        assert_eq!(snapshot.suggestions[0].address, "bob@example.com");
+        assert!(!snapshot.remove_confirmed_contact("/book/ann"));
     }
 
     /// A re-poll that finds the same records is the same content; a changed

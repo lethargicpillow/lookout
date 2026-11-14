@@ -690,6 +690,15 @@ impl ContactsCache {
         }
     }
 
+    /// Remove exactly the resource whose server DELETE succeeded. Preserve
+    /// the sync cursor and every other card, even when another card shares
+    /// its display name or email address.
+    pub fn remove_confirmed_contact(&self, href: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM contacts WHERE href = ?1", [href])?;
+        Ok(())
+    }
+
     /// Upserts contact records under `book_href` without touching the book's
     /// stored sync token - unlike [`Self::apply_delta`], which stores whatever
     /// cursor a `sync-collection`/Graph-delta poll produced. Used for a
@@ -792,6 +801,27 @@ mod contacts_tests {
 
     fn temp_path(account_id: &AccountId) -> std::path::PathBuf {
         contacts_cache_dir().join(format!("{}.sqlite3", sanitize_filename(account_id)))
+    }
+
+    #[test]
+    fn confirmed_contact_delete_preserves_other_records_and_cursor() {
+        let id = temp_account_id();
+        let cache = ContactsCache::open(&id).unwrap();
+        let record = |href: &str| ContactRecord {
+            href: href.into(), etag: Some("1".into()), card: sample_card("same", "same@example.com"),
+        };
+        cache.apply_delta("/book/", Some("token".into()), &[record("/book/a"), record("/book/b")], &[]).unwrap();
+        cache.remove_confirmed_contact("/book/a").unwrap();
+        cache.remove_confirmed_contact("/book/a").unwrap();
+        let rows = cache.load_contacts().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].href, "/book/b");
+        assert_eq!(cache.sync_token("/book/").unwrap().as_deref(), Some("token"));
+        drop(cache);
+        let reopened = ContactsCache::open(&id).unwrap();
+        assert_eq!(reopened.load_contacts().unwrap().len(), 1);
+        drop(reopened);
+        let _ = std::fs::remove_file(temp_path(&id));
     }
 
     #[test]
