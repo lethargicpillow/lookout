@@ -901,6 +901,7 @@ impl Cache {
                 uidvalidity INTEGER NOT NULL,
                 uid INTEGER NOT NULL,
                 retry_after INTEGER NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 1,
                 PRIMARY KEY (mailbox_id, uidvalidity, uid)
             );
             CREATE TABLE IF NOT EXISTS snoozed (
@@ -1064,6 +1065,15 @@ impl Cache {
                 if !has_partial_column(&conn)? {
                     return Err(e.into());
                 }
+            }
+        }
+        // Keep expired retry records to retain the failure history.
+        let has_retry_attempts = |conn: &Connection| -> rusqlite::Result<bool> {
+            conn.prepare("SELECT 1 FROM pragma_table_info('imap_envelope_retry') WHERE name = 'attempts'")?.exists([])
+        };
+        if !has_retry_attempts(&conn)? {
+            if let Err(e) = conn.execute("ALTER TABLE imap_envelope_retry ADD COLUMN attempts INTEGER NOT NULL DEFAULT 1", []) {
+                if !has_retry_attempts(&conn)? { return Err(e.into()); }
             }
         }
         // Messages/envelope cache version. The shared `user_version` PRAGMA is
@@ -1345,6 +1355,10 @@ impl Cache {
         // A complete snapshot supersedes all staged envelopes. Clear them
         // in this same transaction: a failed commit must retain progress.
         tx.execute("DELETE FROM imap_sync_checkpoint WHERE mailbox_id = ?1", [&mailbox_id.0])?;
+        // A recovered UID no longer has a retry history. Keep unresolved
+        // entries even after their deadline, so repeated failure backs off.
+        tx.execute("DELETE FROM imap_envelope_retry WHERE mailbox_id = ?1 AND (uidvalidity != ?2 OR uid IN (SELECT uid FROM messages WHERE mailbox_id = ?1))",
+            rusqlite::params![mailbox_id.0, uidvalidity.0])?;
         tx.commit()?;
         // Delete the flat files only after the rows are committed, and outside
         // the connection mutex: a failed commit must never leave surviving
@@ -1423,7 +1437,9 @@ impl Cache {
         {
             let mut insert = tx.prepare_cached(
                 "INSERT INTO imap_envelope_retry (mailbox_id, uidvalidity, uid, retry_after) VALUES (?1, ?2, ?3, ?4) \
-                 ON CONFLICT(mailbox_id, uidvalidity, uid) DO UPDATE SET retry_after = excluded.retry_after",
+                 ON CONFLICT(mailbox_id, uidvalidity, uid) DO UPDATE SET
+                    retry_after = excluded.retry_after + 300 * ((1 << MIN(imap_envelope_retry.attempts, 6)) - 1),
+                    attempts = MIN(imap_envelope_retry.attempts + 1, 7)",
             )?;
             for uid in uids {
                 insert.execute(rusqlite::params![mailbox.0, validity.0, uid.0, retry_after])?;
@@ -1435,11 +1451,18 @@ impl Cache {
 
     /// Cooldown survives reconnects/restarts, but is not a negative cache
     /// forever: after the deadline the next ordinary sync retries the UID.
+    pub(crate) fn postpone_due_envelopes_at_startup(&self, mailbox: &MailboxId, now: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE imap_envelope_retry SET retry_after = ?2 WHERE mailbox_id = ?1 AND retry_after <= ?3",
+            rusqlite::params![mailbox.0, now + 60, now])?;
+        Ok(())
+    }
+
     pub(crate) fn deferred_imap_envelopes(&self, mailbox: &MailboxId, validity: UidValidity, now: i64) -> Result<HashSet<Uid>> {
         if validity.0 == 0 { return Ok(HashSet::new()); }
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM imap_envelope_retry WHERE mailbox_id = ?1 AND (uidvalidity != ?2 OR retry_after <= ?3)",
-            rusqlite::params![mailbox.0, validity.0, now])?;
+        conn.execute("DELETE FROM imap_envelope_retry WHERE mailbox_id = ?1 AND uidvalidity != ?2",
+            rusqlite::params![mailbox.0, validity.0])?;
         let mut stmt = conn.prepare("SELECT uid FROM imap_envelope_retry WHERE mailbox_id = ?1 AND uidvalidity = ?2 AND retry_after > ?3")?;
         let rows = stmt.query_map(rusqlite::params![mailbox.0, validity.0, now], |r| r.get::<_, u32>(0))?;
         let mut deferred = HashSet::new();
@@ -6423,6 +6446,27 @@ mod tests {
         let path = cache.attachment_path(&mailbox_id, Uid(1), UidValidity(9), part);
         assert_eq!(path.parent(), Some(cache.attachments_dir.as_path()));
         let _ = remove_account_cache(&account_id);
+    }
+
+    #[test]
+    fn imap_envelope_retry_backs_off_and_startup_defers_due_rows() {
+        let account = temp_account_id();
+        let mailbox = MailboxId::new(&account, "INBOX");
+        let v = UidValidity(5);
+        let cache = Cache::open(&account).unwrap();
+        cache.defer_imap_envelopes(&mailbox, v, &[Uid(2)], 400).unwrap();
+        assert!(cache.deferred_imap_envelopes(&mailbox, v, 400).unwrap().is_empty());
+        cache.postpone_due_envelopes_at_startup(&mailbox, 400).unwrap();
+        assert!(cache.deferred_imap_envelopes(&mailbox, v, 459).unwrap().contains(&Uid(2)));
+        assert!(cache.deferred_imap_envelopes(&mailbox, v, 460).unwrap().is_empty());
+        cache.defer_imap_envelopes(&mailbox, v, &[Uid(2)], 760).unwrap();
+        assert!(cache.deferred_imap_envelopes(&mailbox, v, 1059).unwrap().contains(&Uid(2)));
+        assert!(cache.deferred_imap_envelopes(&mailbox, v, 1060).unwrap().is_empty());
+        cache.replace_messages(&mailbox, v, &[sample_summary(&mailbox, 2, None)]).unwrap();
+        cache.defer_imap_envelopes(&mailbox, v, &[Uid(2)], 1400).unwrap();
+        assert!(cache.deferred_imap_envelopes(&mailbox, v, 1400).unwrap().is_empty());
+        drop(cache);
+        let _ = remove_account_cache(&account);
     }
 
     #[test]

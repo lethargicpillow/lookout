@@ -2103,6 +2103,15 @@ async fn connect_and_run(
     publish_folders(&folders, &account_id, cache, events).await;
 
     let inbox_id = MailboxId::new(&account_id, "INBOX");
+    // Previously refused metadata must not delay login after its deadline
+    // expires. Defer due retries briefly; subsequent ordinary syncs may
+    // retry them, while truly new UIDs are fetched immediately.
+    if let Some(Err(e)) = cache_op(cache, {
+        let inbox = inbox_id.clone();
+        move |c| c.postpone_due_envelopes_at_startup(&inbox, chrono::Utc::now().timestamp())
+    }).await {
+        tracing::warn!(%account_id, "could not defer startup metadata retries: {e}");
+    }
     // Fresh session: no mailbox is SELECTed yet, so the sync must select INBOX.
     sync_mailbox(
         &mut session,
@@ -8087,7 +8096,10 @@ async fn sync_mailbox(
             if postponed != 0 {
                 tracing::debug!(account = %account_id, mailbox = %folder_path, postponed, "deferring unavailable message envelopes until retry deadline");
             }
+            remaining.sort_unstable_by_key(|uid| std::cmp::Reverse(uid.0));
+            remaining.dedup();
             let sets = envelope_sync_sets(&remaining);
+            let mut unavailable = HashSet::new();
             // Avoid extra GTK rebuilds on small deltas. Sent retains its
             // existing auto-mark-as-read step before first publication.
             // A real UIDVALIDITY reset must take the full invalidation path.
@@ -8109,6 +8121,13 @@ async fn sync_mailbox(
                 }).await?;
                 if let Some(reason) = refusal {
                     tracing::warn!(account = %account_id, mailbox = %folder_path, responses = fetches.len(), %reason, "server refused envelope fetch; retaining returned rows");
+                    if reason.to_ascii_uppercase().contains("[UNAVAILABLE]") {
+                        // Each envelope batch is at most 100 u32 UIDs, far
+                        // below the UID-set byte limit, so one set = one chunk.
+                        if let Some(group) = remaining.chunks(ENVELOPE_SYNC_BATCH).nth(index) {
+                            unavailable.extend(group.iter().copied());
+                        }
+                    }
                 }
                 let batch: Vec<EmailSummary> = fetches.iter().filter_map(|f| summary_from_fetch(mailbox_id, f))
                     .filter(|m| wanted.contains(&m.uid) && received.insert(m.uid)).collect();
@@ -8145,7 +8164,12 @@ async fn sync_mailbox(
                 }
                 tracing::info!(account = %account_id, mailbox = %folder_path, missing = missing.len(), "checking missing message envelopes");
                 let live = imap_sync_step(account_id, "UID SEARCH missing envelopes", uids_still_present(session, &missing)).await?;
-                for group in live.chunks(20) {
+                let fallback: Vec<Uid> = live.iter().copied().filter(|uid| !unavailable.contains(uid)).collect();
+                let skipped = live.len() - fallback.len();
+                if skipped != 0 {
+                    tracing::info!(account = %account_id, mailbox = %folder_path, skipped, "skipping header fallback for server-unavailable UIDs");
+                }
+                for group in fallback.chunks(20) {
                     for set in uid_set_chunks(group) {
                         let (fetches, refusal) = imap_sync_step(account_id, "UID FETCH HEADER fallback", async {
                             collect_metadata_fetches(session.uid_fetch(&set, "(UID FLAGS RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER])").await?).await
@@ -8174,7 +8198,7 @@ async fn sync_mailbox(
                         unresolved_envelopes += still_live.len();
                         // These UIDs are new, not existing cached rows. Keep
                         // all known messages usable; retry after cooldown.
-                        tracing::warn!(account = %account_id, mailbox = %folder_path, missing = still_live.len(), first_uid = still_live[0].0, retry_after_secs = ENVELOPE_RETRY_COOLDOWN_SECS, "some live envelopes unavailable; publishing available mail");
+                        tracing::warn!(account = %account_id, mailbox = %folder_path, missing = still_live.len(), first_uid = still_live[0].0, base_retry_secs = ENVELOPE_RETRY_COOLDOWN_SECS, "some live envelopes unavailable; publishing available mail");
                     }
                 }
             }
