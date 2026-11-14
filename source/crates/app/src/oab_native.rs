@@ -92,7 +92,7 @@ fn manifest(data: &[u8]) -> Option<Manifest> {
                     for attr in e.attributes() {
                         let attr = attr.ok()?;
                         if attr.key.as_ref() == b"name" {
-                            list.name = attr.decode_and_unescape_value(reader.decoder()).ok()?.into_owned();
+                            list.name = attr.decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, reader.decoder()).ok()?.into_owned();
                         }
                     }
                     lists.push(list);
@@ -110,7 +110,7 @@ fn manifest(data: &[u8]) -> Option<Manifest> {
                             b"SHA" => &mut full.sha,
                             _ => continue,
                         };
-                        *field = attr.decode_and_unescape_value(reader.decoder()).ok()?.into_owned();
+                        *field = attr.decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, reader.decoder()).ok()?.into_owned();
                     }
                     list.fulls.push(full);
                 }
