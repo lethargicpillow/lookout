@@ -49,6 +49,10 @@ const ENVELOPE_RETRY_COOLDOWN_SECS: i64 = 5 * 60;
 /// and dropping the `Handle`'s `StopSource` cancels the wait immediately,
 /// so a command arriving mid-IDLE is picked up right away.
 const IDLE_SLICE: Duration = Duration::from_secs(25 * 60);
+/// Normal prefetch must advance even on a quiet mailbox.
+const NORMAL_PREFETCH_INTERVAL: Duration = Duration::from_secs(5);
+/// A usable connection lasting this long resets the primary reconnect delay.
+const STABLE_SESSION_DURATION: Duration = Duration::from_secs(60);
 
 /// Poll servers without the optional IMAP IDLE extension.
 const NO_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -1739,6 +1743,7 @@ pub async fn run_account_session(
             }
         }
         let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Connecting)).await;
+        let mut ready_since = None;
         match connect_and_run(
             &config,
             credentials.as_ref(),
@@ -1750,6 +1755,7 @@ pub async fn run_account_session(
             &idle_notify_rx,
             carried_command.take(),
             &mut deferred_interactive,
+            &mut ready_since,
             &mut prefetch_failures,
             &mut local_focus,
             &mut prefetch_policy,
@@ -1780,6 +1786,7 @@ pub async fn run_account_session(
                 if commands.is_closed() {
                     return;
                 }
+                backoff = recovery_delay(backoff, ready_since.map(|at| at.elapsed()));
                 tracing::warn!(account = %config.account_id, host = %config.imap.host, retry_in_secs = backoff.as_secs(), "account session error, will reconnect: {e}");
                 // Connection failures are warning-level: the loop below
                 // retries with backoff, so only the connection-lifecycle
@@ -2034,6 +2041,7 @@ async fn connect_and_run(
     idle_notify: &async_channel::Receiver<MailboxId>,
     mut carried_command: Option<AccountCommand>,
     deferred_interactive: &mut VecDeque<AccountCommand>,
+    ready_since: &mut Option<std::time::Instant>,
     prefetch_failures: &mut HashMap<MailboxId, u32>,
     local_focus: &mut LocalFocusSettings,
     prefetch_policy: &mut PrefetchPolicy,
@@ -2150,6 +2158,7 @@ async fn connect_and_run(
     )
     .await?;
 
+    *ready_since = Some(std::time::Instant::now());
     tracing::info!(account = %account_id, host = %config.imap.host, "initial INBOX synchronization complete");
 
     // Folders still awaiting their STATUS count, drained cooperatively below.
@@ -2608,7 +2617,7 @@ async fn connect_and_run(
                                     .filter(|_| scheduled_keywords_ok != Some(false))
                                     .map(|_| next_scheduled_scan);
                                 let next_due = earliest([next_outbox_due, local_snooze_wake, server_snooze_wake, scan_due]);
-                                let slice = if prefetch_policy.aggressive { remaining.min(prefetch_policy.batch_interval) } else { remaining };
+                                let slice = prefetch_idle_slice(remaining, prefetch.as_ref().is_some_and(|pf| !pf.is_done()), prefetch_policy);
                                 let slice = cap_slice_for_outbox(slice, next_due, chrono::Utc::now()).min(remaining);
                                 tokio::select! {
                                     _ = tokio::time::sleep(slice) => {
@@ -2710,13 +2719,11 @@ async fn connect_and_run(
                                     Wake::ServerChanged
                                 } else {
                                     change_resyncs = 0;
-                                    // Aggressive prefetch paces the session with a short IDLE
-                                    // slice so batches keep flowing on a quiet session (a
-                                    // timeout wake runs the next prefetch batch), and the
-                                    // short slice also keeps the periodic re-scan tick alive
-                                    // once a pass is done. Otherwise the wait is the usual
-                                    // keepalive slice.
-                                    let slice = if prefetch_policy.aggressive { prefetch_policy.batch_interval } else { IDLE_SLICE };
+                                    // Normal prefetch also needs timer wakes while work
+                                    // remains. Once done, only aggressive mode keeps its
+                                    // periodic rescan tick; normal mode resumes keepalive.
+                                    let slice = prefetch_idle_slice(IDLE_SLICE,
+                                        prefetch.as_ref().is_some_and(|pf| !pf.is_done()), prefetch_policy);
                                     // Wake early if a scheduled outbox send is
                                     // due sooner than the keepalive slice.
                                     // So is a snooze wake (item 1.15), or the
@@ -5773,6 +5780,26 @@ async fn connect_and_run(
     }
 }
 
+/// Bound the wait only while normal prefetch has work, or when the user
+/// enables aggressive periodic scans. Never extend a shorter deadline.
+fn prefetch_idle_slice(base: Duration, has_pending: bool, policy: &PrefetchPolicy) -> Duration {
+    if policy.aggressive {
+        base.min(policy.batch_interval.max(Duration::from_secs(1)))
+    } else if has_pending {
+        base.min(NORMAL_PREFETCH_INTERVAL)
+    } else {
+        base
+    }
+}
+
+fn recovery_delay(current: Duration, usable_for: Option<Duration>) -> Duration {
+    if usable_for.is_some_and(|elapsed| elapsed >= STABLE_SESSION_DURATION) {
+        INITIAL_BACKOFF
+    } else {
+        current
+    }
+}
+
 /// Backoff curve for the dedicated IDLE-only connection's own reconnect loop
 /// (`run_idle_supervisor`), independent of the primary connection's backoff.
 /// Same shape for the first few attempts - starts at 1s, doubles - but after
@@ -5782,9 +5809,8 @@ async fn connect_and_run(
 /// when the second connection just isn't going to work (a provider's
 /// simultaneous-connection cap that isn't going away): cheap enough to be
 /// harmless if the server later allows it, rare enough not to be spammy if
-/// it never does. Never reset once it reaches the cooldown floor, matching
-/// `run_account_session`'s own backoff, which likewise only ratchets up and
-/// plateaus rather than resetting after a successful run.
+/// it never does. The dedicated connection's cooldown remains independent
+/// of the primary connection, which resets after a stable usable session.
 fn next_idle_probe_delay(consecutive_failures: u32) -> Duration {
     const MAX_BACKOFF: Duration = Duration::from_secs(60);
     const COOLDOWN_THRESHOLD: u32 = 5;
@@ -10670,6 +10696,27 @@ mod tests {
         assert!(pf.current_folder_name.is_empty());
         assert_eq!(pf.forget_tree(&id("A"), '/'), None, "an already-finished folder has nothing to announce");
         assert_eq!(pf.mailboxes[pf.current], id("Work2"));
+    }
+
+    #[test]
+    fn normal_prefetch_idle_slice_wakes_until_pass_is_finished() {
+        let mut policy = PrefetchPolicy::default();
+        assert_eq!(prefetch_idle_slice(IDLE_SLICE, true, &policy), NORMAL_PREFETCH_INTERVAL);
+        assert_eq!(prefetch_idle_slice(IDLE_SLICE, false, &policy), IDLE_SLICE);
+        assert_eq!(prefetch_idle_slice(Duration::from_secs(2), true, &policy), Duration::from_secs(2));
+        policy.aggressive = true;
+        policy.batch_interval = Duration::from_secs(12);
+        assert_eq!(prefetch_idle_slice(IDLE_SLICE, true, &policy), Duration::from_secs(12));
+        assert_eq!(prefetch_idle_slice(IDLE_SLICE, false, &policy), Duration::from_secs(12));
+        assert_eq!(prefetch_idle_slice(Duration::from_secs(2), true, &policy), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn reconnect_backoff_resets_only_after_stable_usable_session() {
+        let delay = Duration::from_secs(32);
+        assert_eq!(recovery_delay(delay, None), delay);
+        assert_eq!(recovery_delay(delay, Some(Duration::from_secs(59))), delay);
+        assert_eq!(recovery_delay(delay, Some(STABLE_SESSION_DURATION)), INITIAL_BACKOFF);
     }
 
     #[test]
