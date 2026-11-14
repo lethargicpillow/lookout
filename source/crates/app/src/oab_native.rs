@@ -23,8 +23,6 @@ const TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug)]
 pub(crate) enum Error {
-    // Compatibility with servers that only offer NTLM inside Negotiate.
-    LegacyNegotiate,
     Failure(String),
 }
 
@@ -202,6 +200,7 @@ fn payload_url(url: &Url, name: &str) -> Option<Url> {
 enum Scheme {
     Ntlm,
     Basic,
+    Negotiate,
 }
 
 #[derive(Default)]
@@ -220,6 +219,11 @@ struct Downloaded {
     reply: Reply,
     bytes: u64,
     sha: String,
+}
+
+impl crate::exchange_negotiate::Reply for Downloaded {
+    fn status(&self) -> u32 { self.reply.status }
+    fn challenges(&self) -> &[String] { &self.reply.challenges }
 }
 
 fn curl_error(error: curl::Error) -> Error {
@@ -268,74 +272,81 @@ impl Session<'_> {
         easy.timeout(remaining.min(Duration::from_secs(60))).map_err(curl_error)?;
         easy.accept_encoding("").map_err(curl_error)?;
         easy.useragent("Lookout Exchange OAB").map_err(curl_error)?;
-        if let Some(scheme) = scheme {
+        if let Some(scheme) = scheme.filter(|s| !matches!(s, Scheme::Negotiate)) {
             let mut auth = Auth::new();
             match scheme {
                 Scheme::Ntlm => { auth.ntlm(true); }
                 Scheme::Basic => { auth.basic(true); }
+                Scheme::Negotiate => unreachable!(),
             }
             easy.username(self.login).map_err(curl_error)?;
             easy.password(self.password).map_err(curl_error)?;
             easy.http_auth(&auth).map_err(curl_error)?;
         }
-        let reply = RefCell::new(Reply::default());
-        let mut header_bytes = 0usize;
-        let mut bytes = 0u64;
-        let mut digest = Context::new(&SHA1_FOR_LEGACY_USE_ONLY);
-        let mut overflow = false;
-        let mut io_failed = false;
-        let result = {
-            let mut transfer = easy.transfer();
-            transfer.header_function(|line| {
-                header_bytes += line.len();
-                if header_bytes > 64 * 1024 {
-                    return false;
-                }
-                let line = String::from_utf8_lossy(line);
-                let mut r = reply.borrow_mut();
-                if line.starts_with("HTTP/") {
-                    *r = Reply::default();
-                    r.status = line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-                } else if let Some((key, value)) = line.split_once(':') {
-                    if key.eq_ignore_ascii_case("WWW-Authenticate") {
-                        r.challenges.push(value.trim().to_owned());
+        let mut once = |easy: &mut Easy| -> Result<Downloaded, Error> {
+            let reply = RefCell::new(Reply::default());
+            let mut header_bytes = 0usize;
+            let mut bytes = 0u64;
+            let mut digest = Context::new(&SHA1_FOR_LEGACY_USE_ONLY);
+            let mut overflow = false;
+            let mut io_failed = false;
+            let result = {
+                let mut transfer = easy.transfer();
+                transfer.header_function(|line| {
+                    header_bytes += line.len();
+                    if header_bytes > 64 * 1024 {
+                        return false;
                     }
-                }
-                true
-            }).map_err(curl_error)?;
-            transfer.write_function(|data| {
-                // Do not write an NTLM intermediate response, login page
-                // returned with non-200 status, or HTTP redirect body.
-                if reply.borrow().status == 200 {
-                    if bytes + data.len() as u64 > limit {
-                        overflow = true;
-                        return Ok(0);
+                    let line = String::from_utf8_lossy(line);
+                    let mut r = reply.borrow_mut();
+                    if line.starts_with("HTTP/") {
+                        *r = Reply::default();
+                        r.status = line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                    } else if let Some((key, value)) = line.split_once(':') {
+                        if key.eq_ignore_ascii_case("WWW-Authenticate") {
+                            r.challenges.push(value.trim().to_owned());
+                        }
                     }
-                    if sink.write_all(data).is_err() {
-                        io_failed = true;
-                        return Ok(0);
+                    true
+                }).map_err(curl_error)?;
+                transfer.write_function(|data| {
+                    // Do not write an NTLM intermediate response, login page
+                    // returned with non-200 status, or HTTP redirect body.
+                    if reply.borrow().status == 200 {
+                        if bytes + data.len() as u64 > limit {
+                            overflow = true;
+                            return Ok(0);
+                        }
+                        if sink.write_all(data).is_err() {
+                            io_failed = true;
+                            return Ok(0);
+                        }
+                        bytes += data.len() as u64;
+                        digest.update(data);
                     }
-                    bytes += data.len() as u64;
-                    digest.update(data);
-                }
-                Ok(data.len())
-            }).map_err(curl_error)?;
-            transfer.perform()
-        };
-        let mut reply = reply.into_inner();
-        reply.status = easy.response_code().map_err(curl_error)?;
-        if overflow {
-            return Err("OAB integrity check failed".into());
-        }
-        if io_failed {
-            return Err("OAB temporary file write failed".into());
-        }
-        if let Err(error) = result {
-            if !(scheme.is_some() && matches!(reply.status, 401 | 403)) {
-                return Err(curl_error(error));
+                    Ok(data.len())
+                }).map_err(curl_error)?;
+                transfer.perform()
+            };
+            let mut reply = reply.into_inner();
+            reply.status = easy.response_code().map_err(curl_error)?;
+            if overflow {
+                return Err("OAB integrity check failed".into());
             }
-        }
-        Ok(Downloaded { reply, bytes, sha: hex(digest.finish().as_ref()) })
+            if io_failed {
+                return Err("OAB temporary file write failed".into());
+            }
+            if let Err(error) = result {
+                if !(scheme.is_some() && !matches!(scheme, Some(Scheme::Negotiate)) && matches!(reply.status, 401 | 403)) {
+                    return Err(curl_error(error));
+                }
+            }
+            Ok(Downloaded { reply, bytes, sha: hex(digest.finish().as_ref()) })
+        };
+        if matches!(scheme, Some(Scheme::Negotiate)) {
+            crate::exchange_negotiate::perform(&mut easy, url.host_str().ok_or("Invalid OAB URL")?, self.login, self.password, false, self.deadline.min(Instant::now() + Duration::from_secs(60)), &mut once)
+                .map_err(|e| match e { crate::exchange_negotiate::Error::Protocol(message) => Error::from(message), crate::exchange_negotiate::Error::Transport(error) => error })
+        } else { once(&mut easy) }
     }
 
     fn fetch(&self, url: &Url, limit: u64, sink: &mut impl Write, stage: &str) -> Result<Downloaded, Error> {
@@ -343,11 +354,11 @@ impl Session<'_> {
         if result.reply.status == 401 {
             let scheme = if result.reply.has_scheme("NTLM") {
                 if !curl::Version::get().feature_ntlm() {
-                    return Err(Error::LegacyNegotiate);
+                    return Err("Bundled libcurl lacks NTLM support".into());
                 }
                 Scheme::Ntlm
             } else if result.reply.has_scheme("Negotiate") {
-                return Err(Error::LegacyNegotiate);
+                Scheme::Negotiate
             } else if result.reply.has_scheme("Basic") {
                 Scheme::Basic
             } else {

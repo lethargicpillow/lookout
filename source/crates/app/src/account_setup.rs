@@ -143,45 +143,9 @@ async fn mail_probe(client: &reqwest::Client, url: String, email: &str) -> Optio
     parse_mail(&xml_response(response).await?, email)
 }
 
-// Exchange needs authenticated POX, redirect handling and SRV discovery.
-// Use the existing distro NTLM stack (also used by OAB); no passwords
-// appear in process arguments, environment or logs.
-const AUTODISCOVER: &str = include_str!("exchange_discover.py");
-
+// Exchange discovery and authentication are entirely native.
 fn exchange_discovery(email: String, password: String, approved: Vec<String>) -> Result<Discovery, String> {
-    match exchange_native::discover(&email, &password, &approved) {
-        Ok(result) => return Ok(result),
-        Err(exchange_native::Error::LegacyNegotiate) => {},
-        Err(error) => return Err(error.message().into()),
-    }
-    // Only a server offering Negotiate without native NTLM uses the old
-    // compatibility transport. Never retry a rejected password this way.
-    let input = serde_json::to_vec(&serde_json::json!({
-        "email": email, "password": password, "approved": approved,
-    })).map_err(|_| "Cannot prepare Autodiscover request")?;
-    let mut child = Command::new("/usr/bin/python3").arg("-I").arg("-c").arg(AUTODISCOVER)
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
-        .spawn().map_err(|_| "Cannot start Exchange Autodiscover helper")?;
-    let written = child.stdin.take().ok_or("Autodiscover helper has no input")?.write_all(&input);
-    if written.is_err() { let _ = child.kill(); let _ = child.wait(); return Err("Cannot pass Autodiscover request".into()); }
-    let output = child.wait_with_output().map_err(|_| "Autodiscover helper failed")?;
-    if !output.status.success() || output.stdout.len() > 64 * 1024 { return Err("Autodiscover timed out or stopped".into()); }
-    let response: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|_| "Invalid Autodiscover response")?;
-    let field = |key: &str| response.get(key).and_then(|v| v.as_str()).map(str::to_owned);
-    match field("status").as_deref() {
-        Some("exchange") => {
-            let ews = field("ews").filter(|v| valid_ews(v)).ok_or("Autodiscover did not return a valid EWS endpoint")?;
-            let oab = field("oab").filter(|v| crate::oab_sync::valid_url(v));
-            Ok(Discovery::Exchange { ews: Some(ews), oab })
-        }
-        Some("cloud") => Ok(Discovery::Microsoft365),
-        Some("password") => Ok(Discovery::PasswordRequired),
-        Some("approval") => field("host").filter(|h| domain(&format!("x@{h}")).is_some())
-            .map(Discovery::ApproveHost).ok_or_else(|| "Invalid Autodiscover redirect host".into()),
-        Some("authentication") => Err("Exchange rejected the password. Check your credentials before retrying.".into()),
-        Some("dependencies") => Err("Exchange discovery requires python3-requests and python3-requests-ntlm (install the Lookout recommended packages).".into()),
-        _ => Err("Autodiscover could not locate your mailbox. Check network/VPN access and your organization's Autodiscover configuration.".into()),
-    }
+    exchange_native::discover(&email, &password, &approved).map_err(|error| error.message().into())
 }
 
 pub(crate) async fn discover(email: &str, password: &str, approved: Vec<String>) -> Result<Discovery, String> {

@@ -1,15 +1,14 @@
 //! Opt-in Exchange OAB refresh, scoped to the configured DavMail account.
 //! Native libcurl transport and isolated libmspack decompression are the
-//! primary path. The legacy helper is only for Negotiate-only servers.
+//! primary path, including native Negotiate-only authentication.
 //! Only a verified complete book reaches SQLite.
-use std::{cell::RefCell, collections::{HashMap, HashSet}, io::Write, path::{Path, PathBuf}, process::{Command, Stdio}, rc::Rc, time::{Duration, Instant}};
+use std::{cell::RefCell, collections::{HashMap, HashSet}, path::{Path, PathBuf}, rc::Rc, time::{Duration, Instant}};
 use gtk::{glib, prelude::*};
 use lookout_core::AccountId;
 use crate::{app_config::OtherAccount, other_accounts::SecretServiceKeyring, window::UiState, worker::Worker};
 
 const CHECK: Duration = Duration::from_secs(24 * 60 * 60);
 const RETRY: Duration = Duration::from_secs(60 * 60);
-const HELPER: &str = include_str!("oab_fetch.py");
 
 pub(crate) fn valid_url(value: &str) -> bool {
     reqwest::Url::parse(value).is_ok_and(|u| u.scheme() == "https"
@@ -32,59 +31,7 @@ impl Drop for Scratch {
 }
 
 fn download(url: &str, login: &str, password: &str, known: Option<String>, dir: &Path) -> Result<Option<String>, String> {
-    match crate::oab_native::download(url, login, password, known.as_deref(), dir) {
-        Ok(result) => return Ok(result),
-        Err(crate::oab_native::Error::Failure(message)) => return Err(message),
-        Err(crate::oab_native::Error::LegacyNegotiate) => {
-            tracing::debug!("OAB server requires Negotiate compatibility transport");
-        }
-    }
-    // The native path never falls back after rejected credentials or an
-    // integrity/TLS error. Only the unsupported auth scheme can get here.
-    download_legacy(url, login, password, known, dir)
-}
-
-fn download_legacy(url: &str, login: &str, password: &str, known: Option<String>, dir: &Path) -> Result<Option<String>, String> {
-    if !valid_url(url) { return Err("Invalid OAB URL".into()); }
-    let input = serde_json::to_vec(&serde_json::json!({
-        "url": url, "login": login, "password": password, "known": known
-    })).map_err(|_| "Cannot prepare OAB request")?;
-    let mut child = Command::new("/usr/bin/python3").arg("-I").arg("-c").arg(HELPER)
-        .current_dir(dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
-        .spawn().map_err(|_| "Cannot start OAB helper")?;
-    let written = child.stdin.take().ok_or("OAB helper has no input")?.write_all(&input);
-    if written.is_err() { let _ = child.kill(); let _ = child.wait(); return Err("Cannot pass credentials to OAB helper".into()); }
-    let output = child.wait_with_output().map_err(|_| "OAB helper failed")?;
-    let response = String::from_utf8_lossy(&output.stdout);
-    let response = response.trim();
-    if !output.status.success() {
-        // Only fixed error codes from the helper, never URLs, secrets or HTTP bodies.
-        return Err(match response {
-            "dependencies" => "Install python3-requests, python3-requests-ntlm and libmspack",
-            "authentication" => "OAB authentication rejected",
-            "manifest" => "Invalid or ambiguous OAB manifest",
-            "integrity" => "OAB integrity check failed",
-            "unpack" => "OAB decompression failed",
-            "tls" => "OAB TLS certificate or handshake failed",
-            "timeout" => "OAB request timed out",
-            "connection" => "OAB connection or DNS resolution failed",
-            "http_transport" => "OAB HTTP transport failed",
-            "helper" => "OAB helper failed internally",
-            "manifest_http_404" => "OAB manifest not found (HTTP 404)",
-            "download_http_404" => "OAB download not found (HTTP 404)",
-            "manifest_http_503" => "OAB manifest service unavailable (HTTP 503)",
-            "download_http_503" => "OAB download service unavailable (HTTP 503)",
-            "manifest_http_500" | "download_http_500" => "OAB server error (HTTP 500)",
-            "manifest_http_301" | "manifest_http_302" | "manifest_http_307" | "manifest_http_308"
-            | "download_http_301" | "download_http_302" | "download_http_307" | "download_http_308" => "OAB server returned a redirect",
-            _ => "OAB network/helper failure",
-        }.into());
-    }
-    if response == "unchanged" { return Ok(None); }
-    if response.len() != 64 || !response.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("Invalid OAB helper response".into());
-    }
-    Ok(Some(response.to_owned()))
+    crate::oab_native::download(url, login, password, known.as_deref(), dir).map_err(|crate::oab_native::Error::Failure(message)| message)
 }
 
 // Only reuse explicitly configured endpoints for the exact same local

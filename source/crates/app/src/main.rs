@@ -78,6 +78,7 @@ mod oab_decode;
 mod oab_cache;
 mod oab_sync;
 mod oab_native;
+mod exchange_negotiate;
 mod other_accounts;
 mod privacy;
 mod profile_card;

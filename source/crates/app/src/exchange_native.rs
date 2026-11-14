@@ -21,9 +21,7 @@ pub(super) enum Error {
     Authentication,
     NotFound,
     InvalidAddress,
-    // The legacy helper supports NTLM wrapped in the Negotiate scheme.
-    // Keep that compatibility route until a native SPNEGO transport exists.
-    LegacyNegotiate,
+    Transport(&'static str),
 }
 
 impl Error {
@@ -32,7 +30,7 @@ impl Error {
             Self::Authentication => AUTH_ERROR,
             Self::NotFound => NOT_FOUND,
             Self::InvalidAddress => "Enter a valid email address",
-            Self::LegacyNegotiate => "Exchange requires the Negotiate compatibility transport.",
+            Self::Transport(message) => message,
         }
     }
 }
@@ -345,6 +343,11 @@ struct Response {
     body: Vec<u8>,
 }
 
+impl crate::exchange_negotiate::Reply for Response {
+    fn status(&self) -> u32 { self.status }
+    fn challenges(&self) -> &[String] { &self.challenges }
+}
+
 impl Response {
     fn has_scheme(&self, scheme: &str) -> bool {
         self.challenges.iter().any(|value| {
@@ -394,10 +397,12 @@ trait Transport {
     fn srv(&mut self, host: &str) -> Vec<Url>;
 
     fn supports_ntlm(&self) -> bool;
+    fn take_error(&mut self) -> Option<&'static str> { None }
 }
 
 struct CurlTransport {
     deadline: Instant,
+    error: Option<&'static str>,
 }
 
 impl Transport for CurlTransport {
@@ -435,7 +440,8 @@ impl Transport for CurlTransport {
             easy.http_headers(headers).ok()?;
         }
         let authenticated = credentials.is_some();
-        if let Some(creds) = credentials {
+        let negotiate = credentials.as_ref().filter(|c| c.scheme == Scheme::NegotiateOnly);
+        if let Some(creds) = credentials.as_ref().filter(|c| c.scheme != Scheme::NegotiateOnly) {
             let mut auth = Auth::new();
             match creds.scheme {
                 Scheme::Ntlm => {
@@ -451,53 +457,63 @@ impl Transport for CurlTransport {
             easy.password(creds.password).ok()?;
             easy.http_auth(&auth).ok()?;
         }
-        let response = RefCell::new(Response::default());
-        let mut header_bytes = 0usize;
-        let result = {
-            let mut transfer = easy.transfer();
-            transfer
-                .header_function(|line| {
-                    header_bytes += line.len();
-                    if header_bytes > 64 * 1024 {
-                        return false;
-                    }
-                    let line = String::from_utf8_lossy(line);
-                    let mut r = response.borrow_mut();
-                    if line.starts_with("HTTP/") {
-                        // Discard the headers/body of intermediate NTLM
-                        // challenges and informational responses.
-                        *r = Response::default();
-                        r.status = line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-                    } else if let Some((key, value)) = line.split_once(':') {
-                        if key.eq_ignore_ascii_case("WWW-Authenticate") {
-                            r.challenges.push(value.trim().to_owned());
-                        } else if key.eq_ignore_ascii_case("Location") {
-                            r.location = Some(value.trim().to_owned());
+        let mut once = |easy: &mut Easy| -> Result<Response, ()> {
+            let response = RefCell::new(Response::default());
+            let mut header_bytes = 0usize;
+            let result = {
+                let mut transfer = easy.transfer();
+                transfer
+                    .header_function(|line| {
+                        header_bytes += line.len();
+                        if header_bytes > 64 * 1024 {
+                            return false;
                         }
-                    }
-                    true
-                })
-                .ok()?;
-            transfer
-                .write_function(|data| {
-                    let mut r = response.borrow_mut();
-                    if r.status == 200 {
-                        if r.body.len() + data.len() > LIMIT {
-                            return Ok(0);
+                        let line = String::from_utf8_lossy(line);
+                        let mut r = response.borrow_mut();
+                        if line.starts_with("HTTP/") {
+                            // Discard the headers/body of intermediate NTLM
+                            // challenges and informational responses.
+                            *r = Response::default();
+                            r.status = line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                        } else if let Some((key, value)) = line.split_once(':') {
+                            if key.eq_ignore_ascii_case("WWW-Authenticate") {
+                                r.challenges.push(value.trim().to_owned());
+                            } else if key.eq_ignore_ascii_case("Location") {
+                                r.location = Some(value.trim().to_owned());
+                            }
                         }
-                        r.body.extend_from_slice(data);
-                    }
-                    Ok(data.len())
-                })
-                .ok()?;
-            transfer.perform()
+                        true
+                    })
+                    .map_err(|_| ())?;
+                transfer
+                    .write_function(|data| {
+                        let mut r = response.borrow_mut();
+                        if r.status == 200 {
+                            if r.body.len() + data.len() > LIMIT {
+                                return Ok(0);
+                            }
+                            r.body.extend_from_slice(data);
+                        }
+                        Ok(data.len())
+                    })
+                    .map_err(|_| ())?;
+                transfer.perform()
+            };
+            let mut response = response.into_inner();
+            response.status = easy.response_code().map_err(|_| ())?;
+            if result.is_err() && !(authenticated && negotiate.is_none() && matches!(response.status, 401 | 403)) {
+                return Err(());
+            }
+            Ok(response)
         };
-        let mut response = response.into_inner();
-        response.status = easy.response_code().ok()?;
-        if result.is_err() && !(authenticated && matches!(response.status, 401 | 403)) {
-            return None;
-        }
-        Some(response)
+        if let Some(creds) = negotiate {
+            let host = url.host_str()?;
+            match crate::exchange_negotiate::perform(&mut easy, host, creds.login, creds.password, body.is_some(), self.deadline.min(Instant::now() + Duration::from_secs(10)), &mut once) {
+                Ok(reply) => Some(reply),
+                Err(crate::exchange_negotiate::Error::Protocol(message)) => { self.error = Some(message); None },
+                Err(crate::exchange_negotiate::Error::Transport(())) => { self.error = Some("Exchange Negotiate HTTP transport failed"); None },
+            }
+        } else { once(&mut easy).ok() }
     }
 
     fn srv(&mut self, host: &str) -> Vec<Url> {
@@ -510,6 +526,7 @@ impl Transport for CurlTransport {
     fn supports_ntlm(&self) -> bool {
         curl::Version::get().feature_ntlm()
     }
+    fn take_error(&mut self) -> Option<&'static str> { self.error.take() }
 }
 
 fn pox_request(address: &str) -> String {
@@ -541,7 +558,7 @@ enum Probe {
     Verified,
     Unavailable,
     Authentication,
-    LegacyNegotiate,
+    Transport(&'static str),
 }
 
 fn probe_manifest(
@@ -566,11 +583,11 @@ fn probe_manifest(
     let Some(scheme) = response.scheme() else {
         return Probe::Unavailable;
     };
-    if scheme == Scheme::NegotiateOnly || (scheme == Scheme::Ntlm && !transport.supports_ntlm()) {
-        return Probe::LegacyNegotiate;
+    if scheme == Scheme::Ntlm && !transport.supports_ntlm() {
+        return Probe::Transport("Bundled libcurl lacks NTLM support");
     }
     let Some(response) = transport.request(url, None, Some(Credentials { scheme, login, password })) else {
-        return Probe::Unavailable;
+        return transport.take_error().map_or(Probe::Unavailable, Probe::Transport);
     };
     match response.status {
         401 | 403 => Probe::Authentication,
@@ -585,7 +602,7 @@ fn choose_oab(
     mut probe: impl FnMut(&Url) -> Probe,
 ) -> Result<Option<Url>, Error> {
     let trusted: Vec<&Url> = urls.iter().filter(|u| authorized(u)).collect();
-    let mut legacy = false;
+    let mut transport_error = None;
     for url in &trusted {
         match probe(url) {
             Probe::Verified => return Ok(Some((*url).clone())),
@@ -593,12 +610,12 @@ fn choose_oab(
                 // Stop after a rejected password; do not try every server.
                 return Ok(trusted.first().map(|u| (**u).clone()));
             }
-            Probe::LegacyNegotiate => legacy = true,
+            Probe::Transport(message) => transport_error = Some(message),
             Probe::Unavailable => {}
         }
     }
-    if legacy {
-        return Err(Error::LegacyNegotiate);
+    if let Some(message) = transport_error {
+        return Err(Error::Transport(message));
     }
     // Retain the published authorized fallback for the background retry.
     Ok(trusted.first().map(|u| (**u).clone()))
@@ -672,14 +689,15 @@ fn discover_with(
                     first_untrusted.get_or_insert_with(|| host.to_owned());
                     continue;
                 }
-                if scheme == Scheme::NegotiateOnly || (scheme == Scheme::Ntlm && !transport.supports_ntlm()) {
-                    return Err(Error::LegacyNegotiate);
+                if scheme == Scheme::Ntlm && !transport.supports_ntlm() {
+                    return Err(Error::Transport("Bundled libcurl lacks NTLM support"));
                 }
                 let Some(authenticated) = transport.request(
                     &url,
                     Some(&xml),
                     Some(Credentials { scheme, login: email, password }),
                 ) else {
+                    if let Some(message) = transport.take_error() { return Err(Error::Transport(message)); }
                     continue;
                 };
                 response = authenticated;
@@ -750,6 +768,7 @@ pub(super) fn discover(
 ) -> Result<Discovery, Error> {
     let mut transport = CurlTransport {
         deadline: Instant::now() + Duration::from_secs(110),
+        error: None,
     };
     discover_with(&mut transport, email, password, approved)
 }
@@ -995,6 +1014,20 @@ mod tests {
         let result = discover_with(&mut fake, "alice@example.test", "secret", &[]).unwrap();
         assert!(matches!(result, Discovery::ApproveHost(host) if host == "unrelated.test"));
         assert!(fake.requests.iter().all(|r| !r.2));
+    }
+
+    #[test]
+    fn native_exchange_negotiate_only_routes_to_native_transport() {
+        let mut fake = Fake {
+            replies: VecDeque::from([
+                Response { status: 401, challenges: vec!["Negotiate".into()], ..Default::default() },
+                Response { status: 200, body: XML.as_bytes().to_vec(), ..Default::default() },
+                Response { status: 200, body: b"<OAB><OAL><Full size=\"123\" SHA=\"abcd\">full.lzx</Full></OAL></OAB>".to_vec(), ..Default::default() },
+            ]),
+            requests: Vec::new(),
+        };
+        assert!(matches!(discover_with(&mut fake, "alice@example.test", "secret", &[]).unwrap(), Discovery::Exchange { .. }));
+        assert_eq!(fake.requests.iter().map(|r| r.2).collect::<Vec<_>>(), vec![false, true, false]);
     }
 
     #[test]

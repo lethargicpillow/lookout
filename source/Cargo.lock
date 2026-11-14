@@ -2334,6 +2334,7 @@ dependencies = [
  "lookout-goa",
  "lookout-graph",
  "lookout-mail",
+ "openssl-sys",
  "quick-xml",
  "reqwest",
  "rusqlite",
