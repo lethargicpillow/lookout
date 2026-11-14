@@ -322,11 +322,19 @@ pub enum ContactCommand {
     /// caches" sends one per account so the freshly-emptied caches rebuild
     /// right away instead of on the next poll tick).
     Refresh,
+    /// User-requested live refresh, with acknowledgement of the poll outcome.
+    RefreshWithReply { reply: async_channel::Sender<Result<(), String>> },
 }
 
 /// CardDAV has no push equivalent in this app yet, so contacts are refreshed
 /// on a fixed polling interval.
 const CONTACTS_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Bound a whole live poll so a stalled discovery, REPORT or multiget cannot
+/// keep the serialized contact command queue blocked indefinitely.
+fn contacts_poll_timeout(provider: Option<&str>) -> std::time::Duration {
+    std::time::Duration::from_secs(if provider == Some("google") { 60 } else { 120 })
+}
 
 /// The most Graph contact photos fetched in one sync pass. Graph returns the
 /// photo from a separate `/photo/$value` request (not inline in the contact
@@ -611,6 +619,58 @@ fn send_contact_command(
                 toast_overlay.add_toast(adw::Toast::new("The contacts session ended before confirming the operation."));
             }
         }
+    });
+}
+
+/// Request a live poll from every connected contacts account. A successful
+/// acknowledgement is sent only after its complete snapshot was obtained.
+pub(crate) fn refresh_contact_accounts(state: &Rc<RefCell<UiState>>, toast_overlay: &adw::ToastOverlay, button: &gtk::Button) {
+    let account_ids: Vec<_> = {
+        let st = state.borrow();
+        if st.work_offline {
+            toast_overlay.add_toast(adw::Toast::new("You're working offline — reconnect to refresh contacts."));
+            return;
+        }
+        st.contact_cmd_tx.keys().cloned().collect()
+    };
+    if account_ids.is_empty() {
+        toast_overlay.add_toast(adw::Toast::new("No connected contacts accounts to refresh."));
+        return;
+    }
+    let mut replies = Vec::new();
+    let mut failures = Vec::new();
+    for id in &account_ids {
+        if let Some(rx) = dispatch_contact_command(state, id, |reply| ContactCommand::RefreshWithReply { reply }) {
+            replies.push(rx);
+        } else {
+            failures.push("A contacts session isn't running.".to_string());
+        }
+    }
+    tracing::info!(accounts = account_ids.len(), "contacts manual refresh requested");
+    button.set_sensitive(false);
+    let pending = adw::Toast::new("Refreshing contacts…");
+    pending.set_timeout(0);
+    toast_overlay.add_toast(pending.clone());
+    let toast_overlay = toast_overlay.clone();
+    let button = button.clone();
+    glib::spawn_future_local(async move {
+        let mut ok = 0usize;
+        for rx in replies {
+            match rx.recv().await {
+                Ok(Ok(())) => ok += 1,
+                Ok(Err(message)) => failures.push(message),
+                Err(_) => failures.push("A contacts session ended before refresh completed.".to_string()),
+            }
+        }
+        pending.dismiss();
+        button.set_sensitive(true);
+        tracing::info!(confirmed = ok, failed = failures.len(), "contacts manual refresh completed");
+        let text = if failures.is_empty() {
+            "Contacts refreshed".to_string()
+        } else {
+            format!("Refreshed {ok} account(s); {} failed: {}", failures.len(), failures.join("; "))
+        };
+        toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&text)));
     });
 }
 
@@ -2680,6 +2740,9 @@ async fn wait_offline(cmd_rx: &async_channel::Receiver<ContactCommand>, offline_
                         .await;
                 }
                 Ok(ContactCommand::Refresh) => {}
+                Ok(ContactCommand::RefreshWithReply { reply }) => {
+                    let _ = reply.send(Err("You're working offline — contacts were not refreshed".to_string())).await;
+                }
                 Err(_) => return false,
             },
         }
@@ -2778,6 +2841,7 @@ pub fn sync_contacts_account(
             }
 
             let mut resync = force_resync || wake.is_none();
+            let mut refresh_replies = Vec::new();
             // Process the command that woke us (if any), then drain any
             // further commands queued while we were mid-fetch.
             for command in wake.into_iter().chain(std::iter::from_fn(|| cmd_rx.try_recv().ok())) {
@@ -2851,6 +2915,10 @@ pub fn sync_contacts_account(
                     ContactCommand::Refresh => {
                         resync = true;
                     }
+                    ContactCommand::RefreshWithReply { reply } => {
+                        resync = true;
+                        refresh_replies.push(reply);
+                    }
                 }
             }
 
@@ -2860,17 +2928,33 @@ pub fn sync_contacts_account(
             // A toggle during command handling must not start a poll: the
             // cache already has the last snapshot, and the reconnect resyncs.
             if *offline_rx.borrow() {
+                for reply in refresh_replies {
+                    let _ = reply.send(Err("You're working offline — contacts were not refreshed".to_string())).await;
+                }
                 continue;
             }
-            let result = match &graph {
-                Some(client) => fetch_graph_contacts(client, &account, cache.as_ref()).await,
-                None => fetch_carddav_contacts(goa_client.clone(), account.clone(), cache.as_ref()).await,
+            let timeout = contacts_poll_timeout(account.provider_type.as_deref());
+            let started = std::time::Instant::now();
+            tracing::info!(account = %account.account_id, timeout_secs = timeout.as_secs(), "contacts live sync started");
+            let result = match tokio::time::timeout(timeout, async {
+                match &graph {
+                    Some(client) => fetch_graph_contacts(client, &account, cache.as_ref()).await,
+                    None => fetch_carddav_contacts(goa_client.clone(), account.clone(), cache.as_ref()).await,
+                }
+            }).await {
+                Ok(result) => result,
+                Err(_) => Err("Contacts synchronization timed out; previous contacts remain available.".to_string()),
             };
+            tracing::info!(account = %account.account_id, success = result.is_ok(), elapsed_ms = started.elapsed().as_millis(), "contacts live sync finished");
             if let Ok(snapshot) = &result {
                 last_snapshot = Some(snapshot.clone());
             }
+            let acknowledgement = result.as_ref().map(|_| ()).map_err(|message| message.clone());
             if tx.send((first, result)).await.is_err() {
                 break;
+            }
+            for reply in refresh_replies {
+                let _ = reply.send(acknowledgement.clone()).await;
             }
             first = false;
         }
@@ -3126,50 +3210,26 @@ async fn fetch_carddav_contacts(goa_client: Option<GoaClient>, account: GoaConta
     tracing::debug!("CardDAV discovery for {}: home={home:?}, {} addressbook(s) found", account.display_name, books.len());
 
     if let Some(cache) = cache {
-        let _ = cache.store_address_books(&books);
-        // Drop cached books that vanished server-side so their members read
-        // as deletions (the UI receiver diffs the previous snapshot against
-        // this one) instead of lingering in the People screen forever.
+        // Do not acknowledge a poll on stale cached data when a book failed.
+        // Apply each verified book, but publish only after all books succeed.
+        for book in &books {
+            let records = sync_addressbook_into(&client, &credential, book, cache).await
+                .map_err(|e| format!("CardDAV addressbook sync failed for {:?}: {e}", book.display_name))?;
+            tracing::debug!(changed = records.len(), "CardDAV addressbook synchronized");
+        }
+        cache.store_address_books(&books).map_err(|e| e.to_string())?;
+        // The discovered list is authoritative only after the live pass
+        // succeeded. Keep old books on discovery/transport failure.
         let live_hrefs: HashSet<&str> = books.iter().map(|b| b.href.as_str()).collect();
-        if let Ok(cached_books) = cache.load_address_books() {
-            for stale in cached_books.iter().filter(|b| !live_hrefs.contains(b.href.as_str())) {
-                if let Err(e) = cache.remove_book(&stale.href) {
-                    tracing::warn!("failed to drop vanished CardDAV addressbook {:?}: {e}", stale.href);
-                }
-            }
+        for stale in cache.load_address_books().map_err(|e| e.to_string())?.iter().filter(|b| !live_hrefs.contains(b.href.as_str())) {
+            cache.remove_book(&stale.href).map_err(|e| e.to_string())?;
         }
-    }
-
-    for book in &books {
-        let result = match cache {
-            Some(cache) => sync_addressbook_into(&client, &credential, book, cache).await,
-            None => client.fetch_addressbook_contacts_with_meta(book, &credential).await.map_err(|e| e.to_string()),
-        };
-        match result {
-            Ok(records) => {
-                tracing::debug!(
-                    "CardDAV addressbook {:?} (href {:?}) returned {} changed vcard(s)",
-                    book.display_name,
-                    book.href,
-                    records.len()
-                );
-            }
-            Err(e) => {
-                tracing::warn!("CardDAV addressbook sync failed for {:?}: {e}", book.display_name);
-            }
-        }
-    }
-    tracing::debug!("CardDAV sync for {} complete", account.display_name);
-
-    // Full-set semantics: per-book deltas above only describe *changes*, so
-    // the snapshot must be rebuilt from the cache the deltas were applied to
-    // (any contact missing from it was genuinely deleted). Without a cache,
-    // the fetched records are the whole set and can be used directly.
-    if let Some(cache) = cache {
         if let Some(snapshot) = snapshot_from_cache(&account, cache) {
             return Ok(snapshot);
         }
     }
+    // Cacheless accounts fetch each book just once, not a discarded first
+    // pass followed by the same full fetch again.
     let mut addresses = Vec::new();
     let mut contacts = Vec::new();
     for book in &books {
@@ -3215,35 +3275,15 @@ async fn fetch_graph_contacts(client: &ContactsClient, account: &GoaContactsAcco
         .collect();
 
     if let Some(cache) = cache {
-        let _ = cache.store_address_books(&books);
-        // Drop cached folders that vanished server-side so their members read
-        // as deletions (the UI receiver diffs the previous snapshot against
-        // this one) instead of lingering in the People screen forever.
+        for folder in &folders {
+            sync_graph_folder_into(client, folder, cache).await
+                .map_err(|e| format!("Graph contacts sync failed for folder {:?}: {e}", folder.display_name))?;
+        }
+        cache.store_address_books(&books).map_err(|e| e.to_string())?;
         let live_hrefs: HashSet<&str> = books.iter().map(|book| book.href.as_str()).collect();
-        if let Ok(cached_books) = cache.load_address_books() {
-            for stale in cached_books.iter().filter(|book| !live_hrefs.contains(book.href.as_str())) {
-                if let Err(e) = cache.remove_book(&stale.href) {
-                    tracing::warn!("failed to drop vanished Graph contact folder {:?}: {e}", stale.href);
-                }
-            }
+        for stale in cache.load_address_books().map_err(|e| e.to_string())?.iter().filter(|book| !live_hrefs.contains(book.href.as_str())) {
+            cache.remove_book(&stale.href).map_err(|e| e.to_string())?;
         }
-    }
-
-    for folder in &folders {
-        let result = match cache {
-            Some(cache) => sync_graph_folder_into(client, folder, cache).await,
-            None => client.list_contacts(Some(&folder.id)).await.map(|_| ()).map_err(|e| e.to_string()),
-        };
-        if let Err(e) = result {
-            tracing::warn!("Graph contacts sync failed for folder {:?}: {e}", folder.display_name);
-        }
-    }
-    tracing::debug!("Graph contacts sync for {} complete ({} folder(s))", account.display_name, folders.len());
-
-    // Full-set semantics: the per-folder syncs above applied to the cache, so
-    // the snapshot is rebuilt from it (a contact missing from it was genuinely
-    // deleted). Without a cache, the folders are re-read into the snapshot.
-    if let Some(cache) = cache {
         if let Some(snapshot) = snapshot_from_cache(account, cache) {
             return Ok(snapshot);
         }
@@ -3251,15 +3291,12 @@ async fn fetch_graph_contacts(client: &ContactsClient, account: &GoaContactsAcco
     let mut contacts = Vec::new();
     let mut addresses = Vec::new();
     for folder in &folders {
-        match client.list_contacts(Some(&folder.id)).await {
-            Ok(records) => {
-                for contact in &records {
-                    addresses.extend(contact.card.email_addresses());
-                }
-                contacts.extend(records.into_iter().map(graph_contact_record));
-            }
-            Err(e) => tracing::warn!("Graph contacts fetch failed for folder {:?}: {e}", folder.display_name),
+        let records = client.list_contacts(Some(&folder.id)).await
+            .map_err(|e| format!("Graph contacts fetch failed for folder {:?}: {e}", folder.display_name))?;
+        for contact in &records {
+            addresses.extend(contact.card.email_addresses());
         }
+        contacts.extend(records.into_iter().map(graph_contact_record));
     }
     let contact_lists = resolve_contact_lists(&contacts);
     Ok(ContactsAccountSnapshot {
@@ -3650,6 +3687,13 @@ mod tests {
             etag: None,
             card,
         }
+    }
+
+    #[test]
+    fn contacts_poll_timeout_bounds_google_and_other_providers() {
+        assert_eq!(contacts_poll_timeout(Some("google")).as_secs(), 60);
+        assert_eq!(contacts_poll_timeout(None).as_secs(), 120);
+        assert_eq!(contacts_poll_timeout(Some("microsoft")).as_secs(), 120);
     }
 
     #[test]

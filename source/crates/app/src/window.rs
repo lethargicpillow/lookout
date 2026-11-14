@@ -5235,6 +5235,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     contacts_edit_button.set_sensitive(false);
     let contacts_delete_button = gtk::Button::with_label("Delete");
     contacts_delete_button.set_sensitive(false);
+    let contacts_sync_button = gtk::Button::with_label("Refresh");
+    contacts_sync_button.set_tooltip_text(Some("Refresh contacts from connected accounts"));
     // Communicate ▸ Email: a new message to the one selected contact, gated
     // with Edit (and on the contact having an address).
     let contacts_email_button = gtk::Button::with_label("Email");
@@ -5270,6 +5272,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         group.button(&contacts_edit_button, "document-edit-symbolic", "Edit");
         group.button(&contacts_delete_button, "user-trash-symbolic", "Delete");
         group.button(&merge_duplicates_button, "edit-find-symbolic", "Merge duplicates…");
+    });
+    contacts_band.group("Sync", |group| {
+        group.button(&contacts_sync_button, "view-refresh-symbolic", "Refresh");
     });
     contacts_band.group("Transfer", |group| {
         group.button(&import_contacts_button, "document-open-symbolic", "Import…");
@@ -8608,6 +8613,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             } else {
                 show_contact_editor_for(&window, &state, &toast_overlay, &entry);
             }
+        });
+    }
+    {
+        let state = state.clone();
+        let toast_overlay = toast_overlay.clone();
+        contacts_sync_button.connect_clicked(move |button| {
+            crate::contacts_view::refresh_contact_accounts(&state, &toast_overlay, button);
         });
     }
     {
