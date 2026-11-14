@@ -370,6 +370,112 @@ fn setup_primary_action(is_edit: bool, discovered: bool, manual: bool) -> SetupP
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OAuthSetupKind {
+    Google,
+    Microsoft365,
+    Other,
+}
+
+impl OAuthSetupKind {
+    fn matches(self, requested: &str, email: &str, provider: Option<&str>, oauth: bool, microsoft: bool) -> bool {
+        if !oauth || !requested.trim().eq_ignore_ascii_case(email.trim()) {
+            return false;
+        }
+        match self {
+            Self::Google => provider == Some("google"),
+            Self::Microsoft365 => microsoft,
+            Self::Other => true,
+        }
+    }
+}
+
+async fn find_oauth_mail_account(address: &str, kind: OAuthSetupKind) -> Option<AccountId> {
+    // Read only: the window's existing GOA watcher owns session creation.
+    // Bound each D-Bus query so an unavailable daemon cannot freeze setup.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let client = lookout_goa::GoaClient::connect().await.ok()?;
+        let accounts = client.list_mail_accounts().await.ok()?;
+        accounts.into_iter().find(|a| kind.matches(address, &a.email,
+            a.provider_type.as_deref(), matches!(&a.auth, lookout_goa::AuthMethod::OAuth2),
+            a.is_microsoft_365())).map(|a| a.account_id)
+    }).await.ok().flatten()
+}
+
+/// Wait for the exact requested mail-enabled OAuth account, not merely any
+/// newly added GOA object. The regular GOA watcher connects its services.
+/// No local password account or second mail actor is created by this flow.
+#[allow(clippy::too_many_arguments)]
+fn wait_for_oauth_account(
+    worker: &Worker,
+    dialog: &gtk::Window,
+    form: &gtk::Grid,
+    status: &gtk::Label,
+    address: String,
+    kind: OAuthSetupKind,
+    running: Rc<std::cell::Cell<bool>>,
+    refresh: Rc<dyn Fn()>,
+) {
+    running.set(true);
+    form.set_sensitive(false);
+    refresh();
+    let (cancel_tx, cancel_rx) = async_channel::bounded::<()>(1);
+    let close_handler = dialog.connect_close_request(move |_| {
+        let _ = cancel_tx.try_send(());
+        glib::Propagation::Proceed
+    });
+    let (tx, rx) = async_channel::bounded(1);
+    worker.spawn(async move {
+        let wait = async {
+            // An already registered account needs neither a new system
+            // login nor another Lookout account with the same address.
+            if let Some(id) = find_oauth_mail_account(&address, kind).await {
+                return Some(id);
+            }
+            crate::online_accounts::open_online_accounts().await;
+            loop {
+                if let Some(id) = find_oauth_mail_account(&address, kind).await {
+                    return Some(id);
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        };
+        let outcome = tokio::select! {
+            _ = cancel_rx.recv() => None,
+            result = tokio::time::timeout(std::time::Duration::from_secs(300), wait) => result.ok().flatten(),
+        };
+        let _ = tx.send(outcome).await;
+    });
+    let dialog = dialog.downgrade();
+    let form = form.clone();
+    let status = status.clone();
+    glib::spawn_future_local(async move {
+        let result = rx.recv().await.ok().flatten();
+        let Some(dialog) = dialog.upgrade() else { return; };
+        dialog.disconnect(close_handler);
+        if !dialog.is_visible() { return; }
+        running.set(false);
+        form.set_sensitive(true);
+        refresh();
+        match result {
+            Some(id) => {
+                // Respect an existing account explicitly disabled in
+                // Lookout. Never silently change the user's preference.
+                let settings = crate::settings::resolve();
+                if settings.get_strv(crate::settings::ACCOUNTS_DISABLED).iter().any(|disabled| disabled == &id.0) {
+                    status.set_label("This account is already registered but disabled in Lookout. Enable it in Config → Accounts.");
+                    return;
+                }
+                tracing::info!(account = %id, "OAuth setup: mail-enabled Online Account found");
+                // This confirms registration, not IMAP authentication.
+                // Microsoft 365 still uses Lookout's own OAuth flow.
+                dialog.close();
+            }
+            None => status.set_label("No matching mail-enabled account was found. Enable Mail for this address in Online Accounts, then select Find settings to try again."),
+        }
+    });
+}
+
 pub fn show_add_account_dialog(
     anchor: &gtk::Widget,
     worker: Rc<Worker>,
@@ -779,6 +885,8 @@ pub fn show_add_account_dialog(
         let detect: Rc<dyn Fn()> = {
             let email = email_entry.clone();
             let password = imap_password_entry.clone();
+            let dialog = dialog.downgrade();
+            let form = form.clone();
             let approve = approve_button.clone();
             let oab = oab_entry.clone();
             let status = setup_status.clone();
@@ -833,8 +941,12 @@ pub fn show_add_account_dialog(
                 let ready = ready.clone();
                 let refresh = refresh.clone();
                 let oauth_worker = worker.clone();
+                let dialog = dialog.clone();
+                let form = form.clone();
                 glib::spawn_future_local(async move {
                     let result = rx.recv().await;
+                    let Some(dialog) = dialog.upgrade() else { return; };
+                    if !dialog.is_visible() { return; }
                     running.set(false);
                     refresh();
                     if email.text().trim() != address { status.set_label("Email changed. Find settings again."); return; }
@@ -873,18 +985,21 @@ pub fn show_add_account_dialog(
                         }
                         Ok(Ok(Discovery::Google)) => {
                             password.set_text("");
-                            status.set_label("Google detected. Sign in to Google in Online Accounts and enable Mail. Lookout will connect automatically.");
-                            oauth_worker.spawn(crate::online_accounts::open_online_accounts());
+                            status.set_label("Google detected. Sign in to Google in Online Accounts and enable Mail. Waiting for this account…");
+                            wait_for_oauth_account(&oauth_worker, &dialog, &form, &status, address,
+                                OAuthSetupKind::Google, running, refresh);
                         }
                         Ok(Ok(Discovery::OAuthRequired(provider))) => {
                             password.set_text("");
-                            status.set_label(&format!("{provider} requires OAuth2. Choose its sign-in in Online Accounts if supported by your system. Otherwise a registered OAuth client is required."));
-                            oauth_worker.spawn(crate::online_accounts::open_online_accounts());
+                            status.set_label(&format!("{provider} requires OAuth2. Sign in through Online Accounts if supported, then enable Mail. Waiting for this account…"));
+                            wait_for_oauth_account(&oauth_worker, &dialog, &form, &status, address,
+                                OAuthSetupKind::Other, running, refresh);
                         }
                         Ok(Ok(Discovery::Microsoft365)) => {
                             password.set_text("");
-                            status.set_label("Microsoft 365 detected. Sign in to Microsoft in Online Accounts. Lookout will complete mail authorization.");
-                            oauth_worker.spawn(crate::online_accounts::open_online_accounts());
+                            status.set_label("Microsoft 365 detected. Sign in to Microsoft in Online Accounts and enable Mail. Lookout will then request any additional mail authorization.");
+                            wait_for_oauth_account(&oauth_worker, &dialog, &form, &status, address,
+                                OAuthSetupKind::Microsoft365, running, refresh);
                         }
                         Ok(Err(message)) => status.set_label(&message),
                         Err(_) => status.set_label("Discovery stopped. Try again."),
@@ -1249,6 +1364,19 @@ mod tests {
 
     fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(fut)
+    }
+
+    #[test]
+    fn oauth_setup_matches_requested_email_provider_and_authentication() {
+        let requested = "alice@example.test";
+        assert!(OAuthSetupKind::Google.matches(requested, "Alice@EXAMPLE.TEST", Some("google"), true, false));
+        assert!(!OAuthSetupKind::Google.matches(requested, "bob@example.test", Some("google"), true, false));
+        assert!(!OAuthSetupKind::Google.matches(requested, requested, Some("google"), false, false));
+        assert!(!OAuthSetupKind::Google.matches(requested, requested, Some("ms_graph"), true, true));
+        assert!(OAuthSetupKind::Microsoft365.matches(requested, requested, Some("ms_graph"), true, true));
+        assert!(!OAuthSetupKind::Microsoft365.matches(requested, requested, Some("google"), true, false));
+        assert!(OAuthSetupKind::Other.matches(requested, requested, Some("yahoo"), true, false));
+        assert!(!OAuthSetupKind::Other.matches(requested, requested, Some("imap_smtp"), false, false));
     }
 
     #[test]
