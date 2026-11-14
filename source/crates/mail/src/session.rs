@@ -7311,6 +7311,19 @@ fn envelope_sync_sets(uids: &[Uid]) -> Vec<String> {
     sorted.chunks(ENVELOPE_SYNC_BATCH).flat_map(uid_set_chunks).collect()
 }
 
+// Persist before starting the next network request, never treating staged
+// rows as the authoritative snapshot. The account can continue without a
+// cache, but report failures so repeated loss of progress is diagnosable.
+async fn persist_envelope_checkpoint(cache: &CacheHandle, mailbox: &MailboxId, validity: UidValidity, batch: &[EmailSummary]) {
+    if batch.is_empty() || validity.0 == 0 { return; }
+    let mailbox = mailbox.clone();
+    let id = mailbox.clone();
+    let batch = batch.to_vec();
+    if let Some(Err(error)) = cache_op(cache, move |c| c.checkpoint_imap_envelopes(&mailbox, validity, &batch)).await {
+        tracing::warn!(mailbox = %id, "could not persist envelope sync checkpoint: {error}");
+    }
+}
+
 /// The STATUS data items a folder-count refresh asks for. `HIGHESTMODSEQ`
 /// (RFC 7162 §3.2.1) rides along on CONDSTORE connections - it's the one
 /// pass that visits every folder, so folders that never get SELECTed still
@@ -7914,16 +7927,73 @@ async fn sync_mailbox(
                 new_messages.extend(fetches.iter().filter_map(|f| summary_from_fetch(mailbox_id, f)));
             }
         } else {
-            let sets = envelope_sync_sets(&new_uids);
-            tracing::info!(account = %account_id, mailbox = %folder_path, count = new_uids.len(), batches = sets.len(), "fetching new message envelopes");
+            // Only a full flag scan has current flags for every staged
+            // message. A delta can checkpoint work too, but reuse it on
+            // the next full SELECT (after a reconnect).
+            let mut staged = if delta { HashMap::new() } else {
+                cache_op(cache, {
+                    let mailbox_id = mailbox_id.clone();
+                    move |c| c.load_imap_checkpoint(&mailbox_id, uidvalidity)
+                }).await.and_then(|r| r.ok()).unwrap_or_default()
+            };
+            let mut remaining = Vec::with_capacity(new_uids.len());
+            let wanted: HashSet<Uid> = new_uids.iter().copied().collect();
+            let mut received = HashSet::new();
+            // Intersect with live membership and update mutable flags.
+            for fetch in &flag_fetches {
+                let Some(uid) = fetch.uid.map(Uid) else { continue };
+                if !wanted.contains(&uid) { continue; }
+                if let Some(mut msg) = staged.remove(&uid) {
+                    let (flags, keywords) = flags_from_fetch(fetch);
+                    msg.flags = flags;
+                    msg.keywords = keywords;
+                    received.insert(uid);
+                    new_messages.push(msg);
+                }
+            }
+            remaining.extend(new_uids.iter().copied().filter(|uid| !received.contains(uid)));
+            let sets = envelope_sync_sets(&remaining);
+            tracing::info!(account = %account_id, mailbox = %folder_path, count = new_uids.len(), reused_checkpoint = new_messages.len(), remaining = remaining.len(), batches = sets.len(), "fetching new message envelopes");
             for (index, uid_set) in sets.iter().enumerate() {
                 tracing::debug!(account = %account_id, mailbox = %folder_path, batch = index + 1, batches = sets.len(), "requesting envelope batch");
                 let fetches: Vec<Fetch> = imap_sync_step(account_id, "UID FETCH ENVELOPE", async {
                     Ok(session.uid_fetch(uid_set, envelope_fetch_items(false)).await?.try_collect().await?)
                 }).await?;
-                new_messages.extend(fetches.iter().filter_map(|f| summary_from_fetch(mailbox_id, f)));
+                let batch: Vec<EmailSummary> = fetches.iter().filter_map(|f| summary_from_fetch(mailbox_id, f))
+                    .filter(|m| wanted.contains(&m.uid) && received.insert(m.uid)).collect();
+                persist_envelope_checkpoint(cache, mailbox_id, uidvalidity, &batch).await;
+                new_messages.extend(batch);
                 if index == 0 || (index + 1) % 10 == 0 || index + 1 == sets.len() {
                     tracing::info!(account = %account_id, mailbox = %folder_path, batch = index + 1, batches = sets.len(), received = new_messages.len(), "envelope sync progress");
+                }
+            }
+
+            // A server can omit a response for an expunged UID or fail to
+            // return an envelope. Retry missing live UIDs in smaller
+            // batches, then distinguish expunge from incomplete
+            // data before replacing the authoritative folder snapshot.
+            let missing: Vec<Uid> = new_uids.iter().copied().filter(|uid| !received.contains(uid)).collect();
+            if !missing.is_empty() {
+                tracing::info!(account = %account_id, mailbox = %folder_path, missing = missing.len(), "checking missing message envelopes");
+                let live = imap_sync_step(account_id, "UID SEARCH missing envelopes", uids_still_present(session, &missing)).await?;
+                for group in live.chunks(20) {
+                    for set in uid_set_chunks(group) {
+                        let fetches: Vec<Fetch> = imap_sync_step(account_id, "UID FETCH missing envelopes", async {
+                            Ok(session.uid_fetch(&set, envelope_fetch_items(false)).await?.try_collect().await?)
+                        }).await?;
+                        let batch: Vec<EmailSummary> = fetches.iter().filter_map(|f| summary_from_fetch(mailbox_id, f))
+                            .filter(|m| wanted.contains(&m.uid) && received.insert(m.uid)).collect();
+                        persist_envelope_checkpoint(cache, mailbox_id, uidvalidity, &batch).await;
+                        new_messages.extend(batch);
+                    }
+                }
+                let missing: Vec<Uid> = live.into_iter().filter(|uid| !received.contains(uid)).collect();
+                if !missing.is_empty() {
+                    let still_live = imap_sync_step(account_id, "UID SEARCH unresolved envelopes", uids_still_present(session, &missing)).await?;
+                    if !still_live.is_empty() {
+                        tracing::warn!(account = %account_id, mailbox = %folder_path, missing = still_live.len(), first_uid = still_live[0].0, "server omitted live message envelopes; preserving checkpoint");
+                        return Err(Error::Io(std::io::Error::other("IMAP server omitted live message envelopes; synchronization will resume")));
+                    }
                 }
             }
         }

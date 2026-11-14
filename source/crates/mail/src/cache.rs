@@ -885,6 +885,15 @@ impl Cache {
                 PRIMARY KEY (mailbox_id, uid)
             );
             CREATE INDEX IF NOT EXISTS messages_by_mailbox ON messages (mailbox_id);
+            -- Interrupted IMAP envelope sync: independent of the visible
+            -- folder snapshot and of the background search-index window.
+            CREATE TABLE IF NOT EXISTS imap_sync_checkpoint (
+                mailbox_id TEXT NOT NULL,
+                uidvalidity INTEGER NOT NULL,
+                uid INTEGER NOT NULL,
+                data TEXT NOT NULL,
+                PRIMARY KEY (mailbox_id, uidvalidity, uid)
+            );
             CREATE TABLE IF NOT EXISTS snoozed (
                 mailbox_id TEXT NOT NULL,
                 uid INTEGER NOT NULL,
@@ -1126,6 +1135,7 @@ impl Cache {
             let stored: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
             if stored < ENVELOPE_LEGACY_WIPE_VERSION {
                 tx.execute("DELETE FROM messages", [])?;
+                tx.execute("DELETE FROM imap_sync_checkpoint", [])?;
                 // A Graph folder cursor describes the rows that were just
                 // wiped; keeping it would let the next incremental page skip
                 // the messages the wipe removed from the cache. Force a
@@ -1322,6 +1332,9 @@ impl Cache {
             }
         }
         drop(upsert);
+        // A complete snapshot supersedes all staged envelopes. Clear them
+        // in this same transaction: a failed commit must retain progress.
+        tx.execute("DELETE FROM imap_sync_checkpoint WHERE mailbox_id = ?1", [&mailbox_id.0])?;
         tx.commit()?;
         // Delete the flat files only after the rows are committed, and outside
         // the connection mutex: a failed commit must never leave surviving
@@ -1365,6 +1378,48 @@ impl Cache {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Persist one successful IMAP FETCH batch without replacing, indexing,
+    /// or exposing the folder's existing snapshot. UIDVALIDITY is mandatory:
+    /// a recycled UID must never resolve to an older message.
+    pub(crate) fn checkpoint_imap_envelopes(&self, mailbox: &MailboxId, validity: UidValidity, messages: &[EmailSummary]) -> Result<()> {
+        if validity.0 == 0 || messages.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM imap_sync_checkpoint WHERE mailbox_id = ?1 AND uidvalidity != ?2", rusqlite::params![mailbox.0, validity.0])?;
+        {
+            let mut insert = tx.prepare_cached(
+                "INSERT INTO imap_sync_checkpoint (mailbox_id, uidvalidity, uid, data) VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(mailbox_id, uidvalidity, uid) DO UPDATE SET data = excluded.data",
+            )?;
+            for message in messages {
+                if &message.mailbox != mailbox { continue; }
+                insert.execute(rusqlite::params![mailbox.0, validity.0, message.uid.0, serde_json::to_string(message)?])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Read only the current UIDVALIDITY's staged envelopes. The caller
+    /// intersects them with the live UID set and refreshes their flags.
+    pub(crate) fn load_imap_checkpoint(&self, mailbox: &MailboxId, validity: UidValidity) -> Result<HashMap<Uid, EmailSummary>> {
+        let mut result = HashMap::new();
+        if validity.0 == 0 { return Ok(result); }
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT uid, data FROM imap_sync_checkpoint WHERE mailbox_id = ?1 AND uidvalidity = ?2")?;
+        for row in stmt.query_map(rusqlite::params![mailbox.0, validity.0], |r| Ok((r.get::<_, u32>(0)?, r.get::<_, String>(1)?)))? {
+            let (uid, data) = row?;
+            if let Ok(message) = serde_json::from_str::<EmailSummary>(&data) {
+                if message.uid == Uid(uid) && &message.mailbox == mailbox {
+                    result.insert(message.uid, message);
+                }
+            }
+        }
+        Ok(result)
     }
 
     /// Indexes a never-opened folder's newest-N envelope window, as fetched
@@ -3462,7 +3517,7 @@ impl Cache {
     /// so a `%` or `_` in a folder name can't widen the match.
     fn cached_ids_in_tree(conn: &Connection, root: &MailboxId, delimiter: char) -> Result<Vec<MailboxId>> {
         let mut ids: HashSet<String> = HashSet::new();
-        for table in ["messages", "bodies", "mailboxes", "snoozed"] {
+        for table in ["messages", "bodies", "mailboxes", "snoozed", "imap_sync_checkpoint"] {
             let mut stmt = conn.prepare(&format!("SELECT DISTINCT mailbox_id FROM {table}"))?;
             for id in stmt.query_map([], |row| row.get::<_, String>(0))? {
                 ids.insert(id?);
@@ -3496,7 +3551,7 @@ impl Cache {
                     purged.insert(row?);
                 }
             }
-            for table in ["messages", "bodies", "search_fts", "mailboxes", "snoozed"] {
+            for table in ["messages", "bodies", "search_fts", "mailboxes", "snoozed", "imap_sync_checkpoint"] {
                 tx.execute(&format!("DELETE FROM {table} WHERE mailbox_id = ?1"), [&id.0])?;
             }
             purged_by_mailbox.push((id.clone(), purged));
@@ -6327,6 +6382,39 @@ mod tests {
         let path = cache.attachment_path(&mailbox_id, Uid(1), UidValidity(9), part);
         assert_eq!(path.parent(), Some(cache.attachments_dir.as_path()));
         let _ = remove_account_cache(&account_id);
+    }
+
+    #[test]
+    fn imap_checkpoint_survives_reopen_without_exposing_partial_snapshot() {
+        let account = temp_account_id();
+        let mailbox = MailboxId::new(&account, "INBOX");
+        let other = MailboxId::new(&account, "Other");
+        let validity = UidValidity(5);
+        {
+            let cache = Cache::open(&account).unwrap();
+            cache.replace_messages(&mailbox, validity, &[sample_summary(&mailbox, 1, None)]).unwrap();
+            cache.checkpoint_imap_envelopes(&mailbox, validity, &[sample_summary(&mailbox, 2, None)]).unwrap();
+            cache.checkpoint_imap_envelopes(&mailbox, validity, &[sample_summary(&mailbox, 3, None)]).unwrap();
+            cache.checkpoint_imap_envelopes(&other, validity, &[sample_summary(&other, 9, None)]).unwrap();
+            assert_eq!(cache.load_messages(&mailbox).unwrap().len(), 1);
+            assert!(!cache.has_messages(&other).unwrap());
+            assert!(cache.load_summary(&mailbox, Uid(2)).unwrap().is_none());
+        }
+        let cache = Cache::open(&account).unwrap();
+        let staged = cache.load_imap_checkpoint(&mailbox, validity).unwrap();
+        assert_eq!(staged.len(), 2);
+        assert!(staged.contains_key(&Uid(2)) && staged.contains_key(&Uid(3)));
+        assert!(cache.load_imap_checkpoint(&mailbox, UidValidity(6)).unwrap().is_empty());
+        assert!(cache.load_imap_checkpoint(&mailbox, UidValidity(0)).unwrap().is_empty());
+        // Complete snapshot deletes only this mailbox's staging rows.
+        cache.replace_messages(&mailbox, validity, &[sample_summary(&mailbox, 1, None), staged[&Uid(2)].clone(), staged[&Uid(3)].clone()]).unwrap();
+        assert_eq!(cache.load_messages(&mailbox).unwrap().len(), 3);
+        assert!(cache.load_imap_checkpoint(&mailbox, validity).unwrap().is_empty());
+        assert_eq!(cache.load_imap_checkpoint(&other, validity).unwrap().len(), 1);
+        cache.forget_mailbox_tree(&other, '/').unwrap();
+        assert!(cache.load_imap_checkpoint(&other, validity).unwrap().is_empty());
+        drop(cache);
+        let _ = remove_account_cache(&account);
     }
 
     #[test]
