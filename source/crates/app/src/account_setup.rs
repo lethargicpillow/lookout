@@ -7,6 +7,8 @@ use quick_xml::{events::Event, Reader};
 
 #[path = "exchange_native.rs"]
 mod exchange_native;
+#[path = "account_dns.rs"]
+mod account_dns;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Server {
@@ -17,7 +19,7 @@ pub(crate) struct Server {
 }
 #[derive(Clone, Debug)]
 pub(crate) enum Discovery {
-    Mail { imap: Server, smtp: Server, oauth_available: bool },
+    Mail { imap: Server, smtp: Server, oauth_available: bool, source: &'static str },
     Exchange { ews: Option<String>, oab: Option<String> },
     Microsoft365,
     Google,
@@ -145,10 +147,11 @@ fn parse_mail_config(xml: &str, email: &str, catalog_domain: Option<&str>) -> Op
     let value = |path: &[&str]| entries.iter().find(|(p, _)| p.iter().map(String::as_str).eq(path.iter().copied())).map(|(_, v)| v.as_str());
     // A catalog response must describe the queried domain, not an unrelated
     // provider returned by a captive portal, proxy or erroneous redirect.
-    if let Some(d) = catalog_domain {
-        if !entries.iter().any(|(p, v)| p == &["clientConfig", "emailProvider", "domain"] && v.eq_ignore_ascii_case(d)) {
-            return None;
-        }
+    let declared: Vec<&str> = entries.iter().filter(|(p, _)| p.iter().map(String::as_str).eq(["clientConfig", "emailProvider", "domain"]))
+        .map(|(_, v)| v.as_str()).collect();
+    let expected = catalog_domain.map(str::to_owned).or_else(|| domain(email))?;
+    if (catalog_domain.is_some() || !declared.is_empty()) && !declared.iter().any(|v| v.eq_ignore_ascii_case(&expected)) {
+        return None;
     }
     let provider_id = value(&["clientConfig", "emailProvider", "@id"]);
     let issuer = value(&["clientConfig", "oAuth2", "issuer"]);
@@ -182,7 +185,7 @@ fn parse_mail_config(xml: &str, email: &str, catalog_domain: Option<&str>) -> Op
                 .replace("%EMAILDOMAIN%", &domain(email)?);
             if username.is_empty() || username.contains('%') { return None; }
             let auth = |method: &str| entries.iter().any(|(p, v)| {
-                p == &["clientConfig", "emailProvider", section.as_str(), "authentication"]
+                p.iter().map(String::as_str).eq(["clientConfig", "emailProvider", section.as_str(), "authentication"])
                     && v.eq_ignore_ascii_case(method)
             });
             let password = auth("password-cleartext") || auth("password-encrypted");
@@ -202,7 +205,7 @@ fn parse_mail_config(xml: &str, email: &str, catalog_domain: Option<&str>) -> Op
     // An unknown OAuth provider can still use a password/app password if
     // its published endpoints explicitly advertise that alternative.
     if let (Some(imap), Some(smtp)) = (imap.iter().find(|e| e.password), smtp.iter().find(|e| e.password)) {
-        return Some(Discovery::Mail { imap: imap.server.clone(), smtp: smtp.server.clone(), oauth_available });
+        return Some(Discovery::Mail { imap: imap.server.clone(), smtp: smtp.server.clone(), oauth_available, source: "Autoconfig" });
     }
     if imap.iter().any(|e| e.oauth) || smtp.iter().any(|e| e.oauth) {
         return Some(Discovery::OAuthRequired(display.to_owned()));
@@ -231,9 +234,61 @@ async fn mail_probe(client: &reqwest::Client, url: String, email: &str) -> Optio
     parse_mail(&xml_response(response).await?, email)
 }
 
-// Exchange discovery and authentication are entirely native.
-fn exchange_discovery(email: String, password: String, approved: Vec<String>) -> Result<Discovery, String> {
-    exchange_native::discover(&email, &password, &approved).map_err(|error| error.message().into())
+// Only the domain (or a DNS-published MX suffix), never credentials or
+// the mailbox local part, is sent to the public provider catalog.
+async fn catalog_probe(client: &reqwest::Client, key: &str, email: &str) -> Option<Discovery> {
+    let response = client.get(format!("https://autoconfig.thunderbird.net/v1.1/{key}")).send().await.ok()?;
+    parse_mail_config(&xml_response(response).await?, email, Some(key))
+}
+
+fn with_source(mut result: Discovery, source: &'static str) -> Discovery {
+    if let Discovery::Mail { source: current, .. } = &mut result { *current = source; }
+    result
+}
+
+async fn dns_srv(name: String) -> Vec<account_dns::Srv> {
+    // libc's DNS resolver is blocking. Keep it off GTK and Tokio's async
+    // workers, and bound how long the wizard waits even with dead VPN DNS.
+    let task = tokio::task::spawn_blocking(move || account_dns::srv(&name));
+    tokio::time::timeout(Duration::from_secs(8), task).await.ok().and_then(Result::ok).unwrap_or_default()
+}
+
+async fn dns_mx(name: String) -> Vec<account_dns::Mx> {
+    let task = tokio::task::spawn_blocking(move || account_dns::mx(&name));
+    tokio::time::timeout(Duration::from_secs(8), task).await.ok().and_then(Result::ok).unwrap_or_default()
+}
+
+fn srv_endpoint(email: &str, implicit: &[account_dns::Srv], starttls: &[account_dns::Srv]) -> Option<Server> {
+    // Prefer implicit TLS (RFC 8314). Only accept a published host and
+    // nonzero port; STARTTLS is mandatory on the other service records.
+    let (record, security) = implicit.first().map(|r| (r, Security::ImplicitTls))
+        .or_else(|| starttls.first().map(|r| (r, Security::StartTls)))?;
+    Some(Server { host: record.host.clone(), port: record.port, security, username: email.to_owned() })
+}
+
+async fn srv_discovery(d: &str, email: &str) -> Option<Discovery> {
+    let (imaps, imap, submissions, submission) = tokio::join!(
+        dns_srv(format!("_imaps._tcp.{d}")),
+        dns_srv(format!("_imap._tcp.{d}")),
+        dns_srv(format!("_submissions._tcp.{d}")),
+        dns_srv(format!("_submission._tcp.{d}")),
+    );
+    Some(Discovery::Mail {
+        imap: srv_endpoint(email, &imaps, &imap)?,
+        smtp: srv_endpoint(email, &submissions, &submission)?,
+        oauth_available: false,
+        source: "DNS SRV",
+    })
+}
+
+async fn mx_discovery(client: &reqwest::Client, d: &str, email: &str) -> Option<Discovery> {
+    let records = dns_mx(d.to_owned()).await;
+    let keys = account_dns::mx_catalog_domains(d, &records);
+    // Requests run concurrently but selection remains in the DNS/catalog
+    // priority order. MX is only a hint and cannot prove the mailbox lives
+    // at the returned provider (e.g. an external spam gateway).
+    let results = futures_util::future::join_all(keys.iter().map(|key| catalog_probe(client, key, email))).await;
+    results.into_iter().flatten().next().map(|r| with_source(r, "DNS MX / ISPDB"))
 }
 
 pub(crate) async fn discover(email: &str, password: &str, approved: Vec<String>) -> Result<Discovery, String> {
@@ -245,17 +300,24 @@ pub(crate) async fn discover(email: &str, password: &str, approved: Vec<String>)
         mail_probe(&client, format!("https://{d}/.well-known/autoconfig/mail/config-v1.1.xml"), email),
     );
     if let Some(result) = a.or(b) { return Ok(result); }
-    // ISPDB is a maintained provider database. Only the domain is sent to
-    // this third-party service, never the full address or a password.
-    if let Ok(response) = client.get(format!("https://autoconfig.thunderbird.net/v1.1/{d}")).send().await {
-        if let Some(xml) = xml_response(response).await {
-            if let Some(result) = parse_mail_config(&xml, email, Some(&d)) { return Ok(result); }
-        }
+    // Direct catalog entries are a stronger signal than MX inference.
+    if let Some(result) = catalog_probe(&client, &d, email).await {
+        return Ok(with_source(result, "ISPDB"));
     }
+    let (srv, mx) = tokio::join!(srv_discovery(&d, email), mx_discovery(&client, &d, email));
+    if let Some(result) = srv { return Ok(result); }
+    // Before accepting an MX-derived provider, try the actual domain's
+    // Exchange service. A successful on-premise Autodiscover (including a
+    // password/host approval prompt) wins over a third-party MX gateway.
     let address = email.to_owned();
     let password = password.to_owned();
-    tokio::task::spawn_blocking(move || exchange_discovery(address, password, approved))
-        .await.map_err(|_| "Autodiscover worker stopped")?
+    let result = tokio::task::spawn_blocking(move || exchange_native::discover(&address, &password, &approved))
+        .await.map_err(|_| "Autodiscover worker stopped")?;
+    match result {
+        Ok(result) => Ok(result),
+        Err(exchange_native::Error::NotFound) => mx.ok_or_else(|| "No mail configuration found. Check the address or network, or open Advanced server settings.".into()),
+        Err(error) => Err(error.message().into()),
+    }
 }
 
 const PORTS: [u16; 4] = [1143, 1025, 1080, 1389];
@@ -388,6 +450,20 @@ mod tests {
         assert_eq!(imap.username, "alice");
         assert_eq!(imap.security, Security::StartTls);
         assert_eq!(smtp.port, 465);
+    }
+
+    #[test]
+    fn account_setup_srv_uses_tls_and_published_ports() {
+        let implicit = [account_dns::Srv { priority: 0, weight: 1, port: 1993, host: "secure.example.test".into() }];
+        let starttls = [account_dns::Srv { priority: 0, weight: 1, port: 1587, host: "submit.example.test".into() }];
+        let selected = srv_endpoint("alice@example.test", &implicit, &starttls).unwrap();
+        assert_eq!(selected.security, Security::ImplicitTls);
+        assert_eq!(selected.port, 1993);
+        assert_eq!(selected.username, "alice@example.test");
+        let selected = srv_endpoint("alice@example.test", &[], &starttls).unwrap();
+        assert_eq!(selected.security, Security::StartTls);
+        assert_eq!(selected.port, 1587);
+        assert!(srv_endpoint("alice@example.test", &[], &[]).is_none());
     }
 
     #[test]

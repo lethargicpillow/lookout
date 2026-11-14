@@ -586,12 +586,14 @@ pub fn show_add_account_dialog(
         let approve = approve_button.clone();
         let oab = oab_entry.clone();
         let name = name_entry.clone();
+        let password = imap_password_entry.clone();
         let previous = Rc::new(RefCell::new(email_entry.text().trim().to_owned()));
         email_entry.connect_changed(move |entry| {
             let address = entry.text().trim().to_owned();
             let mut old = previous.borrow_mut();
             if *old != address {
                 if ready.replace(false) {
+                    password.set_text("");
                     oab.set_text("");
                     if name.text().as_str() == old.as_str() { name.set_text(""); }
                 }
@@ -717,16 +719,19 @@ pub fn show_add_account_dialog(
                     refresh();
                     if email.text().trim() != address { status.set_label("Email changed. Find settings again."); return; }
                     match result {
-                        Ok(Ok(Discovery::Mail { imap, smtp, oauth_available })) => {
+                        Ok(Ok(Discovery::Mail { imap, smtp, oauth_available, source })) => {
                             oab.set_text("");
+                            let endpoints = format!("{source}: IMAP {}:{}, SMTP {}:{}", imap.host, imap.port, smtp.host, smtp.port);
                             apply(imap, smtp);
                             ready.set(true);
                             refresh();
-                            status.set_label(if oauth_available {
-                                "Mail settings found. Use a password or an app password supported by your provider, then add the account."
+                            let instruction = if oauth_available {
+                                "Use a password or app password supported by your provider."
                             } else {
-                                "Mail settings found. Enter your password (or app password), then add the account."
-                            });
+                                "Enter your password or app password."
+                            };
+                            status.set_label(&format!("{endpoints}
+{instruction} Confirm these settings by adding the account."));
                             if password.text().is_empty() { password.grab_focus(); }
                         }
                         Ok(Ok(Discovery::Exchange { ews: Some(_), oab: discovered_oab })) => {
@@ -753,11 +758,13 @@ pub fn show_add_account_dialog(
                         }
                         Ok(Ok(Discovery::OAuthRequired(provider))) => {
                             password.set_text("");
-                            status.set_label(&format!("{provider} requires OAuth2. Lookout does not yet have an OAuth sign-in adapter for this provider. Use a supported Online Accounts provider if available."));
+                            status.set_label(&format!("{provider} requires OAuth2. Choose its sign-in in Online Accounts if supported by your system. Otherwise a registered OAuth client is required."));
+                            oauth_worker.spawn(crate::online_accounts::open_online_accounts());
                         }
                         Ok(Ok(Discovery::Microsoft365)) => {
                             password.set_text("");
-                            status.set_label("Microsoft 365 detected. Use the Microsoft 365 sign-in option in Accounts (OAuth).");
+                            status.set_label("Microsoft 365 detected. Sign in to Microsoft in Online Accounts. Lookout will complete mail authorization.");
+                            oauth_worker.spawn(crate::online_accounts::open_online_accounts());
                         }
                         Ok(Err(message)) => status.set_label(&message),
                         Err(_) => status.set_label("Discovery stopped. Try again."),

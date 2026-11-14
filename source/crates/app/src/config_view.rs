@@ -649,13 +649,13 @@ pub fn build() -> ConfigView {
     let accounts_group = adw::PreferencesGroup::builder().title("Accounts").build();
     let add_account_row = adw::ActionRow::builder()
         .title("Add account…")
-        .subtitle("Open GNOME Online Accounts settings")
+        .subtitle("Automatically detect mail settings and sign in")
         .activatable(true)
         .build();
     accounts_group.add(&add_account_row);
     let add_imap_row = adw::ActionRow::builder()
-        .title("Add IMAP/SMTP account…")
-        .subtitle("Connect a mail account not managed by GNOME Online Accounts")
+        .title("Online Accounts settings…")
+        .subtitle("Manage system sign-ins and connected services")
         .activatable(true)
         .build();
     accounts_group.add(&add_imap_row);

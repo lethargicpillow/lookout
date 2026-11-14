@@ -159,17 +159,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let status_page = adw::StatusPage::builder()
         .icon_name("mail-unread-symbolic")
         .title("No Mail Accounts")
-        .description("Add an account with Mail enabled in GNOME Online Accounts to get started.")
+        .description("Add a mail account to get started.")
         .build();
     let open_settings_button = gtk::Button::builder()
-        .label("Open Online Accounts Settings")
+        .label("Add account")
         .halign(gtk::Align::Center)
         .css_classes(["suggested-action", "pill"])
         .build();
-    open_settings_button.connect_clicked({
-        let worker = worker.clone();
-        move |_| worker.spawn(crate::online_accounts::open_online_accounts())
-    });
     // The first-run route for Evolution users (EDS_TODO.md E3.4); hidden
     // until the background check finds an account to import.
     let import_evolution_button = gtk::Button::builder()
@@ -5039,11 +5035,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // Options section exists; Add Account opens GNOME Online Accounts, where
     // Lookout's accounts come from.
     let add_account_button = gtk::Button::from_icon_name("list-add-symbolic");
-    add_account_button.set_tooltip_text(Some("Add account (GNOME Online Accounts)"));
-    {
-        let worker = worker.clone();
-        add_account_button.connect_clicked(move |_| worker.spawn(crate::online_accounts::open_online_accounts()));
-    }
+    add_account_button.set_tooltip_text(Some("Add account"));
     let account_settings_button = gtk::Button::from_icon_name("preferences-system-symbolic");
     account_settings_button.set_tooltip_text(Some("Account settings"));
     let send_receive_tab_button = send_receive_all_button(&state);
@@ -9841,9 +9833,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     }
 
     {
-        let add_account_row = config_view.add_account_row.clone();
+        let online_accounts_row = config_view.add_imap_row.clone();
         let worker = worker.clone();
-        add_account_row.connect_activated(move |_| {
+        online_accounts_row.connect_activated(move |_| {
             worker.spawn(crate::online_accounts::open_online_accounts());
         });
     }
@@ -11556,25 +11548,29 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         })
     };
 
-    // Config → Accounts → "Add IMAP/SMTP account…": the app's own manual
-    // account entry point, alongside the GOA-settings "Add account…" row.
+    // Every Add Account entry point opens the same discovery wizard.
+    // System account management is a separate settings action.
     {
         let worker = worker.clone();
         let state = state.clone();
         let keyring = keyring.clone();
         let connect_new_other_account = connect_new_other_account.clone();
-        config_view.add_imap_row.connect_activated(move |row| {
+        let open: Rc<dyn Fn(&gtk::Widget)> = Rc::new(move |anchor| {
             let app_config = state.borrow().app_config.clone();
             crate::other_accounts::show_add_account_dialog(
-                row.upcast_ref::<gtk::Widget>(),
-                worker.clone(),
-                app_config,
-                keyring.clone(),
-                None,
-                None,
-                connect_new_other_account.clone(),
+                anchor, worker.clone(), app_config, keyring.clone(),
+                None, None, connect_new_other_account.clone(),
             );
         });
+        config_view.add_account_row.connect_activated({
+            let open = open.clone();
+            move |row| open(row.upcast_ref())
+        });
+        open_settings_button.connect_clicked({
+            let open = open.clone();
+            move |button| open(button.upcast_ref())
+        });
+        add_account_button.connect_clicked(move |button| open(button.upcast_ref()));
     }
 
     // "Import from Evolution…" (EDS_TODO.md E3.4), in Config → Accounts and on

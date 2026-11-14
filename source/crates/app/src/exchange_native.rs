@@ -773,121 +773,20 @@ pub(super) fn discover(
     discover_with(&mut transport, email, password, approved)
 }
 
-// Use the OS resolver on GNU/Linux, including its configured VPN DNS and
-// search policy. Only HTTPS SRV targets on port 443 are accepted.
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+// Reuse the bounded system DNS resolver shared by IMAP/SMTP discovery.
 fn lookup_srv(host: &str) -> Vec<Url> {
-    use std::ffi::{c_char, c_int, CString};
-    #[link(name = "resolv")]
-    extern "C" {
-        fn res_query(
-            name: *const c_char,
-            class: c_int,
-            kind: c_int,
-            answer: *mut u8,
-            answer_len: c_int,
-        ) -> c_int;
-    }
-    let Ok(name) = CString::new(format!("_autodiscover._tcp.{host}.")) else {
-        return Vec::new();
-    };
-    let mut packet = vec![0u8; 65535];
-    // SAFETY: both pointers refer to live allocations, the C string is
-    // NUL-terminated, and answer_len is the exact writable buffer size.
-    let len = unsafe { res_query(name.as_ptr(), 1, 33, packet.as_mut_ptr(), packet.len() as c_int) };
-    if len <= 0 || len as usize > packet.len() {
-        return Vec::new();
-    }
-    parse_srv(&packet[..len as usize]).unwrap_or_default()
+    srv_urls(super::account_dns::srv(&format!("_autodiscover._tcp.{host}")))
 }
 
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-fn lookup_srv(_host: &str) -> Vec<Url> {
-    Vec::new()
+fn srv_urls(records: Vec<super::account_dns::Srv>) -> Vec<Url> {
+    records.into_iter().filter(|r| r.port == 443)
+        .filter_map(|r| secure_url(&format!("https://{}{PATH}", r.host)))
+        .take(8).collect()
 }
 
-fn dns_u16(packet: &[u8], i: usize) -> Option<u16> {
-    Some(u16::from_be_bytes([*packet.get(i)?, *packet.get(i + 1)?]))
-}
-
-// DNS compression can reference a previous label. Bound both the number of
-// jumps and the expanded name so malformed packets cannot loop or allocate
-// without limit. The returned offset is the end of the original wire name.
-fn dns_name(packet: &[u8], start: usize) -> Option<(String, usize)> {
-    let mut pos = start;
-    let mut end = None;
-    let mut name = String::new();
-    for _ in 0..128 {
-        let count = *packet.get(pos)? as usize;
-        if count == 0 {
-            return Some((name, end.unwrap_or(pos + 1)));
-        }
-        if count & 0xc0 == 0xc0 {
-            let next = ((count & 0x3f) << 8) | *packet.get(pos + 1)? as usize;
-            if next >= pos {
-                return None;
-            }
-            end.get_or_insert(pos + 2);
-            pos = next;
-            continue;
-        }
-        if count > 63 {
-            return None;
-        }
-        let label = std::str::from_utf8(packet.get(pos + 1..pos + 1 + count)?).ok()?;
-        if !name.is_empty() {
-            name.push('.');
-        }
-        name.push_str(label);
-        if name.len() > 253 {
-            return None;
-        }
-        pos += count + 1;
-    }
-    None
-}
-
+#[cfg(test)]
 fn parse_srv(packet: &[u8]) -> Option<Vec<Url>> {
-    let flags = dns_u16(packet, 2)?;
-    if flags & 0x8000 == 0 || flags & 0x020f != 0 {
-        return None;
-    }
-    let questions = dns_u16(packet, 4)? as usize;
-    let answers = dns_u16(packet, 6)? as usize;
-    if questions > 16 || answers > 256 {
-        return None;
-    }
-    let mut pos = 12;
-    for _ in 0..questions {
-        let (_, end) = dns_name(packet, pos)?;
-        pos = end + 4;
-        packet.get(..pos)?;
-    }
-    let mut records = Vec::new();
-    for _ in 0..answers {
-        let (_, end) = dns_name(packet, pos)?;
-        let kind = dns_u16(packet, end)?;
-        let class = dns_u16(packet, end + 2)?;
-        let length = dns_u16(packet, end + 8)? as usize;
-        let start = end + 10;
-        pos = start + length;
-        packet.get(..pos)?;
-        if kind != 33 || class != 1 || length < 7 {
-            continue;
-        }
-        let priority = dns_u16(packet, start)?;
-        let weight = dns_u16(packet, start + 2)?;
-        let port = dns_u16(packet, start + 4)?;
-        let (host, target_end) = dns_name(packet, start + 6)?;
-        if port == 443 && target_end == pos {
-            if let Some(url) = secure_url(&format!("https://{host}{PATH}")) {
-                records.push((priority, std::cmp::Reverse(weight), url));
-            }
-        }
-    }
-    records.sort_by_key(|(priority, weight, _)| (*priority, *weight));
-    let mut seen = HashSet::new();
-    Some(records.into_iter().map(|(_, _, u)| u).filter(|u| seen.insert(u.clone())).take(8).collect())
+    super::account_dns::parse_srv(packet, None).map(srv_urls)
 }
 
 #[cfg(test)]
@@ -1050,6 +949,6 @@ mod tests {
         let urls = parse_srv(&packet).unwrap();
         assert_eq!(urls[0].as_str(), "https://mail.example.test/autodiscover/autodiscover.xml");
         assert!(parse_srv(&packet[..packet.len() - 1]).is_none());
-        assert!(dns_name(&[0xc0, 0], 0).is_none());
+        assert!(super::super::account_dns::dns_name(&[0xc0, 0], 0).is_none());
     }
 }
