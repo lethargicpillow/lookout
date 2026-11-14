@@ -53,6 +53,8 @@ const IDLE_SLICE: Duration = Duration::from_secs(25 * 60);
 const NORMAL_PREFETCH_INTERVAL: Duration = Duration::from_secs(5);
 /// A usable connection lasting this long resets the primary reconnect delay.
 const STABLE_SESSION_DURATION: Duration = Duration::from_secs(60);
+/// Initial delay shared by the primary reconnect loop and its recovery policy.
+const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Poll servers without the optional IMAP IDLE extension.
 const NO_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -1630,7 +1632,6 @@ pub async fn run_account_session(
         }
     });
 
-    const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
     let mut backoff = INITIAL_BACKOFF;
     const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
