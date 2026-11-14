@@ -941,7 +941,9 @@ mod tests {
 
     #[test]
     fn native_exchange_curl_has_ntlm() {
-        assert!(curl::Version::get().feature_ntlm(), "the bundled curl must include NTLM");
+        let version = curl::Version::get();
+        assert!(version.vendored(), "expected bundled libcurl, got {}", version.version());
+        assert!(version.feature_ntlm(), "libcurl {} lacks NTLM; check source/.cargo/config.toml and CFLAGS", version.version());
     }
 
     struct Fake {

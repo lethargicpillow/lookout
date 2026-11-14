@@ -1,0 +1,7 @@
+# curl-sys 0.4.91 compiles the NTLM source files with its ntlm feature,
+# but does not define the positive feature macros required by libcurl 8.22.
+# The bundled OpenSSL backend on our Linux targets provides DES_ecb_encrypt.
+# Keep these flags local to the workspace build, not the system curl or SSL
+# configuration. If overriding CFLAGS for a custom build, retain both defines.
+[env]
+CFLAGS = { value = "-DCURL_ENABLE_NTLM=1 -DHAVE_DES_ECB_ENCRYPT=1", force = false }

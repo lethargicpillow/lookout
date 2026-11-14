@@ -2318,6 +2318,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "curl",
+ "curl-sys",
  "futures-util",
  "getrandom 0.2.17",
  "gtk4",

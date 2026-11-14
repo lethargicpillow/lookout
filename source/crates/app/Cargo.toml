@@ -33,8 +33,11 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 reqwest = { workspace = true, features = ["form", "json"] }
 quick-xml = "0.41"
-# Bundled libcurl explicitly enables NTLM, independently of the distro curl.
+# Bundled libcurl for legacy Exchange NTLM; source/.cargo/config.toml
+# supplies the native feature definitions missing in curl-sys 0.4.91.
 curl = { version = "=0.4.51", features = ["static-curl", "ntlm"] }
+# Do not silently resolve to a later libcurl with NTLM removed.
+curl-sys = "=0.4.91"
 base64.workspace = true
 sha2.workspace = true
 getrandom.workspace = true
