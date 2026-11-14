@@ -106,6 +106,56 @@ pub fn summary_from_fetch(mailbox: &MailboxId, fetch: &Fetch) -> Option<EmailSum
     })
 }
 
+/// Fallback for a server which lists a live UID but does not supply a
+/// usable ENVELOPE. Parse actual RFC 5322 headers, without requesting
+/// BODYSTRUCTURE or the full MIME payload.
+pub(crate) fn summary_from_header_fetch(mailbox: &MailboxId, fetch: &Fetch) -> Option<EmailSummary> {
+    let uid = Uid(fetch.uid?);
+    let raw = fetch.header()?;
+    let (flags, keywords) = flags_from_fetch(fetch);
+    header_summary(mailbox, uid, raw, fetch.internal_date().map(|d| d.with_timezone(&Utc)), fetch.size.unwrap_or(0), flags, keywords)
+}
+
+fn header_summary(
+    mailbox: &MailboxId, uid: Uid, raw: &[u8], internal_date: Option<DateTime<Utc>>,
+    size: u32, flags: BTreeSet<SystemFlagBit>, keywords: BTreeSet<String>,
+) -> Option<EmailSummary> {
+    use mail_parser::{Address, HeaderValue, MessageParser};
+    let message = MessageParser::default().parse_headers(raw)?;
+    let headers = selected_headers(Some(raw));
+    let addresses = |key: &str| -> Vec<EmailAddress> {
+        let list: Vec<&mail_parser::Addr<'_>> = match message.header(key) {
+            Some(HeaderValue::Address(Address::List(list))) => list.iter().collect(),
+            Some(HeaderValue::Address(Address::Group(groups))) => groups.iter().flat_map(|g| g.addresses.iter()).collect(),
+            _ => Vec::new(),
+        };
+        list.into_iter().filter_map(|a| Some(EmailAddress {
+            address: a.address.as_deref()?.to_owned(),
+            name: a.name.as_deref().filter(|n| !n.trim().is_empty()).map(str::to_owned),
+        })).collect()
+    };
+    let field = |name: &str| header_value(&headers, name).map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned);
+    let date = field("Date").and_then(|d| DateTime::parse_from_rfc2822(&d).ok()).map(|d| d.with_timezone(&Utc))
+        .or(internal_date).unwrap_or_else(Utc::now);
+    Some(EmailSummary {
+        inference_classification: Default::default(),
+        uid, mailbox: mailbox.clone(),
+        message_id: field("Message-ID"), in_reply_to: field("In-Reply-To"),
+        references: field("References").map(|r| r.split_whitespace().map(str::to_owned).collect()).unwrap_or_default(),
+        thread_key: ThreadKey(String::new()),
+        subject: message.subject().map(str::to_owned),
+        from: addresses("from"), to: addresses("to"), cc: addresses("cc"),
+        date, flags, keywords, size,
+        // Unknown structure: the normal full MIME on-demand path will
+        // recover attachments and calendar content when opened.
+        has_attachment: false, has_calendar: false, structure: None,
+        preview: None, mentions: false,
+        importance: importance_from_headers(&headers).unwrap_or_default(),
+        sensitivity: sensitivity_from_headers(&headers).unwrap_or_default(),
+        list_id: field("List-Id"),
+    })
+}
+
 /// Parses the raw `BODY.PEEK[HEADER.FIELDS (...)]` section the envelope fetch
 /// requests alongside the envelope into the `(name, value)` pairs the interop
 /// readers expect. Delegates to [`crate::body::parse_headers_section`] (same
@@ -154,6 +204,21 @@ fn imap_flag_to_string(flag: &async_imap::types::Flag<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn header_fallback_preserves_real_message_metadata() {
+        let mailbox = MailboxId::new(&lookout_core::AccountId("test".into()), "INBOX");
+        let raw = b"From: Alice <alice@example.test>\r\nTo: Bob <bob@example.test>\r\nSubject: =?UTF-8?Q?Hello_World?=\r\nMessage-ID: <id@example.test>\r\nReferences: <a@example.test> <b@example.test>\r\nDate: Wed, 10 Jun 2026 19:30:00 +0000\r\n\r\n";
+        let summary = header_summary(&mailbox, Uid(1570), raw, None, 123, BTreeSet::from([SystemFlagBit::Seen]), BTreeSet::new()).unwrap();
+        assert_eq!(summary.uid, Uid(1570));
+        assert_eq!(summary.subject.as_deref(), Some("Hello World"));
+        assert_eq!(summary.from[0].address, "alice@example.test");
+        assert_eq!(summary.to[0].address, "bob@example.test");
+        assert_eq!(summary.message_id.as_deref(), Some("<id@example.test>"));
+        assert_eq!(summary.references.len(), 2);
+        assert!(summary.flags.contains(&SystemFlagBit::Seen));
+        assert!(summary.structure.is_none());
+    }
 
     #[test]
     fn decodes_utf8_b_encoded_subject() {

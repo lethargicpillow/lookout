@@ -14,7 +14,7 @@ use crate::auth::XOAuth2Authenticator;
 use crate::body::{parse_body, preview_from_raw};
 use crate::config::{AccountConfig, Credential, Security};
 use crate::connection::{connect_plain, connect_tls, tls_connect_over, SessionStream};
-use crate::envelope::{flags_from_fetch, summary_from_fetch};
+use crate::envelope::{flags_from_fetch, summary_from_fetch, summary_from_header_fetch};
 use crate::error::{Error, Result};
 use crate::search_query::{imap_quote, SearchQuery};
 use crate::send::{build_draft_raw_message, send_smtp, ComposedMessage, OutboxMessage};
@@ -7816,7 +7816,11 @@ async fn sync_mailbox(
     .and_then(|r| r.ok())
     .unwrap_or_default();
     let baseline = folders.iter().find(|f| f.id == *mailbox_id).and_then(|f| f.highest_modseq);
-    let delta = already_selected && condstore && baseline.is_some();
+    // A previously incomplete metadata snapshot must not use QRESYNC's
+    // cached-membership shortcut: unresolved live UIDs would disappear.
+    let complete_membership = folders.iter().find(|f| f.id == *mailbox_id)
+        .is_some_and(|f| f.total as usize == cached.len());
+    let delta = already_selected && condstore && baseline.is_some() && complete_membership;
     tracing::debug!(account = %account_id, mailbox = %folder_path, cached = cached.len(), delta, "requesting mailbox flags");
     let flags = async {
         let rows: Vec<Fetch> = if delta {
@@ -7909,6 +7913,7 @@ async fn sync_mailbox(
         let cached_uids: HashSet<Uid> = cached.keys().copied().collect();
         present_uids.difference(&cached_uids).copied().collect()
     };
+    let mut unresolved_envelopes = 0usize;
     // Full `ENVELOPE`/`BODYSTRUCTURE` fetch, but only for UIDs this mailbox
     // hasn't cached yet - new arrivals, or the first sync since a
     // `UIDVALIDITY` change invalidated everything cached. `BODYSTRUCTURE`
@@ -7969,19 +7974,18 @@ async fn sync_mailbox(
             }
 
             // A server can omit a response for an expunged UID or fail to
-            // return an envelope. Retry missing live UIDs in smaller
-            // batches, then distinguish expunge from incomplete
-            // data before replacing the authoritative folder snapshot.
+            // return an envelope. Try a genuinely different request using
+            // RFC 5322 headers, not the same failing ENVELOPE/BODYSTRUCTURE.
             let missing: Vec<Uid> = new_uids.iter().copied().filter(|uid| !received.contains(uid)).collect();
             if !missing.is_empty() {
                 tracing::info!(account = %account_id, mailbox = %folder_path, missing = missing.len(), "checking missing message envelopes");
                 let live = imap_sync_step(account_id, "UID SEARCH missing envelopes", uids_still_present(session, &missing)).await?;
                 for group in live.chunks(20) {
                     for set in uid_set_chunks(group) {
-                        let fetches: Vec<Fetch> = imap_sync_step(account_id, "UID FETCH missing envelopes", async {
-                            Ok(session.uid_fetch(&set, envelope_fetch_items(false)).await?.try_collect().await?)
+                        let fetches: Vec<Fetch> = imap_sync_step(account_id, "UID FETCH HEADER fallback", async {
+                            Ok(session.uid_fetch(&set, "(UID FLAGS RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER])").await?.try_collect().await?)
                         }).await?;
-                        let batch: Vec<EmailSummary> = fetches.iter().filter_map(|f| summary_from_fetch(mailbox_id, f))
+                        let batch: Vec<EmailSummary> = fetches.iter().filter_map(|f| summary_from_header_fetch(mailbox_id, f))
                             .filter(|m| wanted.contains(&m.uid) && received.insert(m.uid)).collect();
                         persist_envelope_checkpoint(cache, mailbox_id, uidvalidity, &batch).await;
                         new_messages.extend(batch);
@@ -7991,8 +7995,11 @@ async fn sync_mailbox(
                 if !missing.is_empty() {
                     let still_live = imap_sync_step(account_id, "UID SEARCH unresolved envelopes", uids_still_present(session, &missing)).await?;
                     if !still_live.is_empty() {
-                        tracing::warn!(account = %account_id, mailbox = %folder_path, missing = still_live.len(), first_uid = still_live[0].0, "server omitted live message envelopes; preserving checkpoint");
-                        return Err(Error::Io(std::io::Error::other("IMAP server omitted live message envelopes; synchronization will resume")));
+                        unresolved_envelopes = still_live.len();
+                        // These UIDs are new, not existing cached rows. Keep
+                        // all known messages usable and retry missing UIDs
+                        // during the next full membership sync.
+                        tracing::warn!(account = %account_id, mailbox = %folder_path, missing = unresolved_envelopes, first_uid = still_live[0].0, "some live envelopes unavailable; publishing available mail");
                     }
                 }
             }
@@ -8115,8 +8122,11 @@ async fn sync_mailbox(
     // The unread count comes straight from the flags this sync fetched, and
     // the total from the fetch size (see the folder update after the
     // previews).
-    let total = messages.len() as u32;
+    let total = messages.len() as u32 + unresolved_envelopes as u32;
     let unread = messages.iter().filter(|m| m.is_unread()).count() as u32;
+    if unresolved_envelopes != 0 {
+        tracing::info!(account = %account_id, mailbox = %folder_path, available = messages.len(), unresolved = unresolved_envelopes, "mailbox available with incomplete metadata");
+    }
 
     // Phase two: cache the sync's genuinely-new messages' bodies immediately.
     // The envelope pass already learned each new uid's `BODYSTRUCTURE`, so
