@@ -414,37 +414,9 @@ impl DavClient {
         credential: &Credential,
         cached: &std::collections::HashMap<String, Option<String>>,
     ) -> Result<(Vec<String>, Vec<ContactRecord>)> {
-        use std::collections::{HashMap, HashSet};
+        use std::collections::HashMap;
         let url = self.resolve(&book.href)?;
-        let rows = self.propfind(url.clone(), 1, credential, &["D:getetag", "D:resourcetype"]).await?;
-        let mut own_seen = false;
-        let mut members = HashMap::new();
-        let mut canonical = HashSet::new();
-        let mut prefix = url.path().trim_end_matches('/').to_owned();
-        prefix.push('/');
-        for row in rows {
-            if row.href.is_empty() || row.status.as_deref().is_some_and(|s| !s.split_whitespace().nth(1).is_some_and(|code| code.starts_with('2'))) {
-                return Err(Error::Discovery("incomplete addressbook member listing".into()));
-            }
-            let member_url = url.join(&row.href).map_err(|_| Error::Discovery("invalid addressbook href".into()))?;
-            if member_url.origin() != url.origin() {
-                return Err(Error::Discovery("addressbook member outside server origin".into()));
-            }
-            if member_url.path().trim_end_matches('/') == url.path().trim_end_matches('/') {
-                own_seen = true;
-                continue;
-            }
-            if !member_url.path().starts_with(&prefix) || !canonical.insert(member_url.to_string()) {
-                return Err(Error::Discovery("unexpected or duplicate addressbook member".into()));
-            }
-            let etag = row.prop(NS_DAV, "getetag").filter(|v| !v.is_empty())
-                .ok_or_else(|| Error::Discovery("addressbook member has no ETag".into()))?
-                .to_owned();
-            members.insert(row.href, etag);
-        }
-        if !own_seen {
-            return Err(Error::Discovery("addressbook listing did not include its collection".into()));
-        }
+        let members = self.addressbook_etag_members(&url, credential).await?;
         let mut hrefs: Vec<String> = members.keys().cloned().collect();
         hrefs.sort();
         let changed: Vec<String> = hrefs.iter().filter(|href| {
@@ -479,6 +451,44 @@ impl DavClient {
             }
         }
         Ok((hrefs, records))
+    }
+
+    /// A verified membership listing, shared by ETag sync and the
+    /// reconciliation of a DELETE that returned 404.
+    async fn addressbook_etag_members(
+        &self, url: &reqwest::Url, credential: &Credential,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        use std::collections::{HashMap, HashSet};
+        let rows = self.propfind(url.clone(), 1, credential, &["D:getetag", "D:resourcetype"]).await?;
+        let mut own_seen = false;
+        let mut members = HashMap::new();
+        let mut canonical = HashSet::new();
+        let mut prefix = url.path().trim_end_matches('/').to_owned();
+        prefix.push('/');
+        for row in rows {
+            if row.href.is_empty() || row.status.as_deref().is_some_and(|s| !s.split_whitespace().nth(1).is_some_and(|code| code.starts_with('2'))) {
+                return Err(Error::Discovery("incomplete addressbook member listing".into()));
+            }
+            let member_url = url.join(&row.href).map_err(|_| Error::Discovery("invalid addressbook href".into()))?;
+            if member_url.origin() != url.origin() {
+                return Err(Error::Discovery("addressbook member outside server origin".into()));
+            }
+            if member_url.path().trim_end_matches('/') == url.path().trim_end_matches('/') {
+                own_seen = true;
+                continue;
+            }
+            if !member_url.path().starts_with(&prefix) || !canonical.insert(member_url.to_string()) {
+                return Err(Error::Discovery("unexpected or duplicate addressbook member".into()));
+            }
+            let etag = row.prop(NS_DAV, "getetag").filter(|v| !v.is_empty())
+                .ok_or_else(|| Error::Discovery("addressbook member has no ETag".into()))?
+                .to_owned();
+            members.insert(row.href, etag);
+        }
+        if !own_seen {
+            return Err(Error::Discovery("addressbook listing did not include its collection".into()));
+        }
+        Ok(members)
     }
 
     pub fn uses_davmail_contacts(&self) -> bool {
@@ -861,7 +871,42 @@ impl DavClient {
     /// changed since it was fetched fails loudly instead of silently removing
     /// a concurrent edit.
     pub async fn delete_contact_vcard(&self, href: &str, credential: &Credential, etag: Option<&str>) -> Result<()> {
-        self.delete_object(href, credential, etag).await
+        if self.uses_google_contacts() {
+            self.delete_contact_reconciled(href, credential, etag).await
+        } else {
+            self.delete_object(href, credential, etag).await
+        }
+    }
+
+    // Google may return 404 for a contact removed since the last poll.
+    // Never treat 404 alone as proof of deletion: confirm against the
+    // collection's current membership, without trying invented contact URIs.
+    async fn delete_contact_reconciled(&self, href: &str, credential: &Credential, etag: Option<&str>) -> Result<()> {
+        let url = self.resolve(href)?;
+        if url.origin() != self.base_url.origin() || url.path().ends_with('/') || url.query().is_some() || url.fragment().is_some() {
+            return Err(Error::Discovery("invalid contact resource for deletion".into()));
+        }
+        let mut headers = Vec::new();
+        if let Some(etag) = etag {
+            headers.push(("If-Match", if_match_value(etag)));
+        }
+        let response = self.send_body_request_with_not_found("DELETE", url.clone(), credential, None, &headers, true).await?;
+        let status = response.status();
+        drop(response.text().await?);
+        if status.is_success() {
+            return Ok(());
+        }
+        // Only HTTP 404 can reach this branch.
+        let book = url.join(".").map_err(|_| Error::Discovery("invalid contact collection URL".into()))?;
+        let members = self.addressbook_etag_members(&book, credential).await?;
+        for member in members.keys() {
+            let member_url = book.join(member).map_err(|_| Error::Discovery("invalid contact membership href".into()))?;
+            if member_url == url {
+                return Err(Error::Discovery("Google refused deletion (HTTP 404), but the contact is still listed. The address book will be refreshed; no local deletion was made.".into()));
+            }
+        }
+        tracing::debug!("Google CardDAV DELETE 404: contact absent from verified membership");
+        Ok(())
     }
 
     /// Stores `body` as an object at `href` via `PUT` with a `Content-Type`
@@ -952,6 +997,20 @@ impl DavClient {
         body: Option<Vec<u8>>,
         extra_headers: &[(&str, String)],
     ) -> Result<reqwest::Response> {
+        self.send_body_request_with_not_found(method_name, url, credential, body, extra_headers, false).await
+    }
+
+    /// Keep the HTTP status for the contact DELETE reconciliation only.
+    /// Every other caller retains the existing non-2xx error semantics.
+    async fn send_body_request_with_not_found(
+        &self,
+        method_name: &str,
+        url: reqwest::Url,
+        credential: &Credential,
+        body: Option<Vec<u8>>,
+        extra_headers: &[(&str, String)],
+        accept_not_found: bool,
+    ) -> Result<reqwest::Response> {
         if Self::is_local_davmail(&self.base_url) && url.origin() != self.base_url.origin() {
             return Err(Error::Discovery("DavMail href points outside the local bridge".into()));
         }
@@ -979,6 +1038,9 @@ impl DavClient {
         let response = req.send().await?;
         let status = response.status();
         if !status.is_success() {
+            if accept_not_found && status == reqwest::StatusCode::NOT_FOUND {
+                return Ok(response);
+            }
             let text = response.text().await?;
             tracing::debug!("DAV {method_name} {request_url} -> {status}, body:\n{text}");
             // `error_for_status()` would discard the response body here -
@@ -1071,6 +1133,33 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+
+    #[tokio::test]
+    async fn contact_delete_404_reconciles_only_verified_absence() {
+        let server = MockServer::start().await;
+        let listing = r#"<D:multistatus xmlns:D="DAV:">
+          <D:response><D:href>/book/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
+          <D:response><D:href>/book/live</D:href><D:propstat><D:prop><D:getetag>"live"</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
+          </D:multistatus>"#;
+        for contact in ["/book/missing", "/book/live"] {
+            Mock::given(method("DELETE")).and(path(contact))
+                .and(wiremock::matchers::header("If-Match", "\"old\""))
+                .respond_with(ResponseTemplate::new(404)).mount(&server).await;
+        }
+        Mock::given(method("PROPFIND")).and(path("/book/"))
+            .respond_with(ResponseTemplate::new(207).set_body_string(listing)).mount(&server).await;
+        let client = DavClient::new(&server.uri(), false, "user".into()).unwrap();
+        let cred = Credential::Password("test".into());
+        assert!(client.delete_contact_reconciled("/book/missing", &cred, Some("\"old\"")).await.is_ok());
+        let err = client.delete_contact_reconciled("/book/live", &cred, Some("\"old\"")).await.unwrap_err();
+        assert!(err.to_string().contains("still listed"));
+        // Generic CardDAV deletion still surfaces 404.
+        assert!(client.delete_contact_vcard("/book/missing", &cred, Some("\"old\"")).await.is_err());
+        // A 404 with no verified collection listing is never success.
+        Mock::given(method("DELETE")).and(path("/unknown/missing"))
+            .respond_with(ResponseTemplate::new(404)).mount(&server).await;
+        assert!(client.delete_contact_reconciled("/unknown/missing", &cred, None).await.is_err());
+    }
 
     #[tokio::test]
     async fn etag_snapshot_fetches_only_changed_contacts_and_rejects_partial_response() {

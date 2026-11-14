@@ -2748,10 +2748,14 @@ pub fn sync_contacts_account(
                             Some(client) => graph_delete_contact(client, &href, etag.as_deref()).await,
                             None => delete_contact(goa_client.clone(), account.clone(), href, etag).await,
                         };
-                        let _ = reply.send(result.clone()).await;
-                        if result.is_ok() {
+                        // Refresh Google even after a refused delete: its
+                        // membership may have changed since the UI snapshot.
+                        // The sync's verified listing, not a failed mutation,
+                        // decides whether a cached record can be removed.
+                        if result.is_ok() || (graph.is_none() && account.provider_type.as_deref() == Some("google")) {
                             resync = true;
                         }
+                        let _ = reply.send(result).await;
                     }
                     ContactCommand::Refresh => {
                         resync = true;
