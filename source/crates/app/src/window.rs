@@ -18,7 +18,7 @@ use webkit::prelude::*;
 use crate::calendar_colors;
 use crate::calendar_view::{self};
 use crate::contacts_view::{
-    contact_identity, delete_contact_entries, export_current_contacts, find_contact_by_address, microsoft_graph_contacts_account, rebuild_contacts_list_ui,
+    delete_contact_entries, export_current_contacts, find_contact_by_address, microsoft_graph_contacts_account, rebuild_contacts_list_ui,
     refresh_contacts_category_ui, show_contact_details_dialog, show_contact_editor_for, show_contacts_import_dialog, show_create_contact_for, show_manage_groups_dialog,
     show_new_contact_editor, spawn_contacts_discovery, sync_contacts_account, ContactCommand, ContactFileFormat, ContactsCategoryChoice, ContactsListEntry,
 };
@@ -7924,9 +7924,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     let contacts_categories: Rc<RefCell<Vec<ContactsCategoryChoice>>> = Rc::new(RefCell::new(Vec::new()));
     let contacts_entries: Rc<RefCell<Vec<ContactsListEntry>>> = Rc::new(RefCell::new(Vec::new()));
-    // Which contacts are checked in the right-hand list, keyed the same way
-    // as `starred_contacts` (`(account_id, identity)`), so a selection
-    // survives the list's full rebuilds. Pruned to the visible entries inside
+    // Checked contacts use (account_id, resource key), independently of
+    // favourites, so duplicate vCard identities cannot select other cards.
+    // The selection survives rebuilds and is pruned to visible entries inside
     // `rebuild_contacts_list_ui`; drives the ribbon's Edit/Delete via
     // `refresh_contacts_actions`.
     let contacts_selected: Rc<RefCell<HashSet<(AccountId, String)>>> = Rc::new(RefCell::new(HashSet::new()));
@@ -7940,7 +7940,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let entries = contacts_entries.borrow();
             let selected_entries: Vec<ContactsListEntry> = entries
                 .iter()
-                .filter(|entry| contacts_selected.borrow().contains(&(entry.account_id.clone(), contact_identity(entry.card()))))
+                .filter(|entry| contacts_selected.borrow().contains(&entry.selection_key()))
                 .cloned()
                 .collect();
             // Edit needs exactly one selected contact; Delete any number.
@@ -8578,7 +8578,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let address = contacts_entries
                 .borrow()
                 .iter()
-                .find(|entry| contacts_selected.borrow().contains(&(entry.account_id.clone(), contact_identity(entry.card()))))
+                .find(|entry| contacts_selected.borrow().contains(&entry.selection_key()))
                 .and_then(|entry| entry.card().emails.first().map(|email| email.address.clone()));
             if let Some(address) = address {
                 send_email(&lookout_core::EmailAddress { name: None, address }, None);
@@ -8598,7 +8598,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let Some(entry) = contacts_entries
                 .borrow()
                 .iter()
-                .find(|entry| contacts_selected.borrow().contains(&(entry.account_id.clone(), contact_identity(entry.card()))))
+                .find(|entry| contacts_selected.borrow().contains(&entry.selection_key()))
                 .cloned()
             else {
                 return;
@@ -8619,7 +8619,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let entries: Vec<ContactsListEntry> = contacts_entries
                 .borrow()
                 .iter()
-                .filter(|entry| contacts_selected.borrow().contains(&(entry.account_id.clone(), contact_identity(entry.card()))))
+                .filter(|entry| contacts_selected.borrow().contains(&entry.selection_key()))
                 .cloned()
                 .collect();
             delete_contact_entries(&state, &toast_overlay, &entries);

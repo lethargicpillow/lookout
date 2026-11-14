@@ -277,6 +277,18 @@ impl ContactsListEntry {
     pub fn etag(&self) -> Option<&str> {
         self.record.etag.as_deref()
     }
+
+    /// UI selection must distinguish actual writable resources even when
+    /// imported cards have the same UID, email, or no UID/email at all.
+    /// Keep the legacy identity for display-only cards and favourites.
+    pub(crate) fn selection_key(&self) -> (AccountId, String) {
+        let identity = if self.href().is_empty() {
+            format!("card:{}", contact_identity(self.card()))
+        } else {
+            format!("resource:{}", self.href())
+        };
+        (self.account_id.clone(), identity)
+    }
 }
 
 /// A write command for one account's contact session (CardDAV or Graph), sent
@@ -594,8 +606,10 @@ fn send_contact_command(
                 let text = glib::markup_escape_text(&format!("{failure_prefix}: {message}"));
                 toast_overlay.add_toast(adw::Toast::new(&text));
             }
-            // The session died mid-write; its error handling owns the toast.
-            Err(_) => {}
+            Err(_) => {
+                tracing::warn!("contact command reply channel closed before confirmation");
+                toast_overlay.add_toast(adw::Toast::new("The contacts session ended before confirming the operation."));
+            }
         }
     });
 }
@@ -657,33 +671,36 @@ pub fn delete_contact_entries(state: &Rc<RefCell<UiState>>, toast_overlay: &adw:
         toast_overlay.add_toast(adw::Toast::new("No deletable contacts selected."));
         return;
     }
+    tracing::debug!(selected = entries.len(), writable = writable.len(), "contact delete requested");
     let mut replies = Vec::new();
+    let mut dispatch_failures = 0usize;
     for entry in &writable {
         let Some(reply_rx) = dispatch_contact_command(state, &entry.account_id, move |reply| ContactCommand::Delete {
             href: entry.href().to_string(),
             etag: entry.etag().map(str::to_string),
             reply,
         }) else {
-            toast_overlay.add_toast(adw::Toast::new("The contacts session isn't running."));
+            dispatch_failures += 1;
+            tracing::warn!(account = %entry.account_id, "contact delete could not reach account session");
             continue;
         };
         replies.push(reply_rx);
     }
-    if replies.is_empty() {
-        return;
-    }
     let toast_overlay = toast_overlay.clone();
     glib::spawn_future_local(async move {
         let mut ok = 0usize;
-        let mut failures = Vec::new();
+        let mut failures = vec!["The contacts session isn't running.".to_string(); dispatch_failures];
         for reply_rx in replies {
             match reply_rx.recv().await {
                 Ok(Ok(())) => ok += 1,
                 Ok(Err(message)) => failures.push(message),
-                // The session died mid-write; its error handling owns the toast.
-                Err(_) => {}
+                Err(_) => {
+                    tracing::warn!("contact delete reply channel closed before confirmation");
+                    failures.push("The contacts session ended before confirming deletion.".to_string());
+                }
             }
         }
+        tracing::debug!(confirmed = ok, failed = failures.len(), "contact delete requests completed");
         if failures.is_empty() {
             let text = if ok == 1 { "Contact deleted".to_string() } else { format!("{ok} contacts deleted") };
             toast_overlay.add_toast(adw::Toast::new(&text));
@@ -1990,7 +2007,7 @@ pub fn rebuild_contacts_list_ui(
         .selected_row()
         .and_then(|row| unsafe { row.data::<usize>("contacts-entry-index") })
         .map(|idx| unsafe { *idx.as_ref() })
-        .and_then(|idx| contacts.borrow().get(idx).map(|entry| (entry.account_id.clone(), contact_identity(entry.card()))));
+        .and_then(|idx| contacts.borrow().get(idx).map(|entry| entry.selection_key()));
 
     while let Some(child) = contact_list.first_child() {
         contact_list.remove(&child);
@@ -2064,10 +2081,10 @@ pub fn rebuild_contacts_list_ui(
     // Drop any selection whose contact isn't in this list - a category
     // switch, or an unstar removing a contact from Favourites - so the
     // checkboxes and the action bar never point at a contact that isn't
-    // visible. Keyed by `(account_id, identity)`, so a star-toggle rebuild
+    // visible. Keyed by `(account_id, resource key)`, so a star-toggle rebuild
     // (which re-sorts the same entries) leaves selections untouched.
     {
-        let live: HashSet<(AccountId, String)> = entries.iter().map(|entry| (entry.account_id.clone(), contact_identity(entry.card()))).collect();
+        let live: HashSet<(AccountId, String)> = entries.iter().map(|entry| entry.selection_key()).collect();
         selected.borrow_mut().retain(|key| live.contains(key));
     }
 
@@ -2176,6 +2193,7 @@ pub fn rebuild_contacts_list_ui(
         text_box.append(&email);
 
         let identity = contact_identity(entry.card());
+        let selection_key = entry.selection_key();
         // Multi-select checkbox, left of the avatar: toggling it adds the
         // contact to (or removes it from) `selected`, driving the ribbon's
         // Edit/Delete sensitivity. Deliberately a checkbox rather than
@@ -2186,14 +2204,12 @@ pub fn rebuild_contacts_list_ui(
             .valign(gtk::Align::Center)
             .tooltip_text("Select for multi-select actions")
             .build();
-        checkbox.set_active(selected.borrow().contains(&(entry.account_id.clone(), identity.clone())));
+        checkbox.set_active(selected.borrow().contains(&selection_key));
         {
             let selected = selected.clone();
             let refresh_actions = refresh_actions.clone();
-            let account_id = entry.account_id.clone();
-            let identity = identity.clone();
             checkbox.connect_toggled(move |btn| {
-                let key = (account_id.clone(), identity.clone());
+                let key = selection_key.clone();
                 if btn.is_active() {
                     selected.borrow_mut().insert(key);
                 } else {
@@ -2296,7 +2312,7 @@ pub fn rebuild_contacts_list_ui(
         .and_then(|key| {
             row_widgets
                 .iter()
-                .find(|(_, idx)| contact_identity(contacts.borrow()[*idx].card()) == key.1 && contacts.borrow()[*idx].account_id == key.0)
+                .find(|(_, idx)| &contacts.borrow()[*idx].selection_key() == key)
                 .cloned()
         })
         .or_else(|| row_widgets.first().cloned());
@@ -2769,10 +2785,12 @@ pub fn sync_contacts_account(
                         }
                     }
                     ContactCommand::Delete { href, etag, reply } => {
+                        tracing::debug!(account = %account.account_id, has_etag = etag.is_some(), "contact delete received by session");
                         let result = match &graph {
                             Some(client) => graph_delete_contact(client, &href, etag.as_deref()).await,
                             None => delete_contact(goa_client.clone(), account.clone(), href.clone(), etag).await,
                         };
+                        tracing::debug!(account = %account.account_id, confirmed = result.is_ok(), "contact delete server result");
                         if result.is_ok() {
                             // The server confirmed deletion (or verified absence).
                             // Don't leave the live UI dependent on a later full
@@ -3603,6 +3621,28 @@ mod tests {
             etag: None,
             card,
         }
+    }
+
+    #[test]
+    fn contact_selection_distinguishes_resources_with_same_card_identity() {
+        let make = |href: &str| ContactsListEntry {
+            account_id: AccountId("test-account".to_string()),
+            account_label: "Test".into(),
+            category_label: "All".into(),
+            record: Rc::new(ContactRecord {
+                href: href.into(), etag: Some("1".into()),
+                card: person_card("same", "same@example.com"),
+            }),
+        };
+        let a = make("/book/a");
+        let b = make("/book/b");
+        let display_only = make("");
+        assert_eq!(contact_identity(a.card()), contact_identity(b.card()));
+        assert_ne!(a.selection_key(), b.selection_key());
+        assert_ne!(a.selection_key(), display_only.selection_key());
+        let selected = HashSet::from([a.selection_key()]);
+        assert!(selected.contains(&make("/book/a").selection_key()));
+        assert!(!selected.contains(&b.selection_key()));
     }
 
     #[test]
