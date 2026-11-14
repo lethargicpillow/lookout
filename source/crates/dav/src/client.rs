@@ -438,8 +438,9 @@ impl DavClient {
                 return Err(Error::Discovery("unexpected or duplicate addressbook member".into()));
             }
             let etag = row.prop(NS_DAV, "getetag").filter(|v| !v.is_empty())
-                .ok_or_else(|| Error::Discovery("addressbook member has no ETag".into()))?;
-            members.insert(row.href, etag.to_owned());
+                .ok_or_else(|| Error::Discovery("addressbook member has no ETag".into()))?
+                .to_owned();
+            members.insert(row.href, etag);
         }
         if !own_seen {
             return Err(Error::Discovery("addressbook listing did not include its collection".into()));
