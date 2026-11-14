@@ -135,6 +135,40 @@ impl CalendarCache {
     /// Opens (creating if needed) the cache database for `account_id` under
     /// `$XDG_CACHE_HOME/lookout/calendar/`.
     pub fn open(account_id: &AccountId) -> Result<Self> {
+        // The UI, calendar session and search can open the same account at
+        // startup. Serialize initialization per file, not across accounts.
+        use std::{collections::HashMap, path::PathBuf, sync::{Arc, OnceLock, Weak}};
+        static OPEN_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(account_id)));
+        let lock = {
+            let mut locks = OPEN_LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+                .lock().unwrap_or_else(|e| e.into_inner());
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(&path).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(Mutex::new(()));
+                locks.insert(path, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        // SQLite can return BUSY during a journal-mode transition even
+        // with a busy handler. Retry the idempotent initialization only.
+        for attempt in 0..5 {
+            match Self::open_once(account_id) {
+                Err(crate::Error::Cache(rusqlite::Error::SqliteFailure(ref e, _)))
+                    if attempt < 4 && matches!(e.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(200 * (attempt + 1)));
+                }
+                result => return result,
+            }
+        }
+        unreachable!("last attempt returns")
+    }
+
+    fn open_once(account_id: &AccountId) -> Result<Self> {
         let dir = cache_dir();
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{}.sqlite3", sanitize_filename(account_id)));
@@ -144,8 +178,11 @@ impl CalendarCache {
         // and read from other threads (the calendar UI while the session
         // writes), so a per-commit fsync and the rollback journal both cost
         // real latency for data that is always rebuilt from the server.
-        conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let journal: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        if !journal.eq_ignore_ascii_case("wal") {
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+        }
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(
             "
@@ -1016,6 +1053,34 @@ mod tests {
             conference_url: None,
             attachments: Vec::new(),
         }
+    }
+
+    #[test]
+    fn concurrent_calendar_cache_open_preserves_shared_database() {
+        let account = temp_account_id();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let month = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+        let workers: Vec<_> = (0..8).map(|_| {
+            let account = account.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let cache = CalendarCache::open(&account).unwrap();
+                let conn = cache.conn.lock().unwrap();
+                let journal: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+                assert_eq!(journal.to_ascii_lowercase(), "wal");
+                let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+                assert_eq!(version, CALENDAR_CACHE_VERSION);
+            })
+        }).collect();
+        for worker in workers { worker.join().unwrap(); }
+        let cache = CalendarCache::open(&account).unwrap();
+        cache.store_month(month, &[sample_occurrence(&CalendarId("cal-1".into()), "Shared", 5)]).unwrap();
+        let reader = CalendarCache::open(&account).unwrap();
+        assert_eq!(reader.load_month(month).unwrap().unwrap().len(), 1);
+        drop(reader);
+        drop(cache);
+        let _ = std::fs::remove_file(cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account))));
     }
 
     #[test]
