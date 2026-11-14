@@ -2123,7 +2123,7 @@ async fn connect_and_run(
     let mut prefetch = if davmail_compat || prefetch_mailboxes.is_empty() {
         None
     } else {
-        tracing::info!(count = prefetch_mailboxes.len(), "starting background body prefetch");
+        tracing::info!(account = %account_id, count = prefetch_mailboxes.len(), "starting background body prefetch");
         Some(PrefetchState::new(prefetch_mailboxes))
     };
 
@@ -5386,7 +5386,7 @@ async fn connect_and_run(
                     .map(|m| m.id.clone())
                     .collect();
                 if !mailboxes.is_empty() {
-                    tracing::info!(count = mailboxes.len(), "restarting background body prefetch");
+                    tracing::info!(account = %account_id, count = mailboxes.len(), "restarting background body prefetch");
                     prefetch = Some(PrefetchState::new(mailboxes));
                 }
             }
@@ -8342,7 +8342,7 @@ async fn run_davmail_preview_worker(
             if meta.uid_validity != Some(validity.0) { return Ok::<(), Error>(()); }
             for uid in candidates {
                 if *offline.borrow() || mailbox_rx.has_changed().unwrap_or(true) { break; }
-                if let Some(raw) = fetch_body(&mut session, uid).await? {
+                if let Some(raw) = fetch_body(&mut session, &mailbox, uid).await? {
                     let preview = preview_from_raw(&raw).unwrap_or_default();
                     previews.insert(uid, preview);
                     publish_davmail_previews(&cache, &events, &mailbox, validity, &mut previews).await;
@@ -8457,11 +8457,11 @@ async fn fetch_previews(
 /// `BODY[]`/`RFC822` so reading a message doesn't implicitly set `\Seen`
 /// server-side - the UI layer decides if/when to mark as read, per the
 /// mark-as-read setting (item 1.8).
-async fn fetch_body(session: &mut Session<SessionStream>, uid: Uid) -> Result<Option<Vec<u8>>> {
+async fn fetch_body(session: &mut Session<SessionStream>, mailbox: &MailboxId, uid: Uid) -> Result<Option<Vec<u8>>> {
     tracing::debug!(uid = uid.0, "full MIME fetch started");
     let fetches: Vec<_> = session.uid_fetch(uid.0.to_string(), "(UID BODY.PEEK[])").await?.try_collect().await?;
     let Some(fetch) = fetches.iter().find(|f| f.uid == Some(uid.0) && f.body().is_some()) else {
-        tracing::warn!(uid = uid.0, responses = fetches.len(), matching_uid = fetches.iter().any(|f| f.uid == Some(uid.0)), "full MIME fetch returned no matching body");
+        tracing::warn!(?mailbox, uid = uid.0, responses = fetches.len(), matching_uid = fetches.iter().any(|f| f.uid == Some(uid.0)), "full MIME fetch returned no matching body");
         return Ok(None);
     };
     let body = fetch.body().map(|body| body.to_vec());
@@ -8494,7 +8494,7 @@ async fn fetch_raw_message_cached(cache: &CacheHandle, session: &mut Session<Ses
             Err(e) => tracing::warn!(?mailbox, uid = uid.0, "failed to read cached raw message: {e}"),
         }
     }
-    let Some(raw) = fetch_body(session, uid).await? else {
+    let Some(raw) = fetch_body(session, mailbox, uid).await? else {
         return Ok(None);
     };
     if let Some(Err(e)) = cache_op(cache, {

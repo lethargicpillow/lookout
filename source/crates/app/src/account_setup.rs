@@ -399,6 +399,29 @@ pub(crate) fn prepare_gateway(ews: &str) -> Result<(), String> {
     Err("DavMail did not open all four local ports. Check the user service journal.".into())
 }
 
+// Server error strings can contain the command that failed, including a
+// LOGIN argument. Use typed error categories rather than logging or showing
+// arbitrary server text during account setup.
+fn login_failure_reason(error: &lookout_mail::Error) -> &'static str {
+    use lookout_mail::Error;
+    match error {
+        Error::AuthRejected(_) => "authentication rejected; check the login, app password and enabled mail-client access",
+        Error::Tls(_) | Error::NoRootCertificates | Error::InvalidServerName(_) => "TLS certificate or encryption check failed",
+        Error::Io(_) => "network connection failed; check DNS, connectivity and the server port",
+        Error::LoginFailed(message) if message.starts_with("SMTP connection failed:") => "connection or TLS negotiation failed",
+        Error::LoginFailed(message) if message.starts_with("SMTP STARTTLS failed:") || message == "SMTP server does not offer STARTTLS" => "STARTTLS negotiation failed",
+        Error::LoginFailed(_) => "login or protocol negotiation failed",
+        Error::Imap(_) => "IMAP protocol or server response failed",
+        _ => "account verification failed",
+    }
+}
+
+fn verification_failure(protocol: &str, endpoint: &lookout_mail::EndpointConfig, error: &lookout_mail::Error) -> String {
+    let reason = login_failure_reason(error);
+    tracing::warn!(protocol, host = %endpoint.host, port = endpoint.port, security = ?endpoint.security, reason, "account login verification failed");
+    format!("{protocol} {}:{} ({:?}): {reason}.", endpoint.host, endpoint.port, endpoint.security)
+}
+
 /// Verify before saving any secrets or account settings.
 pub(crate) async fn verify_credentials(account: &crate::app_config::OtherAccount, imap_password: String, smtp_password: String) -> Result<(), String> {
     use lookout_mail::{AccountConfig, EndpointConfig, Credential};
@@ -415,10 +438,12 @@ pub(crate) async fn verify_credentials(account: &crate::app_config::OtherAccount
     let timeout = Duration::from_secs(30);
     tokio::time::timeout(timeout, lookout_mail::session::verify_account_login(&config, Credential::Password(imap_password)))
         .await.map_err(|_| "IMAP login timed out. Check the server and network.")?
-        .map_err(|_| "IMAP login failed. Check the server, TLS settings, username and password.")?;
+        .map_err(|error| verification_failure("IMAP", &config.imap, &error))?;
+    tracing::debug!(host = %config.imap.host, port = config.imap.port, "account IMAP verification succeeded");
     tokio::time::timeout(timeout, lookout_mail::send::verify_smtp_login(&config.smtp, smtp_password))
         .await.map_err(|_| "SMTP login timed out. Check the server and network.")?
-        .map_err(|_| "SMTP login failed. Check the server, TLS settings, username and password.")?;
+        .map_err(|error| verification_failure("SMTP", &config.smtp, &error))?;
+    tracing::debug!(host = %config.smtp.host, port = config.smtp.port, "account SMTP verification succeeded");
     Ok(())
 }
 
@@ -464,6 +489,17 @@ mod tests {
         assert_eq!(selected.security, Security::StartTls);
         assert_eq!(selected.port, 1587);
         assert!(srv_endpoint("alice@example.test", &[], &[]).is_none());
+    }
+
+    #[test]
+    fn account_setup_login_diagnostics_do_not_disclose_server_error_text() {
+        let endpoint = lookout_mail::EndpointConfig { host: "imap.example.test".into(), port: 993, security: Security::ImplicitTls, username: "alice@example.test".into() };
+        let message = verification_failure("IMAP", &endpoint, &lookout_mail::Error::AuthRejected("LOGIN alice secret-password".into()));
+        assert!(message.contains("authentication rejected"));
+        assert!(message.contains("imap.example.test:993"));
+        assert!(!message.contains("secret-password"));
+        assert!(!message.contains("alice"));
+        assert!(login_failure_reason(&lookout_mail::Error::LoginFailed("SMTP STARTTLS failed: detail".into())).contains("STARTTLS"));
     }
 
     #[test]
