@@ -524,7 +524,8 @@ pub(crate) fn collapse_last_wins<T>(events: Vec<T>, supersedable: impl Fn(&T) ->
 pub(crate) fn collapse_account_events(events: Vec<AccountEvent>) -> Vec<AccountEvent> {
     collapse_last_wins(events, |event| match event {
         AccountEvent::FoldersUpdated(_) => Some(SnapshotKey::Folders),
-        AccountEvent::MessagesUpdated { mailbox, .. } => Some(SnapshotKey::Mailbox(mailbox.clone())),
+        AccountEvent::MessagesUpdated { mailbox, .. } |
+        AccountEvent::MailboxSyncProgress { mailbox, .. } => Some(SnapshotKey::Mailbox(mailbox.clone())),
         AccountEvent::FlaggedMessages { .. } => Some(SnapshotKey::FlaggedMail),
         _ => None,
     })
@@ -689,8 +690,30 @@ pub(crate) fn spawn_account_event_loop(
                             request_body_fetch(&state, &worker, &reading_stack, &message_header, mailbox, uid);
                         }
                     }
-                    AccountEvent::MessagesUpdated { mailbox, mut messages } => {
-                        // This is the authoritative live-sync landing. Bump the
+                    event @ (AccountEvent::MessagesUpdated { .. } | AccountEvent::MailboxSyncProgress { .. }) => {
+                        let (mailbox, mut messages, progressive_validity) = match event {
+                            AccountEvent::MessagesUpdated { mailbox, messages } => (mailbox, messages, None),
+                            AccountEvent::MailboxSyncProgress { mailbox, uidvalidity, messages } => (mailbox, messages, Some(uidvalidity)),
+                            _ => unreachable!(),
+                        };
+                        // A partial snapshot has a real UIDVALIDITY even on
+                        // the initial sync, before the final folder counts.
+                        // Use it for reading-pane cache lookups.
+                        if let Some(validity) = progressive_validity {
+                            let mut st = state.borrow_mut();
+                            let changed = st.accounts.get_mut(&account_id)
+                                .and_then(|handle| handle.folders.iter_mut().find(|f| f.id == mailbox))
+                                .is_some_and(|folder| {
+                                    let changed = folder.uidvalidity != validity;
+                                    folder.uidvalidity = validity;
+                                    changed
+                                });
+                            if changed {
+                                st.body_cache.remove_mailbox(&mailbox);
+                            }
+                        }
+                        // A live snapshot (including progressive display) must
+                        // supersede stale off-thread cache reads. Bump the
                         // mailbox's epoch first so any off-thread cache read
                         // still in flight for it (dispatched before this sync
                         // returned, so it holds a stale window) is discarded
@@ -705,15 +728,24 @@ pub(crate) fn spawn_account_event_loop(
                         // for a uid this client already acted on locally -
                         // reconcile against the stash instead of trusting
                         // every sync as automatically authoritative.
-                        reconcile_optimistic_removals(&state, &mailbox, &mut messages);
+                        if progressive_validity.is_some() {
+                            // Absence from a partial snapshot cannot confirm a
+                            // deletion. Hide optimistic removals without
+                            // clearing their rollback stash.
+                            if let Some(pending) = state.borrow().pending_optimistic_removals.get(&mailbox) {
+                                messages.retain(|m| !pending.iter().any(|p| p.uid == m.uid));
+                            }
+                        } else {
+                            reconcile_optimistic_removals(&state, &mailbox, &mut messages);
+                        }
                         reconcile_optimistic_flag_changes(&state, &message_list, &mailbox, &mut messages);
                         reconcile_optimistic_pinned_changes(&state, &message_list, &mailbox, &mut messages);
-                        // The sync this mailbox was asked for (if any) has landed.
-                        set_mailbox_syncing(&state, &mailbox, false);
-                        // A sync means the envelope cache this dashboard reads
-                        // changed - repaint its mail sections. (The calendar
-                        // sections repaint via their own event loops.)
-                        dashboard_refresh();
+                        // Progress makes rows available without completing the
+                        // sync. Keep the folder spinner until the final event.
+                        set_mailbox_syncing(&state, &mailbox, progressive_validity.is_some());
+                        if progressive_validity.is_none() {
+                            dashboard_refresh();
+                        }
                         // While a search is active the results list owns the
                         // pane: a background sync repopulating it would clobber
                         // the results with the folder's full set. Still fold

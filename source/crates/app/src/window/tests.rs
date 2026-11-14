@@ -2567,6 +2567,32 @@ fn collapse_account_events_keeps_the_last_messages_updated_per_mailbox_in_order(
 }
 
 #[test]
+fn progressive_mailbox_events_are_superseded_by_the_final_snapshot() {
+    let mailbox = MailboxId("a:INBOX".into());
+    let progress = |count| AccountEvent::MailboxSyncProgress {
+        mailbox: mailbox.clone(),
+        uidvalidity: lookout_core::UidValidity(42),
+        messages: (1..=count).map(|uid| summary(Uid(uid), "a:INBOX", 2026, 8, 1, 9)).collect(),
+    };
+    let other = MailboxId("b:INBOX".into());
+    let collapsed = collapse_account_events(vec![
+        AccountEvent::MailboxSyncStarted { mailbox: mailbox.clone() },
+        progress(1),
+        AccountEvent::MessagesUpdated { mailbox: other.clone(), messages: Vec::new() },
+        progress(2),
+    ]);
+    assert_eq!(collapsed.len(), 3);
+    assert!(matches!(&collapsed[0], AccountEvent::MailboxSyncStarted { .. }));
+    assert!(matches!(&collapsed[1], AccountEvent::MessagesUpdated { mailbox, .. } if mailbox == &other));
+    assert!(matches!(&collapsed[2], AccountEvent::MailboxSyncProgress { messages, .. } if messages.len() == 2));
+    let final_batch = collapse_account_events(vec![
+        progress(2),
+        AccountEvent::MessagesUpdated { mailbox: mailbox.clone(), messages: Vec::new() },
+    ]);
+    assert!(matches!(&final_batch[..], [AccountEvent::MessagesUpdated { .. }]));
+}
+
+#[test]
 fn collapse_account_events_keeps_everything_when_nothing_is_superseded() {
     let a = MailboxId("a:INBOX".into());
     let collapsed = collapse_account_events(vec![

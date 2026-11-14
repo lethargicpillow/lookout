@@ -797,6 +797,13 @@ pub enum AccountEvent {
         mailbox: MailboxId,
         messages: Vec<EmailSummary>,
     },
+    /// A cumulative, display-only snapshot during a large IMAP sync.
+    /// The authoritative cache and folder counts are not committed yet.
+    MailboxSyncProgress {
+        mailbox: MailboxId,
+        uidvalidity: UidValidity,
+        messages: Vec<EmailSummary>,
+    },
     /// The shared `sync_mailbox` has begun a full envelope re-fetch of
     /// `mailbox` - whatever triggered it: an explicit `SyncMailbox`/
     /// `Refresh` command, an IDLE push, or a background move/flag/keyword/
@@ -7324,6 +7331,53 @@ async fn persist_envelope_checkpoint(cache: &CacheHandle, mailbox: &MailboxId, v
     }
 }
 
+/// Combine the live cached membership with staged envelopes. This is
+/// deliberately a display snapshot: no deletion, notification, rule run,
+/// or authoritative cache replacement happens until the final sync.
+fn progressive_mailbox_snapshot(cached: &[EmailSummary], staged: &[EmailSummary]) -> Vec<EmailSummary> {
+    let mut seen = HashSet::new();
+    let mut messages: Vec<_> = cached.iter().chain(staged).filter(|m| seen.insert(m.uid)).cloned().collect();
+    let keys = lookout_core::thread::compute_thread_keys(&messages);
+    for msg in &mut messages {
+        if let Some(key) = keys.get(&msg.uid) {
+            msg.thread_key = key.clone();
+        }
+    }
+    messages
+}
+
+/// Publish cumulative progress, keeping the same snooze and local follow-up
+/// display policy as the final snapshot. Checkpoints stay in their own table.
+async fn emit_mailbox_sync_progress(
+    mailbox: &MailboxId,
+    validity: UidValidity,
+    cached: &[EmailSummary],
+    staged: &[EmailSummary],
+    events: &async_channel::Sender<AccountEvent>,
+    cache: &CacheHandle,
+) {
+    if staged.is_empty() { return; }
+    let mut messages = progressive_mailbox_snapshot(cached, staged);
+    if let Some((snoozed, overlaid)) = cache_op(cache, {
+        let mailbox = mailbox.clone();
+        let mut messages = messages.clone();
+        move |c| {
+            let snoozed = c.active_snoozed_uids(&mailbox, chrono::Utc::now());
+            let overlaid = c.overlay_follow_ups(&mut messages).map(|()| messages);
+            (snoozed, overlaid)
+        }
+    }).await {
+        if let Ok(overlaid) = overlaid { messages = overlaid; }
+        if let Ok(snoozed) = snoozed { messages.retain(|m| !snoozed.contains(&m.uid)); }
+    }
+    tracing::debug!(%mailbox, count = messages.len(), "publishing progressive IMAP snapshot");
+    let _ = events.send(AccountEvent::MailboxSyncProgress {
+        mailbox: mailbox.clone(),
+        uidvalidity: validity,
+        messages,
+    }).await;
+}
+
 /// The STATUS data items a folder-count refresh asks for. `HIGHESTMODSEQ`
 /// (RFC 7162 §3.2.1) rides along on CONDSTORE connections - it's the one
 /// pass that visits every folder, so folders that never get SELECTed still
@@ -7958,6 +8012,19 @@ async fn sync_mailbox(
             }
             remaining.extend(new_uids.iter().copied().filter(|uid| !received.contains(uid)));
             let sets = envelope_sync_sets(&remaining);
+            // Avoid extra GTK rebuilds on small deltas. Sent retains its
+            // existing auto-mark-as-read step before first publication.
+            // A real UIDVALIDITY reset must take the full invalidation path.
+            let progressive = new_uids.len() > ENVELOPE_SYNC_BATCH
+                && !is_sent
+                && uidvalidity.0 != 0
+                && folders.iter().find(|f| f.id == *mailbox_id)
+                    .is_some_and(|f| f.uidvalidity.0 == 0 || f.uidvalidity == uidvalidity);
+            let mut last_progress = None::<std::time::Instant>;
+            if progressive && !new_messages.is_empty() {
+                emit_mailbox_sync_progress(mailbox_id, uidvalidity, &messages, &new_messages, events, cache).await;
+                last_progress = Some(std::time::Instant::now());
+            }
             tracing::info!(account = %account_id, mailbox = %folder_path, count = new_uids.len(), reused_checkpoint = new_messages.len(), remaining = remaining.len(), batches = sets.len(), "fetching new message envelopes");
             for (index, uid_set) in sets.iter().enumerate() {
                 tracing::debug!(account = %account_id, mailbox = %folder_path, batch = index + 1, batches = sets.len(), "requesting envelope batch");
@@ -7967,7 +8034,15 @@ async fn sync_mailbox(
                 let batch: Vec<EmailSummary> = fetches.iter().filter_map(|f| summary_from_fetch(mailbox_id, f))
                     .filter(|m| wanted.contains(&m.uid) && received.insert(m.uid)).collect();
                 persist_envelope_checkpoint(cache, mailbox_id, uidvalidity, &batch).await;
+                let grew = !batch.is_empty();
                 new_messages.extend(batch);
+                // Paint immediately on the first available batch; throttle
+                // later cumulative snapshots to avoid rebuilding GTK for
+                // every fast network round trip.
+                if progressive && grew && last_progress.is_none_or(|at| at.elapsed() >= Duration::from_secs(1)) {
+                    emit_mailbox_sync_progress(mailbox_id, uidvalidity, &messages, &new_messages, events, cache).await;
+                    last_progress = Some(std::time::Instant::now());
+                }
                 if index == 0 || (index + 1) % 10 == 0 || index + 1 == sets.len() {
                     tracing::info!(account = %account_id, mailbox = %folder_path, batch = index + 1, batches = sets.len(), received = new_messages.len(), "envelope sync progress");
                 }
@@ -7988,7 +8063,12 @@ async fn sync_mailbox(
                         let batch: Vec<EmailSummary> = fetches.iter().filter_map(|f| summary_from_header_fetch(mailbox_id, f))
                             .filter(|m| wanted.contains(&m.uid) && received.insert(m.uid)).collect();
                         persist_envelope_checkpoint(cache, mailbox_id, uidvalidity, &batch).await;
+                        let grew = !batch.is_empty();
                         new_messages.extend(batch);
+                        if progressive && grew && last_progress.is_none_or(|at| at.elapsed() >= Duration::from_secs(1)) {
+                            emit_mailbox_sync_progress(mailbox_id, uidvalidity, &messages, &new_messages, events, cache).await;
+                            last_progress = Some(std::time::Instant::now());
+                        }
                     }
                 }
                 let missing: Vec<Uid> = live.into_iter().filter(|uid| !received.contains(uid)).collect();
@@ -9543,6 +9623,19 @@ mod tests {
             list_id: None,
             structure: None,
         }
+    }
+
+    #[test]
+    fn progressive_mailbox_snapshot_preserves_known_rows_and_deduplicates_staged_rows() {
+        let mailbox = MailboxId::new(&AccountId("acc".into()), "INBOX");
+        let cached = vec![summary(1, &mailbox, true), summary(2, &mailbox, false)];
+        let staged = vec![summary(2, &mailbox, true), summary(3, &mailbox, false)];
+        let result = progressive_mailbox_snapshot(&cached, &staged);
+        assert_eq!(result.iter().map(|m| m.uid).collect::<Vec<_>>(), vec![Uid(1), Uid(2), Uid(3)]);
+        assert!(result[1].is_unread(), "the live cached flags win over duplicate staged rows");
+        let expanded = progressive_mailbox_snapshot(&cached, &[staged[0].clone(), staged[1].clone(), summary(4, &mailbox, false)]);
+        assert_eq!(expanded.len(), 4);
+        assert_eq!(cached.len(), 2, "display snapshots never mutate the authoritative input");
     }
 
     #[test]
