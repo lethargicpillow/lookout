@@ -120,13 +120,28 @@ pub(crate) fn keyring_error(e: secret_service::Error) -> String {
 impl KeyringStore for SecretServiceKeyring {
     async fn load_password(&self, account_id: &AccountId, protocol: &str) -> Result<String, String> {
         let service = SecretService::connect(EncryptionType::Dh).await.map_err(keyring_error)?;
-        let collection = service.get_default_collection().await.map_err(keyring_error)?;
-        let items = collection.search_items(slot_attributes(account_id, protocol)).await.map_err(keyring_error)?;
-        let Some(item) = items.into_iter().next() else {
-            return Err(format!("No saved password for {} ({protocol}).", account_id.0));
-        };
-        let secret = item.get_secret().await.map_err(keyring_error)?;
-        String::from_utf8(secret).map_err(|_| "The stored password is not valid text.".to_string())
+        // Writes target the default collection. Prefer it when reading as
+        // well, so a newly saved password wins over an older duplicate.
+        // A changed default alias must not make existing accounts unusable.
+        if let Ok(collection) = service.get_default_collection().await {
+            if let Ok(items) = collection.search_items(slot_attributes(account_id, protocol)).await {
+                if let Some(item) = items.into_iter().next() {
+                    let secret = item.get_secret().await.map_err(keyring_error)?;
+                    return String::from_utf8(secret).map_err(|_| "The stored password is not valid text.".to_string());
+                }
+            }
+        }
+        let matches = service.search_items(slot_attributes(account_id, protocol)).await.map_err(keyring_error)?;
+        if let Some(item) = matches.unlocked.into_iter().next() {
+            let secret = item.get_secret().await.map_err(keyring_error)?;
+            return String::from_utf8(secret).map_err(|_| "The stored password is not valid text.".to_string());
+        }
+        if !matches.locked.is_empty() {
+            // Background IMAP/DAV/GAL retries must not open repeated unlock
+            // prompts. Ask the user to unlock the existing collection.
+            return Err(format!("Saved password for {} ({protocol}) is in a locked keyring. Unlock it to reconnect.", account_id.0));
+        }
+        Err(format!("No saved password for {} ({protocol}) in any collection of the active Secret Service.", account_id.0))
     }
 
     async fn store_password(&self, account_id: &AccountId, protocol: &str, password: &str) -> Result<(), String> {
@@ -150,9 +165,13 @@ impl KeyringStore for SecretServiceKeyring {
 
     async fn delete_account(&self, account_id: &AccountId) -> Result<(), String> {
         let service = SecretService::connect(EncryptionType::Dh).await.map_err(keyring_error)?;
-        let collection = service.get_default_collection().await.map_err(keyring_error)?;
-        let items = collection.search_items(account_attributes(account_id)).await.map_err(keyring_error)?;
-        for item in items {
+        // Match the read scope: removing an account must not leave a
+        // password in another collection that could be picked up later.
+        let matches = service.search_items(account_attributes(account_id)).await.map_err(keyring_error)?;
+        if !matches.locked.is_empty() {
+            return Err(keyring_error(secret_service::Error::Locked));
+        }
+        for item in matches.unlocked {
             item.delete().await.map_err(keyring_error)?;
         }
         Ok(())
