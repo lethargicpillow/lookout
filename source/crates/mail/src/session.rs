@@ -1476,6 +1476,14 @@ pub async fn run_account_session(
     events: async_channel::Sender<AccountEvent>,
     mut offline_rx: tokio::sync::watch::Receiver<bool>,
 ) {
+    // A replaced session may still be finishing an IMAP operation. Serialize
+    // primary actors for the same account until the old actor has exited,
+    // including its cache writes. Different accounts remain independent.
+    let session_lock = account_session_lock(&config.account_id);
+    let _session_guard = session_lock.lock().await;
+    if commands.is_closed() {
+        return;
+    }
     // Opening runs the file open, pragmas, DDL and migrations, so it goes to
     // the blocking pool like every other cache call (`cache_op`).
     let open_id = config.account_id.clone();
@@ -1655,7 +1663,7 @@ pub async fn run_account_session(
     let (idle_notify_tx, idle_notify_rx) = async_channel::unbounded::<MailboxId>();
     // A launch that starts already offline must not even attempt the spare
     // IDLE connection; it is spawned when the account first goes online.
-    let mut idle_task = (!*offline_rx.borrow()).then(|| tokio::spawn(run_idle_supervisor(config.clone(), credentials.clone(), mailbox_rx, idle_notify_tx.clone())));
+    let mut idle_task = AccountTaskGuard((!*offline_rx.borrow()).then(|| tokio::spawn(run_idle_supervisor(config.clone(), credentials.clone(), mailbox_rx, idle_notify_tx.clone()))));
     // A separate, ordered draft lane survives primary IMAP reconnects.
     let draft_jobs = if davmail_saves_sent(&config.imap, &config.smtp) {
         let (tx, rx) = async_channel::unbounded();
@@ -1667,22 +1675,22 @@ pub async fn run_account_session(
     let preview_task = davmail_saves_sent(&config.imap, &config.smtp).then(|| {
         tokio::spawn(run_davmail_preview_worker(config.clone(), credentials.clone(), cache.clone(), events.clone(), mailbox_tx.subscribe(), offline_rx.clone()))
     });
-    // Abort the worker when the account session exits (including task cancellation).
-    struct PreviewTaskGuard(Option<tokio::task::JoinHandle<()>>);
-    impl Drop for PreviewTaskGuard {
-        fn drop(&mut self) {
-            if let Some(task) = self.0.take() { task.abort(); }
-        }
-    }
-    let _preview_task = PreviewTaskGuard(preview_task);
+    // Abort auxiliary readers on every exit, including a closed command
+    // channel while disconnected, or cancellation of the primary actor.
+    let _preview_task = AccountTaskGuard(preview_task);
 
     loop {
+        // The sender is explicitly closed when the UI removes/replaces
+        // this account. Do not reconnect with stale settings or credentials.
+        if commands.is_closed() {
+            return;
+        }
         // Work Offline (M-40): no network module runs while the user has
         // paused syncing. Park here, still answering the cache-only outbox
         // commands, until the signal goes back online.
         if *offline_rx.borrow() {
             let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Offline)).await;
-            if let Some(task) = idle_task.take() {
+            if let Some(task) = idle_task.0.take() {
                 task.abort();
             }
             match wait_offline(
@@ -1699,7 +1707,7 @@ pub async fn run_account_session(
             {
                 OfflineWait::Online => {
                     backoff = INITIAL_BACKOFF;
-                    idle_task = Some(tokio::spawn(run_idle_supervisor(
+                    idle_task.0 = Some(tokio::spawn(run_idle_supervisor(
                         config.clone(),
                         credentials.clone(),
                         mailbox_tx.subscribe(),
@@ -1736,7 +1744,7 @@ pub async fn run_account_session(
         {
             Ok(ShutdownReason::Requested) => {
                 let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Disconnected)).await;
-                if let Some(task) = idle_task.take() {
+                if let Some(task) = idle_task.0.take() {
                     task.abort();
                 }
                 return;
@@ -1744,13 +1752,16 @@ pub async fn run_account_session(
             Ok(ShutdownReason::Offline) => {
                 // The toggle won inside the connection: drop the IDLE
                 // supervisor now and park on the next pass without a backoff.
-                if let Some(task) = idle_task.take() {
+                if let Some(task) = idle_task.0.take() {
                     task.abort();
                 }
                 backoff = INITIAL_BACKOFF;
                 continue;
             }
             Err(e) => {
+                if commands.is_closed() {
+                    return;
+                }
                 tracing::warn!(account = %config.account_id, host = %config.imap.host, retry_in_secs = backoff.as_secs(), "account session error, will reconnect: {e}");
                 // Connection failures are warning-level: the loop below
                 // retries with backoff, so only the connection-lifecycle
@@ -1767,8 +1778,8 @@ pub async fn run_account_session(
                 // otherwise awaits it, respawn here so a silently-dead IDLE
                 // connection doesn't linger unnoticed for the rest of the
                 // session.
-                if idle_task.as_ref().is_none_or(|task| task.is_finished()) {
-                    idle_task = Some(tokio::spawn(run_idle_supervisor(
+                if idle_task.0.as_ref().is_none_or(|task| task.is_finished()) {
+                    idle_task.0 = Some(tokio::spawn(run_idle_supervisor(
                         config.clone(),
                         credentials.clone(),
                         mailbox_tx.subscribe(),
@@ -1806,7 +1817,7 @@ pub async fn run_account_session(
                 // without waiting out the backoff.
                 if changed.is_err() {
                     let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Disconnected)).await;
-                    if let Some(task) = idle_task.take() {
+                    if let Some(task) = idle_task.0.take() {
                         task.abort();
                     }
                     return;
@@ -1818,22 +1829,44 @@ pub async fn run_account_session(
                 match cmd {
                     Ok(AccountCommand::Shutdown) => {
                         let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Disconnected)).await;
-                        if let Some(task) = idle_task.take() {
+                        if let Some(task) = idle_task.0.take() {
                             task.abort();
                         }
                         return;
                     }
                     Ok(other) => carried_command = Some(other),
-                    Err(_) => {}
+                    Err(_) => return,
                 }
             }
-            cmd = interactive_commands.recv() => {
+            cmd = interactive_commands.recv(), if !interactive_commands.is_closed() => {
                 if let Ok(other) = cmd {
                     carried_command = Some(other);
                 }
             }
         }
         backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
+    }
+}
+
+// Weak entries avoid retaining an account's lock after its final actor
+// exits. The registry mutex is never held across an await.
+fn account_session_lock(account_id: &AccountId) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    use std::sync::{Arc, Mutex, OnceLock, Weak};
+    static LOCKS: OnceLock<Mutex<HashMap<AccountId, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let mut locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(account_id).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(account_id.clone(), Arc::downgrade(&lock));
+    lock
+}
+
+struct AccountTaskGuard(Option<tokio::task::JoinHandle<()>>);
+impl Drop for AccountTaskGuard {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() { task.abort(); }
     }
 }
 
@@ -9346,6 +9379,19 @@ mod tests {
         smtp.host = "localhost".into();
         imap.port = 143;
         assert!(!davmail_saves_sent(&imap, &smtp));
+    }
+
+    #[tokio::test]
+    async fn replacement_account_session_waits_for_old_primary_actor() {
+        let id = AccountId("test:session-lock".into());
+        let first = account_session_lock(&id);
+        let second = account_session_lock(&id);
+        let unrelated = account_session_lock(&AccountId("test:other-session-lock".into()));
+        let guard = first.lock().await;
+        assert!(second.try_lock().is_err());
+        assert!(unrelated.try_lock().is_ok());
+        drop(guard);
+        assert!(second.try_lock().is_ok());
     }
 
     #[tokio::test]
