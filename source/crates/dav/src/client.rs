@@ -398,6 +398,88 @@ impl DavClient {
         Ok((hrefs, records))
     }
 
+    /// Google rejects an empty RFC 6578 sync-token. Compare its verified
+    /// PROPFIND membership and ETags instead, fetching only changed cards.
+    pub fn uses_google_contacts(&self) -> bool {
+        self.base_url.host_str() == Some("www.googleapis.com")
+            && self.base_url.path().starts_with("/carddav/")
+    }
+
+    /// Return complete membership separately from changed card data.
+    /// A partial listing, invalid member, or incomplete multiget is an
+    /// error: the caller must not infer deletions or advance its baseline.
+    pub async fn fetch_addressbook_etag_snapshot(
+        &self,
+        book: &AddressBookInfo,
+        credential: &Credential,
+        cached: &std::collections::HashMap<String, Option<String>>,
+    ) -> Result<(Vec<String>, Vec<ContactRecord>)> {
+        use std::collections::{HashMap, HashSet};
+        let url = self.resolve(&book.href)?;
+        let rows = self.propfind(url.clone(), 1, credential, &["D:getetag", "D:resourcetype"]).await?;
+        let mut own_seen = false;
+        let mut members = HashMap::new();
+        let mut canonical = HashSet::new();
+        let mut prefix = url.path().trim_end_matches('/').to_owned();
+        prefix.push('/');
+        for row in rows {
+            if row.href.is_empty() || row.status.as_deref().is_some_and(|s| !s.split_whitespace().nth(1).is_some_and(|code| code.starts_with('2'))) {
+                return Err(Error::Discovery("incomplete addressbook member listing".into()));
+            }
+            let member_url = url.join(&row.href).map_err(|_| Error::Discovery("invalid addressbook href".into()))?;
+            if member_url.origin() != url.origin() {
+                return Err(Error::Discovery("addressbook member outside server origin".into()));
+            }
+            if member_url.path().trim_end_matches('/') == url.path().trim_end_matches('/') {
+                own_seen = true;
+                continue;
+            }
+            if !member_url.path().starts_with(&prefix) || !canonical.insert(member_url.to_string()) {
+                return Err(Error::Discovery("unexpected or duplicate addressbook member".into()));
+            }
+            let etag = row.prop(NS_DAV, "getetag").filter(|v| !v.is_empty())
+                .ok_or_else(|| Error::Discovery("addressbook member has no ETag".into()))?;
+            members.insert(row.href, etag.to_owned());
+        }
+        if !own_seen {
+            return Err(Error::Discovery("addressbook listing did not include its collection".into()));
+        }
+        let mut hrefs: Vec<String> = members.keys().cloned().collect();
+        hrefs.sort();
+        let changed: Vec<String> = hrefs.iter().filter(|href| {
+            cached.get(*href).and_then(|v| v.as_ref()) != members.get(*href)
+        }).cloned().collect();
+        let mut records = Vec::new();
+        for batch in changed.chunks(100) {
+            let mut expected: HashMap<String, &String> = HashMap::new();
+            for href in batch {
+                let key = url.join(href).map_err(|_| Error::Discovery("invalid multiget href".into()))?.to_string();
+                expected.insert(key, href);
+            }
+            let body = xml::build_addressbook_multiget_body(batch, &["D:getetag", "CD:address-data"]);
+            let responses = self.report(url.clone(), 1, credential, body).await?;
+            for row in responses {
+                if row.href.is_empty() || row.status.as_deref().is_some_and(|s| !s.split_whitespace().nth(1).is_some_and(|code| code.starts_with('2'))) {
+                    return Err(Error::Discovery("addressbook multiget returned an unsuccessful member".into()));
+                }
+                let key = url.join(&row.href).map_err(|_| Error::Discovery("invalid multiget response href".into()))?.to_string();
+                let href = expected.remove(&key).ok_or_else(|| Error::Discovery("unexpected multiget response member".into()))?;
+                let etag = row.prop(NS_DAV, "getetag").filter(|v| !v.is_empty())
+                    .ok_or_else(|| Error::Discovery("multiget member has no ETag".into()))?;
+                if members.get(href).map(String::as_str) != Some(etag) {
+                    return Err(Error::Discovery("contact changed during addressbook sync; retry next poll".into()));
+                }
+                let data = row.prop(NS_CARDDAV, "address-data").ok_or_else(|| Error::Discovery("multiget member has no vCard".into()))?;
+                let card = VCard::parse(data).map_err(|_| Error::Discovery("multiget returned an invalid vCard".into()))?;
+                records.push(ContactRecord { href: href.clone(), etag: Some(etag.to_owned()), card });
+            }
+            if !expected.is_empty() {
+                return Err(Error::Discovery("addressbook multiget omitted requested members".into()));
+            }
+        }
+        Ok((hrefs, records))
+    }
+
     pub fn uses_davmail_contacts(&self) -> bool {
         self.is_davmail_collection("contacts")
     }
@@ -988,6 +1070,40 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+
+    #[tokio::test]
+    async fn etag_snapshot_fetches_only_changed_contacts_and_rejects_partial_response() {
+        let server = MockServer::start().await;
+        let listing = r#"<D:multistatus xmlns:D="DAV:">
+          <D:response><D:href>/book/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
+          <D:response><D:href>/book/a.vcf</D:href><D:propstat><D:prop><D:getetag>"a"</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
+          <D:response><D:href>/book/b.vcf</D:href><D:propstat><D:prop><D:getetag>"b2"</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
+          </D:multistatus>"#;
+        Mock::given(method("PROPFIND")).and(path("/book/")).respond_with(ResponseTemplate::new(207).set_body_string(listing)).mount(&server).await;
+        let report = r#"<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">
+          <D:response><D:href>/book/b.vcf</D:href><D:propstat><D:prop><D:getetag>"b2"</D:getetag><C:address-data>BEGIN:VCARD
+VERSION:3.0
+FN:Bob
+UID:b
+END:VCARD
+</C:address-data></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>"#;
+        Mock::given(method("REPORT")).and(path("/book/"))
+            .and(wiremock::matchers::body_string_contains("/book/b.vcf"))
+            .respond_with(ResponseTemplate::new(207).set_body_string(report)).mount(&server).await;
+        let client = DavClient::new(&server.uri(), false, "user".into()).unwrap();
+        let book = AddressBookInfo::new(&AccountId("test".into()), "/book/", "Book".into());
+        let credential = Credential::Password("test".into());
+        let cached = std::collections::HashMap::from([("/book/a.vcf".into(), Some("\"a\"".into())), ("/book/b.vcf".into(), Some("\"b1\"".into()))]);
+        let (live, changed) = client.fetch_addressbook_etag_snapshot(&book, &credential, &cached).await.unwrap();
+        assert_eq!(live, vec!["/book/a.vcf", "/book/b.vcf"]);
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].href, "/book/b.vcf");
+        let requests = server.received_requests().await.unwrap();
+        let body = String::from_utf8_lossy(&requests.iter().find(|r| r.method.as_str() == "REPORT").unwrap().body);
+        assert!(!body.contains("/book/a.vcf"));
+        // With no cached cards the same response is incomplete; reject it.
+        assert!(client.fetch_addressbook_etag_snapshot(&book, &credential, &std::collections::HashMap::new()).await.is_err());
+    }
 
     #[test]
     fn normalize_webcal_url_rewrites_webcal_schemes_and_keeps_http_https() {

@@ -2961,9 +2961,8 @@ fn snapshot_from_cache(account: &GoaContactsAccount, cache: &ContactsCache) -> O
 /// - A stored token that the server rejects (stale, or a cold-start refusal)
 ///   falls back to a full refetch; the refetch then re-acquires a token via a
 ///   cold-start `sync-collection`, which servers that support delta sync
-///   (Nextcloud, per RFC 6578) accept. Google's CardDAV refuses cold starts
-///   outright (see `fetch_addressbook_contacts`), so the token stays cleared
-///   there and every poll is a full refetch - the pre-cache behaviour.
+///   (Nextcloud, per RFC 6578) accept. Google uses a separate verified
+///   membership/ETag path because it rejects cold-start sync-collection.
 async fn sync_addressbook_into(
     client: &DavClient,
     credential: &Credential,
@@ -2977,6 +2976,15 @@ async fn sync_addressbook_into(
             .filter(|contact| contact.book_href == book.href && !live.contains(contact.href.as_str()))
             .map(|contact| contact.href).collect();
         cache.apply_delta(&book.href, None, &records, &deleted).map_err(|e| e.to_string())?;
+        return Ok(records);
+    }
+    if client.uses_google_contacts() {
+        let cached: HashMap<String, Option<String>> = cache.load_contacts().map_err(|e| e.to_string())?
+            .into_iter().filter(|contact| contact.book_href == book.href)
+            .map(|contact| (contact.href, contact.etag)).collect();
+        let (hrefs, records) = client.fetch_addressbook_etag_snapshot(book, credential, &cached).await.map_err(|e| e.to_string())?;
+        cache.apply_membership_snapshot(&book.href, &hrefs, &records).map_err(|e| e.to_string())?;
+        tracing::debug!(mailbox = %book.href, live = hrefs.len(), changed = records.len(), "Google CardDAV ETag sync complete");
         return Ok(records);
     }
     let stored_token = cache.sync_token(&book.href).map_err(|e| e.to_string())?;

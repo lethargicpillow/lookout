@@ -731,6 +731,35 @@ impl ContactsCache {
         Ok(())
     }
 
+    /// Commit a verified complete membership snapshot atomically. A failed
+    /// fetch never calls this method, and a failed SQLite write rolls back.
+    pub fn apply_membership_snapshot(&self, book_href: &str, live_hrefs: &[String], changed: &[ContactRecord]) -> Result<()> {
+        let live: std::collections::HashSet<&str> = live_hrefs.iter().map(String::as_str).collect();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let existing = {
+            let mut stmt = tx.prepare("SELECT href FROM contacts WHERE book_href = ?1")?;
+            let rows = stmt.query_map([book_href], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for record in changed {
+            if !live.contains(record.href.as_str()) {
+                return Err(crate::Error::Discovery("changed contact missing from membership snapshot".into()));
+            }
+            tx.execute("INSERT OR REPLACE INTO contacts (href, book_href, etag, card) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![record.href, book_href, record.etag, record.card.serialize()])?;
+        }
+        for href in existing {
+            if !live.contains(href.as_str()) {
+                tx.execute("DELETE FROM contacts WHERE book_href = ?1 AND href = ?2", rusqlite::params![book_href, href])?;
+            }
+        }
+        tx.execute("INSERT INTO address_books (href, displayname, sync_token) VALUES (?1, '', NULL)
+            ON CONFLICT(href) DO UPDATE SET sync_token = NULL", [book_href])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Removes a book that vanished server-side, together with its members.
     ///
     /// Unlike [`Self::apply_delta`], this does not keep an `address_books` row:
@@ -763,6 +792,32 @@ mod contacts_tests {
 
     fn temp_path(account_id: &AccountId) -> std::path::PathBuf {
         contacts_cache_dir().join(format!("{}.sqlite3", sanitize_filename(account_id)))
+    }
+
+    #[test]
+    fn membership_snapshot_updates_and_prunes_only_its_own_book() {
+        let id = temp_account_id();
+        let cache = ContactsCache::open(&id).unwrap();
+        let record = |href: &str, etag: &str| ContactRecord {
+            href: href.into(), etag: Some(etag.into()), card: sample_card(href, "test@example.com"),
+        };
+        cache.apply_delta("/book/", Some("old".into()), &[record("/book/a", "1"), record("/book/b", "1")], &[]).unwrap();
+        cache.apply_delta("/other/", Some("keep".into()), &[record("/other/c", "1")], &[]).unwrap();
+        cache.apply_membership_snapshot("/book/", &["/book/a".into(), "/book/d".into()],
+            &[record("/book/a", "2"), record("/book/d", "1")]).unwrap();
+        let rows = cache.load_contacts().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().any(|r| r.href == "/book/a" && r.etag.as_deref() == Some("2")));
+        assert!(!rows.iter().any(|r| r.href == "/book/b"));
+        assert!(rows.iter().any(|r| r.href == "/other/c"));
+        assert_eq!(cache.sync_token("/book/").unwrap(), None);
+        assert_eq!(cache.sync_token("/other/").unwrap().as_deref(), Some("keep"));
+        // An invalid changed row rolls back earlier writes.
+        assert!(cache.apply_membership_snapshot("/book/", &["/book/a".into()],
+            &[record("/book/a", "3"), record("/outside", "1")]).is_err());
+        assert!(cache.load_contacts().unwrap().iter().any(|r| r.href == "/book/a" && r.etag.as_deref() == Some("2")));
+        drop(cache);
+        let _ = std::fs::remove_file(temp_path(&id));
     }
 
     #[test]

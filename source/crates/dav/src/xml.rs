@@ -305,6 +305,9 @@ pub fn parse_multistatus(xml: &str) -> Result<Vec<DavResponse>> {
         }
     }
 
+    if depth != 0 {
+        return Err(crate::Error::Discovery("truncated DAV multistatus response".into()));
+    }
     Ok(state.responses)
 }
 
@@ -361,6 +364,9 @@ pub fn parse_multistatus_with_token(xml: &str) -> Result<(Vec<DavResponse>, Opti
         }
     }
 
+    if depth != 0 {
+        return Err(crate::Error::Discovery("truncated DAV multistatus response".into()));
+    }
     Ok((state.responses, (!state.sync_token_text.is_empty()).then_some(state.sync_token_text)))
 }
 
