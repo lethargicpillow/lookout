@@ -147,10 +147,20 @@ impl KeyringStore for SecretServiceKeyring {
     async fn store_password(&self, account_id: &AccountId, protocol: &str, password: &str) -> Result<(), String> {
         let service = SecretService::connect(EncryptionType::Dh).await.map_err(keyring_error)?;
         let collection = service.get_default_collection().await.map_err(keyring_error)?;
-        // Best-effort unlock: a locked default collection prompts the user
-        // through the keyring daemon before the write lands.
-        let _ = collection.unlock().await;
-        collection
+        // Session collections are destroyed at logout. Never report a
+        // successful permanent account save into one.
+        match service.get_collection_by_alias("session").await {
+            Ok(session) if session.collection_path == collection.collection_path => {
+                return Err("The default keyring is session-only. Select a permanent keyring in your desktop password manager before saving this account.".to_string());
+            }
+            Ok(_) | Err(secret_service::Error::NoResult) => {}
+            Err(e) => return Err(keyring_error(e)),
+        }
+        if collection.is_locked().await.map_err(keyring_error)? {
+            collection.unlock().await.map_err(keyring_error)?;
+        }
+        let collection_path = collection.collection_path.clone();
+        let item = collection
             .create_item(
                 &format!("Lookout · {} · {}", account_id.0, protocol),
                 slot_attributes(account_id, protocol),
@@ -160,6 +170,14 @@ impl KeyringStore for SecretServiceKeyring {
             )
             .await
             .map_err(keyring_error)?;
+        // Verify the exact saved item through a fresh encrypted session,
+        // not a potentially stale duplicate in another collection.
+        let check = SecretService::connect(EncryptionType::Dh).await.map_err(keyring_error)?;
+        let saved = check.get_item_by_path(item.item_path.clone()).await.map_err(keyring_error)?;
+        if saved.get_secret().await.map_err(keyring_error)? != password.as_bytes() {
+            return Err("The keyring did not retain the saved password. Account settings were not saved.".to_string());
+        }
+        tracing::debug!(account = %account_id.0, protocol, collection = %collection_path, "account password stored and verified");
         Ok(())
     }
 
@@ -171,11 +189,48 @@ impl KeyringStore for SecretServiceKeyring {
         if !matches.locked.is_empty() {
             return Err(keyring_error(secret_service::Error::Locked));
         }
+        let count = matches.unlocked.len();
         for item in matches.unlocked {
             item.delete().await.map_err(keyring_error)?;
         }
+        tracing::info!(account = %account_id.0, count, "account secrets deleted");
         Ok(())
     }
+}
+
+// Resolve both slots before writing either. Blank edit fields must refer
+// to actual existing credentials, not silently preserve missing secrets.
+async fn resolve_account_passwords(
+    keyring: &dyn KeyringStore, id: &AccountId,
+    imap: Option<&str>, smtp: Option<&str>, same_password: bool,
+) -> Result<(String, String), String> {
+    let imap = match imap {
+        Some(p) => p.to_owned(),
+        None => keyring.load_password(id, PROTOCOL_IMAP).await
+            .map_err(|e| format!("Enter the IMAP password: {e}"))?,
+    };
+    let smtp = if same_password { imap.clone() } else {
+        match smtp {
+            Some(p) => p.to_owned(),
+            None => keyring.load_password(id, PROTOCOL_SMTP).await
+                .map_err(|e| format!("Enter the SMTP password: {e}"))?,
+        }
+    };
+    if imap.is_empty() || smtp.is_empty() {
+        return Err("Account passwords cannot be empty.".to_string());
+    }
+    Ok((imap, smtp))
+}
+
+async fn verify_account_passwords(
+    keyring: &dyn KeyringStore, id: &AccountId, imap: &str, smtp: &str,
+) -> Result<(), String> {
+    for (protocol, expected) in [(PROTOCOL_IMAP, imap), (PROTOCOL_SMTP, smtp)] {
+        if keyring.load_password(id, protocol).await? != expected {
+            return Err(format!("The keyring did not retain the {protocol} password. Account settings were not saved."));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -895,9 +950,8 @@ pub fn show_add_account_dialog(
             // config mutation + save stay on the UI thread, like the
             // identities dialog, and only run once the secrets are stored -
             // a failed keyring write leaves settings.json untouched so the
-            // account isn't half-configured. Blank password fields (the
-            // edit-without-changing-the-password case) skip that slot's
-            // write entirely, leaving the existing keyring entry untouched.
+            // account isn't half-configured. Blank edit fields must resolve to existing secrets;
+            // both slots are verified before committing settings.
             save_button.set_sensitive(false);
             let verify = existing.is_none();
             if verify {
@@ -917,17 +971,19 @@ pub fn show_add_account_dialog(
             );
             worker.spawn(async move {
                 let result = async {
+                    let id = AccountId(account_for_worker.id.clone());
+                    let (imap, smtp) = resolve_account_passwords(
+                        keyring.as_ref(), &id, secrets.0.as_deref(), secrets.1.as_deref(),
+                        account_for_worker.use_same_password,
+                    ).await?;
                     if verify {
-                        let imap = secrets.0.clone().ok_or("A password is required")?;
-                        let smtp = secrets.1.clone().ok_or("An SMTP password is required")?;
-                        crate::account_setup::verify_credentials(&account_for_worker, imap, smtp).await?;
+                        crate::account_setup::verify_credentials(&account_for_worker, imap.clone(), smtp.clone()).await?;
                     }
-                    if let Some(password) = &secrets.0 {
-                        keyring.store_password(&AccountId(account_for_worker.id.clone()), PROTOCOL_IMAP, password).await?;
-                    }
-                    if let Some(password) = &secrets.1 {
-                        keyring.store_password(&AccountId(account_for_worker.id.clone()), PROTOCOL_SMTP, password).await?;
-                    }
+                    // Persist both resolved slots in the permanent default
+                    // collection, including secrets found in another collection.
+                    keyring.store_password(&id, PROTOCOL_IMAP, &imap).await?;
+                    keyring.store_password(&id, PROTOCOL_SMTP, &smtp).await?;
+                    verify_account_passwords(keyring.as_ref(), &id, &imap, &smtp).await?;
                     Ok::<_, String>(())
                 }
                 .await;
@@ -1114,6 +1170,24 @@ mod tests {
 
     fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(fut)
+    }
+
+    #[test]
+    fn editing_account_requires_existing_passwords_or_replacements() {
+        let keyring = FakeKeyring::default();
+        let id = AccountId("other:test".into());
+        block_on(async {
+            assert!(resolve_account_passwords(&keyring, &id, None, None, true).await.is_err());
+            keyring.store_password(&id, PROTOCOL_IMAP, "imap").await.unwrap();
+            assert!(resolve_account_passwords(&keyring, &id, None, None, false).await.is_err());
+            assert_eq!(resolve_account_passwords(&keyring, &id, None, None, true).await.unwrap(), ("imap".into(), "imap".into()));
+            keyring.store_password(&id, PROTOCOL_SMTP, "smtp").await.unwrap();
+            assert_eq!(resolve_account_passwords(&keyring, &id, None, None, false).await.unwrap(), ("imap".into(), "smtp".into()));
+            assert_eq!(resolve_account_passwords(&keyring, &id, Some("new"), None, true).await.unwrap(), ("new".into(), "new".into()));
+            assert!(verify_account_passwords(&keyring, &id, "imap", "smtp").await.is_ok());
+            assert!(verify_account_passwords(&keyring, &id, "new", "smtp").await.is_err());
+            assert_eq!(keyring.load_password(&id, PROTOCOL_IMAP).await.unwrap(), "imap");
+        });
     }
 
     #[test]
