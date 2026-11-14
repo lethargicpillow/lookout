@@ -49,6 +49,18 @@ const ENVELOPE_RETRY_COOLDOWN_SECS: i64 = 5 * 60;
 /// and dropping the `Handle`'s `StopSource` cancels the wait immediately,
 /// so a command arriving mid-IDLE is picked up right away.
 const IDLE_SLICE: Duration = Duration::from_secs(25 * 60);
+
+/// Yandex connections in the field have been dropping after a few minutes.
+/// Renew IDLE before that observed interval on both connections, without
+/// changing other providers or the polling path for servers without IDLE.
+const YANDEX_IDLE_SLICE: Duration = Duration::from_secs(90);
+
+fn idle_keepalive_slice(host: &str) -> Duration {
+    match host.trim_end_matches('.').to_ascii_lowercase().as_str() {
+        "imap.yandex.com" | "imap.yandex.ru" => YANDEX_IDLE_SLICE,
+        _ => IDLE_SLICE,
+    }
+}
 /// Normal prefetch must advance even on a quiet mailbox.
 const NORMAL_PREFETCH_INTERVAL: Duration = Duration::from_secs(5);
 /// A usable connection lasting this long resets the primary reconnect delay.
@@ -2105,6 +2117,11 @@ async fn connect_and_run(
     // DavMail's default loopback IMAP endpoint needs a conservative body
     // fetch path. Keep other IMAP accounts on the existing optimized path.
     let davmail_compat = is_local_davmail_endpoint(&config.imap, has_idle);
+    let idle_slice = idle_keepalive_slice(&config.imap.host);
+    if has_idle {
+        tracing::info!(account = %config.account_id, host = %config.imap.host,
+            keepalive_secs = idle_slice.as_secs(), "IMAP IDLE keepalive configured");
+    }
     if davmail_compat {
         tracing::info!("DavMail compatibility: full MIME on demand, no background body fetch");
     }
@@ -2229,7 +2246,7 @@ async fn connect_and_run(
     let mut prefetch = if davmail_compat || prefetch_mailboxes.is_empty() {
         None
     } else {
-        tracing::info!(account = %account_id, count = prefetch_mailboxes.len(), "starting background body prefetch");
+        tracing::info!(account = %account_id, mailboxes = prefetch_mailboxes.len(), "starting background body prefetch");
         Some(PrefetchState::new(prefetch_mailboxes))
     };
 
@@ -2734,7 +2751,7 @@ async fn connect_and_run(
                                     // Normal prefetch also needs timer wakes while work
                                     // remains. Once done, only aggressive mode keeps its
                                     // periodic rescan tick; normal mode resumes keepalive.
-                                    let slice = prefetch_idle_slice(IDLE_SLICE,
+                                    let slice = prefetch_idle_slice(idle_slice,
                                         prefetch.as_ref().is_some_and(|pf| !pf.is_done()), prefetch_policy);
                                     // Wake early if a scheduled outbox send is
                                     // due sooner than the keepalive slice.
@@ -5523,7 +5540,7 @@ async fn connect_and_run(
                     .map(|m| m.id.clone())
                     .collect();
                 if !mailboxes.is_empty() {
-                    tracing::info!(account = %account_id, count = mailboxes.len(), "restarting background body prefetch");
+                    tracing::info!(account = %account_id, mailboxes = mailboxes.len(), "restarting background body prefetch");
                     prefetch = Some(PrefetchState::new(mailboxes));
                 }
             }
@@ -5774,7 +5791,7 @@ async fn connect_and_run(
                     pf.advance();
                     let _ = events.send(AccountEvent::PrefetchFinished { mailbox: finished_mailbox }).await;
                     if pf.is_done() {
-                        tracing::info!("background body prefetch complete");
+                        tracing::info!(account = %account_id, host = %config.imap.host, "background body prefetch complete");
                     }
                 }
             }
@@ -5949,7 +5966,7 @@ async fn run_idle_connection(
             take_mailbox_change(&unsolicited);
             continue;
         }
-        let (wait_fut, stop_source) = handle.wait_with_timeout(IDLE_SLICE);
+        let (wait_fut, stop_source) = handle.wait_with_timeout(idle_keepalive_slice(&config.imap.host));
         // A mailbox switch mid-wait re-selects the new target on the next
         // loop iteration; dropping `wait_fut`/`stop_source` (via `select!`'s
         // implicit drop of the losing branch) cancels the IDLE wait
@@ -10734,6 +10751,18 @@ mod tests {
         assert!(pf.current_folder_name.is_empty());
         assert_eq!(pf.forget_tree(&id("A"), '/'), None, "an already-finished folder has nothing to announce");
         assert_eq!(pf.mailboxes[pf.current], id("Work2"));
+    }
+
+    #[test]
+    fn yandex_idle_keepalive_is_shorter_without_affecting_other_hosts() {
+        assert_eq!(idle_keepalive_slice("imap.yandex.com"), Duration::from_secs(90));
+        assert_eq!(idle_keepalive_slice("IMAP.YANDEX.RU."), Duration::from_secs(90));
+        assert_eq!(idle_keepalive_slice("imap.gmail.com"), IDLE_SLICE);
+        assert_eq!(idle_keepalive_slice("127.0.0.1"), IDLE_SLICE);
+        assert_eq!(idle_keepalive_slice("imap.yandex.com.example.org"), IDLE_SLICE);
+        let policy = PrefetchPolicy::default();
+        assert_eq!(prefetch_idle_slice(idle_keepalive_slice("imap.yandex.com"), true, &policy), NORMAL_PREFETCH_INTERVAL);
+        assert_eq!(prefetch_idle_slice(idle_keepalive_slice("imap.yandex.com"), false, &policy), YANDEX_IDLE_SLICE);
     }
 
     #[test]
