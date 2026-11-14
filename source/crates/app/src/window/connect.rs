@@ -373,6 +373,8 @@ pub(crate) fn connect_account(
             uses_graph_mail,
         },
     );
+    let refresh = state.borrow().composer_identities_refresh.clone();
+    if let Some(refresh) = refresh { refresh(); }
     // Show the account in the sidebar now, under its name, rather than only
     // once its first folder list arrives, which can take a while.
     rebuild_folder_tree(&state, &folder_selection, &folder_scroller);
@@ -1712,6 +1714,8 @@ pub(crate) fn connect_other_account(
             uses_graph_mail: false,
         },
     );
+    let refresh = state.borrow().composer_identities_refresh.clone();
+    if let Some(refresh) = refresh { refresh(); }
     // Show the account in the sidebar now, under its name, rather than only
     // once its first folder list arrives, which can take a while.
     rebuild_folder_tree(&state, &folder_selection, &folder_scroller);
@@ -1801,6 +1805,8 @@ pub(crate) fn teardown_mail_account(
         st.search_pending.retain(|(_, mailbox)| !belongs(mailbox));
         st.current_account.as_ref() == Some(account_id) || st.current_mailbox.as_ref().is_some_and(belongs)
     };
+    let refresh = state.borrow().composer_identities_refresh.clone();
+    if let Some(refresh) = refresh { refresh(); }
     message_list.set_viewer_addresses(viewer_addresses(&state.borrow()));
     clear_account_syncing(state, account_id);
     if open_mailbox_was_this_account {

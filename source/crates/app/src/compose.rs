@@ -144,12 +144,12 @@ pub struct ComposePrefill {
 /// the "Sending" feedback (with Undo during the undo-send delay, item 1.13)
 /// or the "Scheduled for …" one, and returns the `SendMessage`'s
 /// `not_before` and `client_token`.
-pub type SendStarted = Rc<dyn Fn(&ComposedMessage, Option<chrono::DateTime<chrono::Utc>>) -> (Option<chrono::DateTime<chrono::Utc>>, Option<u64>)>;
+pub type SendStarted = Rc<dyn Fn(&AccountId, &ComposedMessage, Option<chrono::DateTime<chrono::Utc>>) -> (Option<chrono::DateTime<chrono::Utc>>, Option<u64>)>;
 
 /// The server-side schedule-send hook (item 5.5 / C-08): given the message and
 /// its scheduled time, returns true when it was scheduled through Exchange (so
 /// nothing goes in the local outbox), false to fall back to it.
-pub type ScheduleSendHook = Rc<dyn Fn(&ComposedMessage, chrono::DateTime<chrono::Utc>) -> bool>;
+pub type ScheduleSendHook = Rc<dyn Fn(&AccountId, &ComposedMessage, chrono::DateTime<chrono::Utc>) -> bool>;
 
 /// Whether Reply excludes the original's other recipients (`Reply`) or
 /// carries them all forward minus the replying account itself (`ReplyAll`).
@@ -1171,6 +1171,7 @@ fn parse_recipients(field: &str) -> Vec<String> {
 /// rendering).
 #[derive(Clone, PartialEq)]
 struct DraftSnapshot {
+    account: AccountId,
     /// The selected sending identity's address - a From change must re-save
     /// the draft like any other edit.
     from: String,
@@ -1240,6 +1241,11 @@ impl PendingAttachment {
 /// selection, falling back to the first entry (the account's own default
 /// identity), and ultimately to a blank placeholder - the send will be
 /// rejected by the SMTP envelope check long before anything goes out.
+fn sender_option_label(identity: &Identity) -> String {
+    if identity.name.trim().is_empty() { identity.email.clone() }
+    else { format!("{} ; {}", identity.name.trim(), identity.email) }
+}
+
 fn selected_identity(identities: &Rc<RefCell<Vec<Identity>>>, from_dropdown: &gtk::DropDown) -> Identity {
     let list = identities.borrow();
     list.get(from_dropdown.selected() as usize)
@@ -1332,7 +1338,9 @@ struct AutosaveCtx {
     /// `Message-ID` to search by). Every later save purges by
     /// `draft_message_id` instead.
     replace_uid: Rc<RefCell<Option<(MailboxId, Uid)>>>,
-    cmd_tx: async_channel::Sender<AccountCommand>,
+    account_sender: Rc<dyn Fn(&AccountId) -> Option<async_channel::Sender<AccountCommand>>>,
+    draft_owner: Rc<RefCell<Option<AccountId>>>,
+    pending_owner: Rc<RefCell<Option<AccountId>>>,
     /// The account's selectable identities (default first) and the From
     /// dropdown that selects among them. Shared with the send handler, so
     /// whatever the dropdown shows is exactly what drafts and sends use.
@@ -1349,6 +1357,30 @@ struct AutosaveCtx {
 impl AutosaveCtx {
     /// The composer's current contents, or `None` when the rich editor can't
     /// be read this tick (document still loading) - the next tick retries.
+    fn discard_copy(&self, account: &AccountId, source: Option<(MailboxId, Uid)>) {
+        if let Some(tx) = (self.account_sender)(account) {
+            let command = match source {
+                Some((mailbox, uid)) => AccountCommand::MoveMessage { mailbox, uid, role: lookout_core::MailboxRole::Trash },
+                None => AccountCommand::DeleteDraft { message_id: (*self.draft_message_id).clone() },
+            };
+            if tx.try_send(command).is_err() {
+                tracing::warn!("could not queue previous draft cleanup");
+            }
+        } else {
+            tracing::warn!("previous draft account unavailable; retaining its copy");
+        }
+    }
+
+    fn confirm_save(&self) {
+        let Some(owner) = self.pending_owner.borrow_mut().take() else { return; };
+        let previous = self.draft_owner.borrow_mut().replace(owner.clone());
+        let source = self.replace_uid.borrow_mut().take();
+        if let Some(previous) = previous.filter(|previous| previous != &owner) {
+            // Retain the previous copy until the new account confirms its save.
+            self.discard_copy(&previous, source);
+        }
+    }
+
     async fn snapshot(&self) -> Option<DraftSnapshot> {
         let rich = self.rich_toggle.is_active();
         let (body, body_text, inline_images) = if rich {
@@ -1360,6 +1392,7 @@ impl AutosaveCtx {
             (text.clone(), text, vec![])
         };
         Some(DraftSnapshot {
+            account: selected_identity(&self.identities, &self.from_dropdown).account_id,
             from: selected_identity(&self.identities, &self.from_dropdown).email,
             to: self.to_row.text_value(),
             cc: self.cc_row.text_value(),
@@ -1435,14 +1468,22 @@ impl AutosaveCtx {
         // clears it); every other replace works by Message-ID, which by now
         // names either this session's earlier save or the reopened draft's
         // own id.
-        let replace = if !self.draft_queued.get() {
-            DraftReplace::None
-        } else if let Some((mailbox, uid)) = self.replace_uid.borrow().clone() {
-            DraftReplace::ByUid { mailbox, uid }
-        } else {
-            DraftReplace::ByMessageId
-        };
         let identity = selected_identity(&self.identities, &self.from_dropdown);
+        let Some(cmd_tx) = (self.account_sender)(&identity.account_id) else {
+            self.status_label.set_label("Mail account unavailable — draft not saved");
+            return false;
+        };
+        let same_owner = self.draft_owner.borrow().as_ref() == Some(&identity.account_id);
+        let replace = if same_owner {
+            match self.replace_uid.borrow().clone() {
+                Some((mailbox, uid)) => DraftReplace::ByUid { mailbox, uid },
+                None => DraftReplace::ByMessageId,
+            }
+        } else if self.draft_queued.get() {
+            DraftReplace::ByMessageId
+        } else {
+            DraftReplace::None
+        };
         let bcc = with_identity_bcc(parse_recipients(&snap.bcc), &identity);
         let msg = ComposedMessage {
             from: identity.email,
@@ -1466,10 +1507,11 @@ impl AutosaveCtx {
             references: self.references.clone(),
             message_id: Some((*self.draft_message_id).clone()),
         };
-        match self.cmd_tx.try_send(AccountCommand::SaveDraft { msg: Box::new(msg), replace }) {
+        match cmd_tx.try_send(AccountCommand::SaveDraft { msg: Box::new(msg), replace }) {
             Ok(()) => {
                 *self.last_saved.borrow_mut() = Some(snap);
                 self.draft_queued.set(true);
+                *self.pending_owner.borrow_mut() = Some(identity.account_id);
                 self.pending.set(true);
                 self.retry_required.set(false);
                 self.status_label.set_label("Saving draft…");
@@ -2201,7 +2243,9 @@ pub fn build_compose_view(
     // reply/forward), resolved by the caller from `AppConfig::signature_defaults`.
     // Appended to the end of the body when the composer opens.
     default_signature: Option<Signature>,
-    cmd_tx: async_channel::Sender<AccountCommand>,
+    account_sender: Rc<dyn Fn(&AccountId) -> Option<async_channel::Sender<AccountCommand>>>,
+    initial_account: AccountId,
+    account_changed: Rc<dyn Fn(&AccountId)>,
     prefill: ComposePrefill,
     on_done: Rc<dyn Fn()>,
     rich_text_default: bool,
@@ -2217,7 +2261,7 @@ pub fn build_compose_view(
     open_contact_picker: crate::contact_picker::ContactPickerOpener,
     on_pop_out: Option<Rc<dyn Fn(PopOutHandle)>>,
     on_send_started: SendStarted,
-    on_send_queue_failed: Rc<dyn Fn(Option<u64>)>,
+    on_send_queue_failed: Rc<dyn Fn(&AccountId, Option<u64>)>,
     // Server-side schedule send (item 5.5 / C-08): returns true when the
     // message was scheduled through Exchange (so nothing goes in the local
     // outbox), false to fall back to it.
@@ -2287,8 +2331,34 @@ pub fn build_compose_view(
     // `identities_source` when the Config → Mail accounts manage dialog
     // changes them, so an edit while a composer is open lands in its From
     // list immediately.
+    let sender_busy = Rc::new(Cell::new(false));
     let identities = Rc::new(RefCell::new(identities_source()));
-    let from_dropdown = gtk::DropDown::builder().selected(0).build();
+    let from_dropdown = gtk::DropDown::builder().selected(0).width_request(56).build();
+    // Closed control: compact From button. Open menu: full sender labels.
+    let from_factory = gtk::SignalListItemFactory::new();
+    from_factory.connect_setup(|_, item| {
+        if let Some(item) = item.downcast_ref::<gtk::ListItem>() {
+            item.set_child(Some(&gtk::Label::new(Some("From"))));
+        }
+    });
+    from_dropdown.set_factory(Some(&from_factory));
+    let list_factory = gtk::SignalListItemFactory::new();
+    list_factory.connect_setup(|_, item| {
+        if let Some(item) = item.downcast_ref::<gtk::ListItem>() {
+            item.set_child(Some(&gtk::Label::builder().xalign(0.0).build()));
+        }
+    });
+    list_factory.connect_bind(|_, item| {
+        if let Some(item) = item.downcast_ref::<gtk::ListItem>() {
+            if let (Some(label), Some(value)) = (item.child().and_downcast::<gtk::Label>(), item.item().and_downcast::<gtk::StringObject>()) {
+                label.set_label(&value.string());
+            }
+        }
+    });
+    from_dropdown.set_list_factory(Some(&list_factory));
+    let from_value = gtk::Label::builder().xalign(0.0).hexpand(true).ellipsize(gtk::pango::EllipsizeMode::End).build();
+    crate::privacy::mark_content(&from_value);
+    let show_from = gtk::ToggleButton::new();
     // Identity names/addresses are content: blurred by privacy mode.
     crate::privacy::mark_content(&from_dropdown);
     // `identities_for_account` always inserts the account's own default
@@ -2306,8 +2376,22 @@ pub fn build_compose_view(
     let update_identity_hint: Rc<dyn Fn()> = {
         let from_dropdown = from_dropdown.clone();
         let identity_hint_icon = identity_hint_icon.clone();
+        let identities = identities.clone();
+        let from_value = from_value.clone();
+        let account_changed = account_changed.clone();
         Rc::new(move || {
-            identity_hint_icon.set_visible(from_dropdown.selected() != 0);
+            let list = identities.borrow();
+            let Some(identity) = list.get(from_dropdown.selected() as usize) else {
+                from_value.set_label("");
+                identity_hint_icon.set_visible(false);
+                return;
+            };
+            let label = sender_option_label(identity);
+            from_value.set_label(&label);
+            from_value.set_tooltip_text(Some(&label));
+            let primary = list.iter().find(|entry| entry.account_id == identity.account_id);
+            identity_hint_icon.set_visible(primary.is_some_and(|entry| !entry.email.eq_ignore_ascii_case(&identity.email)));
+            account_changed(&identity.account_id);
         })
     };
     {
@@ -2318,16 +2402,25 @@ pub fn build_compose_view(
         let identities = identities.clone();
         let from_dropdown = from_dropdown.clone();
         let update_identity_hint = update_identity_hint.clone();
+        let show_from = show_from.clone();
+        let initial_account = initial_account.clone();
+        let sender_busy = sender_busy.clone();
         Rc::new(move || {
+            if sender_busy.get() { return; }
+            let previous = selected_identity(&identities, &from_dropdown);
             let list = identities_source();
-            let labels: Vec<String> = list.iter().map(|i| i.label()).collect();
+            let selected = list.iter().position(|i| i.account_id == previous.account_id && i.email.eq_ignore_ascii_case(&previous.email))
+                .or_else(|| list.iter().position(|i| i.account_id == initial_account)).unwrap_or(0);
+            let account_count = list.iter().map(|i| &i.account_id).collect::<std::collections::HashSet<_>>().len();
+            let labels: Vec<String> = list.iter().map(sender_option_label).collect();
             let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
             let model = gtk::StringList::new(&label_refs);
-            from_dropdown.set_model(Some(&model));
             *identities.borrow_mut() = list;
-            if !labels.is_empty() && from_dropdown.selected() as usize >= labels.len() {
-                from_dropdown.set_selected(0);
-            }
+            from_dropdown.set_model(Some(&model));
+            from_dropdown.set_selected(selected as u32);
+            show_from.set_visible(account_count == 1 && labels.len() > 1);
+            show_from.set_active(account_count >= 2 || (account_count == 1 && selected != 0));
+            from_dropdown.set_sensitive(!labels.is_empty());
             update_identity_hint();
         })
     };
@@ -2337,7 +2430,7 @@ pub fn build_compose_view(
     // unmatched address (the identity was deleted since) silently keeps the
     // default - the saved From header's display name isn't carried over.
     if let Some(email) = prefill.from.as_deref().map(str::trim).filter(|email| !email.is_empty()) {
-        let index = identities.borrow().iter().position(|identity| identity.email.eq_ignore_ascii_case(email));
+        let index = identities.borrow().iter().position(|identity| identity.account_id == initial_account && identity.email.eq_ignore_ascii_case(email));
         if let Some(index) = index {
             from_dropdown.set_selected(index as u32);
         }
@@ -2353,7 +2446,9 @@ pub fn build_compose_view(
     address_form.append(bcc_row.widget());
     let show_bcc = gtk::ToggleButton::builder().active(prefill.bcc.as_deref().is_some_and(|v| !v.trim().is_empty())).build();
     show_bcc.bind_property("active", bcc_row.widget(), "visible").sync_create().build();
-    let show_from = gtk::ToggleButton::builder().active(identities.borrow().len() > 1 || from_dropdown.selected() != 0).build();
+    if identities.borrow().iter().map(|i| &i.account_id).collect::<std::collections::HashSet<_>>().len() == 1 && from_dropdown.selected() != 0 {
+        show_from.set_active(true);
+    }
     let schedule_button = gtk::MenuButton::builder().tooltip_text("Schedule send").build();
     fields_group.attach(&address_form, 1, 0, 1, 1);
     let subject_line = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["compose-subject-line"]).build();
@@ -3055,7 +3150,7 @@ pub fn build_compose_view(
     // send path awaits the rich editor (and possibly an attachment dialog),
     // so without this a double-click - or a click plus the ribbon's Send -
     // queues `SendMessage` twice and the recipient gets the message twice.
-    let sending = Rc::new(Cell::new(false));
+    let sending = sender_busy.clone();
     let status_label = gtk::Label::builder().css_classes(["dim-label"]).build();
     crate::privacy::mark_ui(&status_label);
     // A reopened draft keeps the saved message's own Message-ID (bare, no
@@ -3089,7 +3184,9 @@ pub fn build_compose_view(
         save_lock: Rc::new(futures_util::lock::Mutex::new(())),
         draft_message_id: draft_message_id.clone(),
         replace_uid,
-        cmd_tx: cmd_tx.clone(),
+        account_sender: account_sender.clone(),
+        draft_owner: Rc::new(RefCell::new((prefill.draft_source.is_some() || prefill.draft_saved).then(|| initial_account.clone()))),
+        pending_owner: Rc::new(RefCell::new(None)),
         identities: identities.clone(),
         from_dropdown: from_dropdown.clone(),
         in_reply_to: prefill.in_reply_to.clone(),
@@ -3155,7 +3252,7 @@ pub fn build_compose_view(
                 if message_id == *draft_message_id {
                     autosave.pending.set(false);
                     autosave.retry_required.set(false);
-                    autosave.replace_uid.borrow_mut().take();
+                    autosave.confirm_save();
                     autosave.status_label.set_label("Draft saved");
                 }
             }
@@ -3228,13 +3325,12 @@ pub fn build_compose_view(
         .margin_end(6)
         .build();
     let from_line = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
-    let from_label = gtk::Label::builder().label("From").width_request(56).xalign(0.0).build();
-    address_labels.add_widget(&from_label);
-    from_line.append(&from_label);
+    address_labels.add_widget(&from_dropdown);
     from_line.append(&from_dropdown);
+    from_line.append(&from_value);
     from_line.append(&identity_hint_icon);
     from_line.set_hexpand(true);
-    from_dropdown.set_hexpand(true);
+    from_dropdown.set_hexpand(false);
     from_dropdown.add_css_class("compose-from-select");
     address_form.prepend(&from_line);
     show_from.bind_property("active", &from_line, "visible").sync_create().build();
@@ -3319,8 +3415,7 @@ pub fn build_compose_view(
     {
         let on_done = on_done.clone();
         let closed = closed.clone();
-        let cmd_tx = cmd_tx.clone();
-        let draft_message_id = draft_message_id.clone();
+        let autosave = autosave.clone();
         cancel_button.connect_clicked(move |_| {
             // Discard (UX-08): remove any autosaved copy from Drafts, then
             // close without the final save the old "Cancel" action performed.
@@ -3328,9 +3423,14 @@ pub fn build_compose_view(
             // queued ahead of this delete stays ahead of it on the account's
             // command channel, so the delete still wins.
             closed.set(true);
-            let _ = cmd_tx.send_blocking(AccountCommand::DeleteDraft {
-                message_id: (*draft_message_id).clone(),
-            });
+            let owner = autosave.draft_owner.borrow().clone();
+            let pending = autosave.pending_owner.borrow().clone();
+            if let Some(owner) = &owner {
+                autosave.discard_copy(owner, if pending.as_ref() == Some(owner) { None } else { autosave.replace_uid.borrow().clone() });
+            }
+            if let Some(pending) = pending.filter(|id| Some(id) != owner.as_ref()) {
+                autosave.discard_copy(&pending, None);
+            }
             on_done();
         });
     }
@@ -3423,6 +3523,7 @@ pub fn build_compose_view(
             }
             sending.set(true);
             send_button_for_reminder.set_sensitive(false);
+            from_dropdown.set_sensitive(false);
             let cc = cc_row.addresses();
             let bcc = bcc_row.addresses();
             // Everything from here on has to await the editor read, so the
@@ -3436,7 +3537,7 @@ pub fn build_compose_view(
             let subject = subject_row.text().to_string();
             let autosave = autosave.clone();
             let draft_message_id = draft_message_id.clone();
-            let cmd_tx = cmd_tx.clone();
+            let account_sender = account_sender.clone();
             let identities = identities.clone();
             let from_dropdown = from_dropdown.clone();
             let read_receipt_toggle = read_receipt_toggle.clone();
@@ -3465,9 +3566,33 @@ pub fn build_compose_view(
                 // current and `draft_queued` names it for the outbox to
                 // delete once sent. Commands reach the session in order, so
                 // the save lands before the outbox row is queued.
-                if schedule.is_some() {
+                let identity = selected_identity(&identities, &from_dropdown);
+                let account = identity.account_id.clone();
+                let Some(cmd_tx) = account_sender(&account) else {
+                    autosave.status_label.set_label("Mail account unavailable — message not sent");
+                    sending.set(false);
+                    send_button_for_dialog.set_sensitive(true);
+                    from_dropdown.set_sensitive(true);
+                    return;
+                };
+                if autosave.pending.get() && !autosave.wait_for_save().await {
+                    autosave.status_label.set_label("Draft not confirmed — message not queued");
+                    sending.set(false);
+                    send_button_for_dialog.set_sensitive(true);
+                    from_dropdown.set_sensitive(true);
+                    return;
+                }
+                let switching_draft = autosave.draft_queued.get() && autosave.draft_owner.borrow().as_ref() != Some(&account);
+                if schedule.is_some() || switching_draft {
                     if autosave.pending.get() { let _ = autosave.wait_for_save().await; }
-                    let _ = autosave.flush(true).await;
+                    let queued = !autosave.pending.get() && autosave.flush(true).await;
+                    if !queued || !autosave.wait_for_save().await {
+                        autosave.status_label.set_label("Draft not confirmed — message not queued");
+                        sending.set(false);
+                        send_button_for_dialog.set_sensitive(true);
+                        from_dropdown.set_sensitive(true);
+                        return;
+                    }
                 }
                 let (text_body, html_body, inline_images) = if rich {
                     // Reading the editor's live HTML back out is a round trip
@@ -3497,6 +3622,7 @@ pub fn build_compose_view(
                             autosave.status_label.set_label("Could not read message — try Send again");
                             sending.set(false);
                             send_button_for_dialog.set_sensitive(true);
+                            from_dropdown.set_sensitive(true);
                             return;
                         }
                     }
@@ -3532,6 +3658,7 @@ pub fn build_compose_view(
                         // send it for real.
                         sending.set(false);
                         send_button_for_dialog.set_sensitive(true);
+                        from_dropdown.set_sensitive(true);
                         return;
                     }
                 }
@@ -3541,7 +3668,6 @@ pub fn build_compose_view(
                 // actually goes out (item 0.3) - so a queued send that fails or
                 // is scheduled leaves the draft in Drafts until it's sent.
                 let draft_message_id_used = autosave.draft_queued.get().then(|| (*draft_message_id).clone());
-                let identity = selected_identity(&identities, &from_dropdown);
                 let bcc = with_identity_bcc(bcc.clone(), &identity);
                 let msg = ComposedMessage {
                     from: identity.email,
@@ -3571,7 +3697,7 @@ pub fn build_compose_view(
                 // An iMIP reply or read receipt is never guest-scheduled (its
                 // special MIME body has no Graph equivalent here).
                 if let Some(at) = schedule {
-                    if msg.calendar_part.is_none() && msg.read_receipt.is_none() && on_schedule_send.as_ref().is_some_and(|schedule_send| schedule_send(&msg, at)) {
+                    if msg.calendar_part.is_none() && msg.read_receipt.is_none() && on_schedule_send.as_ref().is_some_and(|schedule_send| schedule_send(&account, &msg, at)) {
                         closed.set(true);
                         on_done();
                         return;
@@ -3584,19 +3710,21 @@ pub fn build_compose_view(
                     autosave.status_label.set_label("Mail account unavailable — message not sent");
                     sending.set(false);
                     send_button_for_dialog.set_sensitive(true);
+                    from_dropdown.set_sensitive(true);
                     return;
                 }
-                let (not_before, client_token) = on_send_started(&msg, schedule);
+                let (not_before, client_token) = on_send_started(&account, &msg, schedule);
                 if cmd_tx.send(AccountCommand::SendMessage {
                     message: Box::new(msg),
                     not_before,
                     client_token,
                 }).await.is_err() {
                     tracing::warn!("compose send: account command channel closed");
-                    on_send_queue_failed(client_token);
+                    on_send_queue_failed(&account, client_token);
                     autosave.status_label.set_label("Mail account unavailable — message not sent");
                     sending.set(false);
                     send_button_for_dialog.set_sensitive(true);
+                    from_dropdown.set_sensitive(true);
                     return;
                 }
                 tracing::debug!("compose send: command accepted; closing editor");
@@ -4256,6 +4384,7 @@ mod tests {
 
     fn snapshot(to: &str, subject: &str, body_text: &str) -> DraftSnapshot {
         DraftSnapshot {
+            account: AccountId("test".into()),
             from: "me@example.com".to_string(),
             to: to.to_string(),
             cc: String::new(),
@@ -4271,6 +4400,16 @@ mod tests {
             attachments: vec![],
             inline_images: vec![],
         }
+    }
+
+    #[test]
+    fn sender_label_and_account_change_are_distinct() {
+        let identity = Identity::new(AccountId("a".into()), "My name", "me@example.com");
+        assert_eq!(sender_option_label(&identity), "My name ; me@example.com");
+        let first = snapshot("recipient@example.com", "subject", "body");
+        let mut second = first.clone();
+        second.account = AccountId("b".into());
+        assert!(should_save(&second, Some(&first), true, false));
     }
 
     #[test]
@@ -4368,6 +4507,7 @@ mod tests {
         // The rich editor's untouched document renders to whitespace-only
         // text even though its HTML is non-empty.
         let snap = DraftSnapshot {
+            account: AccountId("test".into()),
             from: String::new(),
             to: String::new(),
             cc: String::new(),

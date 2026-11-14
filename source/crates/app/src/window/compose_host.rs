@@ -304,6 +304,12 @@ pub(crate) fn show_composer_in_reading_pane_full(
         reading_stack.set_visible_child_name("compose");
         return;
     }
+    let account_id = account_id.or_else(|| {
+        let st = state.borrow();
+        st.accounts.iter().find(|(_, handle)| handle.cmd_tx.same_channel(&cmd_tx)).map(|(id, _)| id.clone())
+    });
+    let Some(initial_account) = account_id.clone() else { return; };
+    let active_sender = Rc::new(RefCell::new(initial_account.clone()));
     // Seed the delivery-receipt checkbox (C-07) from the global "request for
     // all messages I send" setting. A composer that already carries a
     // decision - a reopened draft or a withdrawn scheduled send - keeps it.
@@ -529,23 +535,40 @@ pub(crate) fn show_composer_in_reading_pane_full(
     // UI memory synchronously (cheap, no SQLite); the mail-history half is
     // an off-thread cache read (`spawn_cache_read`) - the completion callback
     // fires once it answers, merged with the CardDAV half computed up front.
-    let address_cache = account_id.clone().and_then(|id| state.borrow().accounts.get(&id).and_then(|h| h.address_cache.clone()));
-    let carddav_provider = SnapshotContactsProvider {
-        state: state.clone(),
-        account: account_id.clone(),
-    };
+    let active_for_suggestions = active_sender.clone();
     let worker_for_suggestions = worker.clone();
     let state_for_suggestions = state.clone();
-    let account_for_suggestions = account_id.clone();
-    // The directory source this composer's To/Cc/Bcc fields (and its recipient
-    // picker, via `directory_lookup` below) search (item 4.7.6): scoped to the
-    // account being sent from, so only that account's directories answer.
-    let directory = crate::directory::directory_source(state, account_id.clone(), worker.clone());
+    // Cache the directory source for the active sender, preserving its
+    // debounce and generation state until the sender changes.
+    let directory = Rc::new(RefCell::new((initial_account.clone(),
+        crate::directory::directory_source(state, Some(initial_account.clone()), worker.clone()))));
     // The full address book is a separate search surface. Do not share
     // autocomplete's debounce/generation or its eight-result limit.
     let picker_directory = crate::directory::people_directory_source(state, worker.clone());
     let directory_lookup = picker_directory.suggestion_lookup();
     let suggestions: crate::recipient_entry::SuggestionSource = Rc::new(move |prefix: &str, complete: Rc<dyn Fn(Vec<crate::recipient_entry::Suggestion>)>| {
+        let account_for_suggestions = Some(active_for_suggestions.borrow().clone());
+        let carddav_provider = SnapshotContactsProvider {
+            state: state_for_suggestions.clone(),
+            account: account_for_suggestions.clone(),
+        };
+        let address_cache = account_for_suggestions.as_ref().and_then(|id| state_for_suggestions.borrow().accounts.get(id).and_then(|h| h.address_cache.clone()));
+        let id = active_for_suggestions.borrow().clone();
+        let directory = {
+            let mut current = directory.borrow_mut();
+            if current.0 != id {
+                *current = (id.clone(), crate::directory::directory_source(&state_for_suggestions, Some(id), worker_for_suggestions.clone()));
+            }
+            current.1.clone()
+        };
+        // Ignore late results from the previous sender.
+        let complete = {
+            let active = active_for_suggestions.clone();
+            let expected = account_for_suggestions.clone();
+            Rc::new(move |hits| {
+                if expected.as_ref() == Some(&*active.borrow()) { complete(hits); }
+            }) as Rc<dyn Fn(Vec<crate::recipient_entry::Suggestion>)>
+        };
         let carddav = carddav_provider.search_contacts(prefix, 8);
         // Contact lists (P-05) live on the same account snapshots the picker
         // reads; collect the ones whose name matches the typed prefix.
@@ -606,19 +629,18 @@ pub(crate) fn show_composer_in_reading_pane_full(
     // friends in `connect_account`).
     let on_send_started: crate::compose::SendStarted = {
         let state = state.clone();
-        let account_id = account_id.clone();
         // The answer is applied once, on the first Send - a second Send
         // click would be a no-op anyway, but the flag keeps it from writing
         // the same PARTSTAT twice.
         let reply_applied = Rc::new(Cell::new(false));
-        Rc::new(move |message: &lookout_mail::ComposedMessage, schedule| {
+        Rc::new(move |account: &AccountId, message: &lookout_mail::ComposedMessage, schedule| {
             if let Some(reply) = &imip_reply {
                 if !reply_applied.replace(true) {
                     save_replied_event(&reply.calendar_state, &reply.toast_overlay, reply.event.clone());
                     (reply.on_applied)();
                 }
             }
-            start_send_feedback(&state, account_id.clone(), message, schedule)
+            start_send_feedback(&state, Some(account.clone()), message, schedule)
         })
     };
     // Backs the To row's address-book button: opens `contact_picker` over
@@ -650,17 +672,18 @@ pub(crate) fn show_composer_in_reading_pane_full(
         // account when no explicit account was resolved.
         {
             let state = state.clone();
-            let account_id = account_id.clone();
+            let initial = initial_account.clone();
             Rc::new(move || {
                 let st = state.borrow();
-                let resolved = account_id.clone().or_else(|| st.accounts.keys().next().cloned());
-                match resolved {
-                    Some(id) => match st.accounts.get(&id) {
-                        Some(handle) => st.app_config.borrow().identities_for_account(&id, &handle.display_name, &handle.email),
-                        None => Vec::new(),
-                    },
-                    None => Vec::new(),
-                }
+                let mut accounts: Vec<_> = st.accounts.iter().filter(|(_, handle)| !handle.cmd_tx.is_closed()).collect();
+                accounts.sort_by(|(a, ah), (b, bh)| {
+                    (*a != &initial).cmp(&(*b != &initial))
+                        .then_with(|| ah.display_name.to_lowercase().cmp(&bh.display_name.to_lowercase()))
+                        .then_with(|| ah.email.cmp(&bh.email))
+                        .then_with(|| a.0.cmp(&b.0))
+                });
+                let config = st.app_config.borrow();
+                accounts.into_iter().flat_map(|(id, handle)| config.identities_for_account(id, &handle.display_name, &handle.email)).collect()
             })
         },
         // The composer's signature menu re-reads the global signature list
@@ -675,8 +698,8 @@ pub(crate) fn show_composer_in_reading_pane_full(
         // `UiState::manage_signatures`).
         {
             let manage = state.borrow().manage_signatures.clone();
-            let account = account_id.clone();
-            manage.map(|manage| Rc::new(move |anchor: &gtk::Widget| manage(anchor, account.clone())) as Rc<dyn Fn(&gtk::Widget)>)
+            let account = active_sender.clone();
+            manage.map(|manage| Rc::new(move |anchor: &gtk::Widget| manage(anchor, Some(account.borrow().clone()))) as Rc<dyn Fn(&gtk::Widget)>)
         },
         // The composer's My Templates menu re-reads the global template list
         // each time it opens (item 2.10 / C-17), like the signature menu.
@@ -703,7 +726,15 @@ pub(crate) fn show_composer_in_reading_pane_full(
             });
             id.and_then(|id| config.signatures.iter().find(|s| s.id == id).cloned())
         },
-        cmd_tx,
+        {
+            let state = state.clone();
+            Rc::new(move |id| state.borrow().accounts.get(id).map(|handle| handle.cmd_tx.clone()).filter(|tx| !tx.is_closed()))
+        },
+        initial_account.clone(),
+        {
+            let active_sender = active_sender.clone();
+            Rc::new(move |id| *active_sender.borrow_mut() = id.clone())
+        },
         prefill,
         on_done,
         rich_text_default,
@@ -716,9 +747,8 @@ pub(crate) fn show_composer_in_reading_pane_full(
         on_send_started,
         {
             let state = state.clone();
-            let account_id = account_id.clone();
-            Rc::new(move |token| {
-                if let (Some(account_id), Some(token)) = (account_id.as_ref(), token) {
+            Rc::new(move |account_id, token| {
+                if let Some(token) = token {
                     take_pending_send(&state, account_id, 0, Some(token));
                 }
             })
@@ -729,16 +759,8 @@ pub(crate) fn show_composer_in_reading_pane_full(
         // outbox handles it.
         {
             let state = state.clone();
-            let account_id = account_id.clone();
-            Some(Rc::new(move |message: &lookout_mail::ComposedMessage, at: chrono::DateTime<chrono::Utc>| {
-                let resolved = {
-                    let st = state.borrow();
-                    account_id.clone().or_else(|| st.accounts.keys().next().cloned())
-                };
-                match resolved {
-                    Some(id) => schedule_send_via_graph(&state, &id, message, at),
-                    None => false,
-                }
+            Some(Rc::new(move |account_id: &AccountId, message: &lookout_mail::ComposedMessage, at: chrono::DateTime<chrono::Utc>| {
+                schedule_send_via_graph(&state, account_id, message, at)
             }))
         },
         true, // keep the editor independent of mail selection
