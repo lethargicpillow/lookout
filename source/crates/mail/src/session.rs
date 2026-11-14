@@ -1737,7 +1737,7 @@ pub async fn run_account_session(
                 continue;
             }
             Err(e) => {
-                tracing::warn!("account session error, will reconnect: {e}");
+                tracing::warn!(account = %config.account_id, host = %config.imap.host, retry_in_secs = backoff.as_secs(), "account session error, will reconnect: {e}");
                 // Connection failures are warning-level: the loop below
                 // retries with backoff, so only the connection-lifecycle
                 // event is sent (no duplicate `AccountEvent::Error`). The UI
@@ -1993,6 +1993,7 @@ async fn connect_and_run(
             return Err(error);
         }
     };
+    tracing::info!(account = %config.account_id, host = %config.imap.host, "IMAP session authenticated");
     // Both the primary and dedicated connections must respect IDLE capability.
     let ServerCapabilities {
         has_move,
@@ -2023,6 +2024,7 @@ async fn connect_and_run(
     }
     let account_id = config.account_id.clone();
     let (mut folders, list_counts_supplied) = list_mailboxes(&mut session, &account_id, condstore, has_list_status).await?;
+    tracing::debug!(account = %account_id, count = folders.len(), "initial IMAP folder list received");
     // Fast first paint: the folder tree shows immediately and the INBOX sync
     // that fills the message list starts right away. On a LIST-STATUS (RFC
     // 5819) connection the list just answered every folder's counts in that
@@ -2066,6 +2068,8 @@ async fn connect_and_run(
         davmail_compat,
     )
     .await?;
+
+    tracing::info!(account = %account_id, host = %config.imap.host, "initial INBOX synchronization complete");
 
     // Folders still awaiting their STATUS count, drained cooperatively below.
     // Held as ids rather than indices so a re-list that reorders (or shortens)
