@@ -5556,7 +5556,6 @@ async fn connect_and_run(
                     let mailbox_meta = session.select(&folder_name).await?;
                     session_selected = pf.mailboxes[pf.current].clone();
                     selected_for_prefetch = true;
-                    did_prefetch_work = true;
                     // The prefetch is the first SELECT most folders ever get
                     // (only the open folder and STATUS-dirty ones go through
                     // `sync_mailbox`), so it's the primary place their
