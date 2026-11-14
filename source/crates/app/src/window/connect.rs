@@ -335,6 +335,7 @@ pub(crate) fn connect_account(
     // ahead of the background one - see `AccountHandle::interactive_cmd_tx`.
     let (cmd_tx, cmd_rx) = async_channel::unbounded();
     let (interactive_cmd_tx, interactive_cmd_rx) = async_channel::unbounded();
+    let lifecycle = cmd_rx.clone();
     let (evt_tx, evt_rx) = async_channel::bounded(EVENT_CHANNEL_CAPACITY);
     state.borrow_mut().accounts.insert(
         account_id.clone(),
@@ -452,6 +453,7 @@ pub(crate) fn connect_account(
 
     spawn_account_event_loop(
         evt_rx,
+        lifecycle,
         state,
         account_id,
         folder_selection,
@@ -569,6 +571,7 @@ pub(crate) fn collapse_subscription_events(events: Vec<SubscriptionSessionEvent>
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_account_event_loop(
     evt_rx: async_channel::Receiver<AccountEvent>,
+    lifecycle: async_channel::Receiver<lookout_mail::session::AccountCommand>,
     state: Rc<RefCell<UiState>>,
     account_id: AccountId,
     folder_selection: gtk::SingleSelection,
@@ -588,6 +591,10 @@ pub(crate) fn spawn_account_event_loop(
 ) {
     glib::spawn_future_local(async move {
         while let Ok(event) = evt_rx.recv().await {
+            // A removed or replaced session must never repaint a mailbox.
+            if lifecycle.is_closed() || !state.borrow().accounts.contains_key(&account_id) {
+                break;
+            }
             // Drain the whole queued batch before handling, collapsing
             // whole-snapshot events (folders, message lists) into the last
             // copy of each - the startup burst queues the same envelope set
@@ -1640,6 +1647,7 @@ pub(crate) fn connect_other_account(
     // ahead of the background one - see `AccountHandle::interactive_cmd_tx`.
     let (cmd_tx, cmd_rx) = async_channel::unbounded();
     let (interactive_cmd_tx, interactive_cmd_rx) = async_channel::unbounded();
+    let lifecycle = cmd_rx.clone();
     let (evt_tx, evt_rx) = async_channel::bounded(EVENT_CHANNEL_CAPACITY);
     state.borrow_mut().accounts.insert(
         account_id.clone(),
@@ -1701,6 +1709,7 @@ pub(crate) fn connect_other_account(
 
     spawn_account_event_loop(
         evt_rx,
+        lifecycle,
         state,
         account_id,
         folder_selection,
@@ -1741,7 +1750,12 @@ pub(crate) fn teardown_mail_account(
     // navigate away or the messages stay on screen).
     let open_mailbox_was_this_account = {
         let mut st = state.borrow_mut();
-        st.accounts.remove(account_id);
+        if let Some(handle) = st.accounts.remove(account_id) {
+            // Close explicitly: composers and pending commands may own clones.
+            handle.cmd_tx.close();
+            handle.interactive_cmd_tx.close();
+        }
+        st.folder_tree = None;
         st.forget_account_bodies(account_id);
         st.refreshing.remove(account_id);
         st.graph_property_syncs.forget(account_id);
@@ -1753,8 +1767,9 @@ pub(crate) fn teardown_mail_account(
         st.pending_optimistic_pinned_changes.retain(|mailbox, _| !belongs(mailbox));
         st.search_results.retain(|summary| !belongs(&summary.mailbox));
         st.search_pending.retain(|(_, mailbox)| !belongs(mailbox));
-        st.current_mailbox.as_ref().is_some_and(belongs)
+        st.current_account.as_ref() == Some(account_id) || st.current_mailbox.as_ref().is_some_and(belongs)
     };
+    message_list.set_viewer_addresses(viewer_addresses(&state.borrow()));
     clear_account_syncing(state, account_id);
     if open_mailbox_was_this_account {
         enter_unified_inbox(state, message_list, message_list_stack);
@@ -1850,7 +1865,22 @@ pub(crate) fn teardown_goa_account(
         let mut st = state.borrow_mut();
         st.contacts_by_account.remove(account_id);
         st.deleted_contacts.remove(account_id);
-        st.contact_cmd_tx.remove(account_id);
+        if let Some(tx) = st.contact_cmd_tx.remove(account_id) {
+            tx.close();
+        }
+        // Invalidate a cached dispatcher and any outstanding directory search.
+        st.contacts_directory_source = None;
+        if st.contacts_directory_account.as_ref() == Some(account_id) {
+            st.contacts_directory_generation = st.contacts_directory_generation.wrapping_add(1);
+            st.contacts_directory_account = None;
+            st.contacts_directory_active = false;
+            st.contacts_directory_searching = false;
+            st.contacts_directory_results.clear();
+            st.contacts_directory_selected = None;
+            st.contacts_directory_total = 0;
+            st.contacts_directory_local = false;
+            st.contacts_directory_query.clear();
+        }
         drop(st);
         refresh_contacts_ui(None);
     }
@@ -1869,7 +1899,9 @@ fn teardown_goa_calendar(
 ) {
     {
         let mut st = calendar_state.borrow_mut();
-        st.accounts.remove(account_id);
+        if let Some(handle) = st.accounts.remove(account_id) {
+            handle.cmd_tx.close();
+        }
         st.calendar_cache_slots.remove(account_id);
         // Calendar ids embed their account's id as a prefix; drop every
         // checked entry belonging to the disabled account.
@@ -2857,6 +2889,7 @@ pub(crate) fn connect_calendar_account(
     let (cmd_tx, cmd_rx) = async_channel::unbounded();
     let (evt_tx, evt_rx) = async_channel::bounded(EVENT_CHANNEL_CAPACITY);
     let shared_cmd_tx = cmd_tx.clone();
+    let lifecycle = cmd_rx.clone();
     calendar_state.borrow_mut().accounts.insert(
         account_id.clone(),
         CalendarAccountHandle {
@@ -2920,6 +2953,9 @@ pub(crate) fn connect_calendar_account(
     let cache_worker = worker.clone();
     glib::spawn_future_local(async move {
         while let Ok(event) = evt_rx.recv().await {
+            if lifecycle.is_closed() || !calendar_state.borrow().accounts.contains_key(&account_id) {
+                break;
+            }
             // Drain the whole queued batch before handling, collapsing
             // whole-snapshot events (calendars, a month's occurrences, tasks)
             // into the last copy of each - the fast-paint cache replay and

@@ -423,6 +423,14 @@ impl AppConfig {
         self.other_accounts.iter().find(|a| a.id == id).cloned()
     }
 
+    /// Remove a manual account and the directory settings owned by it.
+    pub fn remove_other_account(&mut self, account_id: &AccountId) {
+        self.other_accounts.retain(|a| a.id != account_id.0);
+        self.oab_urls.remove(&account_id.0);
+        self.directory_accounts.retain(|id| id != account_id);
+        self.ldap_directories.retain(|directory| &directory.account_id != account_id);
+    }
+
     /// The parent Microsoft 365 account whose OAuth token a shared mailbox
     /// borrows, when `id` names one (item 5.6 / M-42).
     pub fn shared_mailbox_parent(&self, id: &AccountId) -> Option<AccountId> {
@@ -1066,6 +1074,20 @@ mod tests {
         assert_eq!(config.other_accounts.len(), 1);
         assert_eq!(config.other_account(&account.id), Some(edited));
         assert_eq!(config.other_account("other:nope"), None);
+
+        // Removing a manual account must not leave an orphan GAL row.
+        let removed = AccountId(account.id.clone());
+        let survivor = AccountId("other:survivor".into());
+        config.oab_urls.insert(removed.0.clone(), "https://example.com/OAB/".into());
+        config.oab_urls.insert(survivor.0.clone(), "https://example.org/OAB/".into());
+        config.set_directory_enabled(&removed, true);
+        config.set_directory_enabled(&survivor, true);
+        config.remove_other_account(&removed);
+        assert!(config.other_accounts.is_empty());
+        assert!(!config.oab_urls.contains_key(&removed.0));
+        assert!(config.oab_urls.contains_key(&survivor.0));
+        assert!(!config.directory_enabled_for(&removed));
+        assert!(config.directory_enabled_for(&survivor));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

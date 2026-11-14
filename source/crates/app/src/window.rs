@@ -10552,6 +10552,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let run_directory_search = run_directory_search.clone();
         let goa_connect = goa_connect.clone();
         let goa_teardown = goa_teardown.clone();
+        let current_mail_page = current_mail_page.clone();
+        let current_lookout_page = current_lookout_page.clone();
+        let current_calendar_page = current_calendar_page.clone();
+        let current_tasks_page = current_tasks_page.clone();
         move || {
             let st = state.borrow();
             // The GOA enable/disable list - every account the discoveries
@@ -10844,7 +10848,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                             let account_id = AccountId(account_id.to_string());
                             {
                                 let mut st = state.borrow_mut();
-                                st.accounts.remove(&account_id);
+                                if let Some(handle) = st.accounts.remove(&account_id) {
+                                    handle.cmd_tx.close();
+                                    handle.interactive_cmd_tx.close();
+                                }
                                 st.forget_account_bodies(&account_id);
                             }
                             let Some(account) = state.borrow().app_config.borrow().other_account(&account_id.0) else {
@@ -10883,15 +10890,41 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let refresh_hook = refresh_hook.clone();
                 let calendar_state = calendar_state.clone();
                 let goa_teardown = goa_teardown.clone();
+                let current_mail_page = current_mail_page.clone();
+                let current_lookout_page = current_lookout_page.clone();
+                let current_calendar_page = current_calendar_page.clone();
+                let current_tasks_page = current_tasks_page.clone();
+                let current_contacts_page = current_contacts_page.clone();
                 Rc::new(move |_anchor, account_id: &str| {
                     let account_id = AccountId(account_id.to_string());
                     {
                         let app_config = state.borrow().app_config.clone();
-                        app_config.borrow_mut().other_accounts.retain(|a| a.id != account_id.0);
-                        app_config.borrow_mut().oab_urls.remove(&account_id.0);
+                        app_config.borrow_mut().remove_other_account(&account_id);
                         crate::app_config::save(&app_config.borrow());
                     }
                     goa_teardown(&account_id, GoaServices::ALL);
+                    // Keep the page selectors in sync too: returning from Config
+                    // must not reopen a service view whose last account is gone.
+                    {
+                        let st = state.borrow();
+                        if st.accounts.is_empty() {
+                            current_mail_page.set("empty");
+                            current_lookout_page.set("lookout-empty");
+                        }
+                        if st.contact_cmd_tx.is_empty() && st.contacts_by_account.is_empty()
+                            && st.desktop_contacts.is_empty() && !crate::directory::directory_configured_for_state(&st) {
+                            current_contacts_page.set("contacts-empty");
+                        }
+                    }
+                    {
+                        let st = calendar_state.borrow();
+                        if st.accounts.is_empty() {
+                            current_calendar_page.set("calendar-empty");
+                            if st.google_tasks.is_empty() && st.graph_todo.is_empty() {
+                                current_tasks_page.set("tasks-empty");
+                            }
+                        }
+                    }
                     // The account is gone for good (unlike a Config disable,
                     // which keeps the on-disk state for a re-enable), so prune
                     // its folder-pane expansion rows too - the mailbox ids
