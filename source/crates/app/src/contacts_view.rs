@@ -2658,6 +2658,7 @@ pub fn sync_contacts_account(
     let goa_client = goa_client.into();
     let (tx, rx) = async_channel::unbounded();
     let cache_account_id = account_id.clone();
+    let lifecycle = cmd_rx.clone();
     worker.spawn(async move {
         // The per-account contacts cache: fast-paint source at startup, the
         // full contact set deltas are applied to, and the RFC 6578 sync-token /
@@ -2779,6 +2780,8 @@ pub fn sync_contacts_account(
 
     glib::spawn_future_local(async move {
         while let Ok((is_first, result)) = rx.recv().await {
+            // A late snapshot must not reinsert a removed account.
+            if lifecycle.is_closed() { break; }
             match result {
                 Ok(contacts) => {
                     if state.borrow().contacts_by_account.get(&account_id).is_some_and(|previous| previous.same_content(&contacts)) {

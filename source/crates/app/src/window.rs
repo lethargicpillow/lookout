@@ -10882,20 +10882,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let toast_overlay = toast_overlay.clone();
                 let refresh_hook = refresh_hook.clone();
                 let calendar_state = calendar_state.clone();
+                let goa_teardown = goa_teardown.clone();
                 Rc::new(move |_anchor, account_id: &str| {
                     let account_id = AccountId(account_id.to_string());
-                    {
-                        let mut st = state.borrow_mut();
-                        st.accounts.remove(&account_id);
-                        st.forget_account_bodies(&account_id);
-                    }
                     {
                         let app_config = state.borrow().app_config.clone();
                         app_config.borrow_mut().other_accounts.retain(|a| a.id != account_id.0);
                         app_config.borrow_mut().oab_urls.remove(&account_id.0);
                         crate::app_config::save(&app_config.borrow());
                     }
-                    calendar_state.borrow_mut().calendar_cache_slots.remove(&account_id);
+                    goa_teardown(&account_id, GoaServices::ALL);
                     // The account is gone for good (unlike a Config disable,
                     // which keeps the on-disk state for a re-enable), so prune
                     // its folder-pane expansion rows too - the mailbox ids
@@ -11428,10 +11424,26 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let mail_view_button = mail_view_button.clone();
         let current_lookout_page = current_lookout_page.clone();
         let lookout_view_button = lookout_view_button.clone();
+        let calendar_state = calendar_state.clone();
+        let calendar_main = calendar_main.clone();
+        let calendar_list_box = calendar_sidebar.calendar_list_box.clone();
+        let mini_calendar = calendar_sidebar.mini_calendar.clone();
+        let mail_overview_day = mail_overview_day.clone();
+        let mail_overview_day_list = mail_overview_day_list.clone();
+        let reminders_engine = reminders_engine.clone();
+        let tasks_view = tasks_view.clone();
+        let current_calendar_page = current_calendar_page.clone();
+        let current_tasks_page = current_tasks_page.clone();
+        let calendar_view_button = calendar_view_button.clone();
+        let tasks_view_button = tasks_view_button.clone();
+        let current_contacts_page = current_contacts_page.clone();
+        let contacts_view_button = contacts_view_button.clone();
+        let refresh_contacts_ui = refresh_contacts_ui.clone();
         Rc::new(move |account_id: &str| {
             let Some(account) = state.borrow().app_config.borrow().other_account(account_id) else {
                 return;
             };
+            let dav = crate::other_accounts::davmail_accounts(&account);
             connect_other_account(
                 worker.clone(),
                 state.clone(),
@@ -11451,6 +11463,46 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 mark_read_icon.clone(),
                 pin_icon.clone(),
             );
+            // DavMail's companion services must start on account creation,
+            // not only during startup discovery. The same account ID owns
+            // mail, calendar, contacts and the GAL directory.
+            if let Some((calendar, contacts)) = dav {
+                let id = contacts.account_id.clone();
+                if !state.borrow().contact_cmd_tx.contains_key(&id) {
+                    let (cmd_tx, cmd_rx) = async_channel::unbounded();
+                    state.borrow_mut().contact_cmd_tx.insert(id.clone(), cmd_tx);
+                    sync_contacts_account(
+                        worker.clone(), state.clone(), toast_overlay.clone(),
+                        None::<lookout_goa::GoaClient>, contacts, cmd_rx,
+                        refresh_contacts_ui.clone(), offline_receiver(&state),
+                    );
+                }
+                // Directory rows can be shown before the first CardDAV or
+                // OAB snapshot. Refresh immediately, including empty People.
+                current_contacts_page.set("contacts");
+                refresh_contacts_ui(None);
+                if contacts_view_button.is_active() {
+                    root_stack.set_visible_child_name("contacts");
+                }
+
+                if !calendar_state.borrow().accounts.contains_key(&id) {
+                    connect_calendar_account(
+                        worker.clone(), calendar_state.clone(), calendar_main.clone(),
+                        calendar_list_box.clone(), mini_calendar.clone(),
+                        mail_overview_day.clone(), mail_overview_day_list.clone(),
+                        reminders_engine.clone(), toast_overlay.clone(),
+                        None::<lookout_goa::GoaClient>, calendar, tasks_view.clone(), Vec::new(),
+                    );
+                }
+                current_calendar_page.set("calendar");
+                current_tasks_page.set("tasks");
+                if calendar_view_button.is_active() {
+                    root_stack.set_visible_child_name("calendar");
+                }
+                if tasks_view_button.is_active() {
+                    root_stack.set_visible_child_name("tasks");
+                }
+            }
             // The first account added from the "No Mail Accounts" page: show
             // the mail it's about to sync rather than the empty state, as
             // account discovery does.
