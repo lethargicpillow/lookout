@@ -2790,6 +2790,9 @@ pub fn sync_contacts_account(
         };
         // The Graph transport, built once per session; `None` for CardDAV.
         let graph = graph_backend.then(|| ContactsClient::new(GraphClient::new(MicrosoftOAuth::for_account(&account.account_id))));
+        // Only Google contacts reuse a DAV transport and the recently
+        // discovered book list. Credentials still come from GOA each time.
+        let mut google_dav = GoogleContactsSession::default();
         let mut first = true;
         let mut initial_live_sync = true;
         let mut last_snapshot: Option<ContactsAccountSnapshot> = None;
@@ -2855,7 +2858,7 @@ pub fn sync_contacts_account(
                     ContactCommand::Create { book_href, card, reply } => {
                         let result = match &graph {
                             Some(client) => graph_create_contact(client, &book_href, &card).await,
-                            None => put_contact(goa_client.clone(), account.clone(), new_contact_href(&book_href, &card), &card, None).await,
+                            None => put_contact(goa_client.clone(), account.clone(), new_contact_href(&book_href, &card), &card, None, &mut google_dav).await,
                         };
                         let _ = reply.send(result.clone()).await;
                         if result.is_ok() {
@@ -2865,7 +2868,7 @@ pub fn sync_contacts_account(
                     ContactCommand::Update { href, etag, card, reply } => {
                         let result = match &graph {
                             Some(client) => graph_update_contact(client, &href, etag.as_deref(), &card).await,
-                            None => put_contact(goa_client.clone(), account.clone(), href, &card, etag).await,
+                            None => put_contact(goa_client.clone(), account.clone(), href, &card, etag, &mut google_dav).await,
                         };
                         let _ = reply.send(result.clone()).await;
                         if result.is_ok() {
@@ -2877,7 +2880,7 @@ pub fn sync_contacts_account(
                         let result = match tokio::time::timeout(std::time::Duration::from_secs(45), async {
                             match &graph {
                                 Some(client) => graph_delete_contact(client, &href, etag.as_deref()).await,
-                                None => delete_contact(goa_client.clone(), account.clone(), href.clone(), etag).await,
+                                None => delete_contact(goa_client.clone(), account.clone(), href.clone(), etag, &mut google_dav).await,
                             }
                         }).await {
                             Ok(result) => result,
@@ -2945,12 +2948,17 @@ pub fn sync_contacts_account(
             let result = match tokio::time::timeout(timeout, async {
                 match &graph {
                     Some(client) => fetch_graph_contacts(client, &account, cache.as_ref()).await,
-                    None => fetch_carddav_contacts(goa_client.clone(), account.clone(), cache.as_ref()).await,
+                    None => fetch_carddav_contacts(goa_client.clone(), account.clone(), cache.as_ref(), &mut google_dav).await,
                 }
             }).await {
                 Ok(result) => result,
                 Err(_) => Err("Contacts synchronization timed out; previous contacts remain available.".to_string()),
             };
+            if result.is_err() {
+                // A failed poll must not keep using a possibly stale book
+                // URL. Rediscover on the next attempt, but keep the pool.
+                google_dav.books = None;
+            }
             tracing::info!(account = %account.account_id, success = result.is_ok(), elapsed_ms = started.elapsed().as_millis(), "contacts live sync finished");
             if let Ok(snapshot) = &result {
                 last_snapshot = Some(snapshot.clone());
@@ -3022,7 +3030,22 @@ pub fn sync_contacts_account(
 /// Builds the authenticated DAV client + fresh credential for one CardDAV
 /// account - shared by the poll fetch and the write path, so a command
 /// executed between polls authenticates exactly like a poll would.
-async fn carddav_connection(goa_client: &Option<GoaClient>, account: &GoaContactsAccount) -> Result<(DavClient, Credential), String> {
+const GOOGLE_BOOK_DISCOVERY_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+#[derive(Default)]
+struct GoogleContactsSession {
+    client: Option<DavClient>,
+    books: Option<(std::time::Instant, Vec<lookout_dav::AddressBookInfo>)>,
+}
+
+impl GoogleContactsSession {
+    fn recent_books(&self) -> Option<Vec<lookout_dav::AddressBookInfo>> {
+        self.books.as_ref().filter(|(at, _)| at.elapsed() < GOOGLE_BOOK_DISCOVERY_TTL)
+            .map(|(_, books)| books.clone())
+    }
+}
+
+async fn carddav_connection(goa_client: &Option<GoaClient>, account: &GoaContactsAccount, google_dav: &mut GoogleContactsSession) -> Result<(DavClient, Credential), String> {
     let credential = if let Some(goa_client) = goa_client {
         let google = account.provider_type.as_deref() == Some("google");
         // Google GOA GetAccessToken already refreshes an expired OAuth token.
@@ -3055,6 +3078,9 @@ async fn carddav_connection(goa_client: &Option<GoaClient>, account: &GoaContact
         Credential::Password(keyring.load_password(&account.account_id, crate::other_accounts::PROTOCOL_IMAP).await?)
     };
 
+    if let Some(client) = &google_dav.client {
+        return Ok((client.clone(), credential));
+    }
     let config = CardDavAccountConfig {
         account_id: account.account_id.clone(),
         display_name: account.display_name.clone(),
@@ -3070,14 +3096,17 @@ async fn carddav_connection(goa_client: &Option<GoaClient>, account: &GoaContact
         },
     };
     let client = DavClient::new(&config.base_url, config.accept_ssl_errors, config.username.clone()).map_err(|e| e.to_string())?;
+    if client.uses_google_contacts() {
+        google_dav.client = Some(client.clone());
+    }
     Ok((client, credential))
 }
 
 /// The PUT half of a contact write: `etag` guards an update (`If-Match`), so
 /// an edit based on a stale copy fails with HTTP 412 instead of clobbering a
 /// concurrent change; `None` marks a create (`If-None-Match: *`).
-async fn put_contact(goa_client: Option<GoaClient>, account: GoaContactsAccount, href: String, card: &VCard, etag: Option<String>) -> Result<(), String> {
-    let (client, credential) = carddav_connection(&goa_client, &account).await?;
+async fn put_contact(goa_client: Option<GoaClient>, account: GoaContactsAccount, href: String, card: &VCard, etag: Option<String>, google_dav: &mut GoogleContactsSession) -> Result<(), String> {
+    let (client, credential) = carddav_connection(&goa_client, &account, google_dav).await?;
     client
         .put_contact_vcard(&href, card, &credential, etag.as_deref())
         .await
@@ -3086,8 +3115,8 @@ async fn put_contact(goa_client: Option<GoaClient>, account: GoaContactsAccount,
 }
 
 /// The DELETE half of a contact write, with the same `If-Match` guard.
-async fn delete_contact(goa_client: Option<GoaClient>, account: GoaContactsAccount, href: String, etag: Option<String>) -> Result<(), String> {
-    let (client, credential) = carddav_connection(&goa_client, &account).await?;
+async fn delete_contact(goa_client: Option<GoaClient>, account: GoaContactsAccount, href: String, etag: Option<String>, google_dav: &mut GoogleContactsSession) -> Result<(), String> {
+    let (client, credential) = carddav_connection(&goa_client, &account, google_dav).await?;
     client.delete_contact_vcard(&href, &credential, etag.as_deref()).await.map_err(|e| e.to_string())
 }
 
@@ -3225,15 +3254,29 @@ async fn sync_addressbook_into(
     Ok(records)
 }
 
-async fn fetch_carddav_contacts(goa_client: Option<GoaClient>, account: GoaContactsAccount, cache: Option<&ContactsCache>) -> Result<ContactsAccountSnapshot, String> {
-    let (client, credential) = carddav_connection(&goa_client, &account).await?;
+async fn fetch_carddav_contacts(goa_client: Option<GoaClient>, account: GoaContactsAccount, cache: Option<&ContactsCache>, google_dav: &mut GoogleContactsSession) -> Result<ContactsAccountSnapshot, String> {
+    let (client, credential) = carddav_connection(&goa_client, &account, google_dav).await?;
     let google = client.uses_google_contacts();
-    if google { tracing::info!(account = %account.account_id, "Google CardDAV discovering addressbook home"); }
-    let home = client.discover_addressbook_home(&credential).await.map_err(|e| format!("Address book discovery: {e}"))?;
-    if google { tracing::info!(account = %account.account_id, "Google CardDAV listing addressbooks"); }
-    let books = client.list_addressbooks(&home, &account.account_id, &credential).await.map_err(|e| format!("Address book listing: {e}"))?;
-    if google { tracing::info!(account = %account.account_id, books = books.len(), "Google CardDAV addressbooks listed"); }
-    tracing::debug!("CardDAV discovery for {}: home={home:?}, {} addressbook(s) found", account.display_name, books.len());
+    let recent = if google { google_dav.recent_books() } else { None };
+    let fresh_discovery = recent.is_none();
+    let books = if let Some(books) = recent {
+        tracing::info!(account = %account.account_id, books = books.len(), "Google CardDAV reusing discovered addressbooks");
+        books
+    } else {
+        if google { tracing::info!(account = %account.account_id, "Google CardDAV discovering addressbook home"); }
+        let home = client.discover_addressbook_home(&credential).await.map_err(|e| format!("Address book discovery: {e}"))?;
+        if google { tracing::info!(account = %account.account_id, "Google CardDAV listing addressbooks"); }
+        let books = client.list_addressbooks(&home, &account.account_id, &credential).await.map_err(|e| format!("Address book listing: {e}"))?;
+        if google {
+            tracing::info!(account = %account.account_id, books = books.len(), "Google CardDAV addressbooks listed");
+            if books.is_empty() {
+                return Err("Google CardDAV returned no address books; retaining previous contacts.".to_string());
+            }
+            google_dav.books = Some((std::time::Instant::now(), books.clone()));
+        }
+        tracing::debug!("CardDAV discovery for {}: home={home:?}, {} addressbook(s) found", account.display_name, books.len());
+        books
+    };
 
     if let Some(cache) = cache {
         // Do not acknowledge a poll on stale cached data when a book failed.
@@ -3246,9 +3289,11 @@ async fn fetch_carddav_contacts(goa_client: Option<GoaClient>, account: GoaConta
         cache.store_address_books(&books).map_err(|e| e.to_string())?;
         // The discovered list is authoritative only after the live pass
         // succeeded. Keep old books on discovery/transport failure.
-        let live_hrefs: HashSet<&str> = books.iter().map(|b| b.href.as_str()).collect();
-        for stale in cache.load_address_books().map_err(|e| e.to_string())?.iter().filter(|b| !live_hrefs.contains(b.href.as_str())) {
-            cache.remove_book(&stale.href).map_err(|e| e.to_string())?;
+        if fresh_discovery {
+            let live_hrefs: HashSet<&str> = books.iter().map(|b| b.href.as_str()).collect();
+            for stale in cache.load_address_books().map_err(|e| e.to_string())?.iter().filter(|b| !live_hrefs.contains(b.href.as_str())) {
+                cache.remove_book(&stale.href).map_err(|e| e.to_string())?;
+            }
         }
         if let Some(snapshot) = snapshot_from_cache(&account, cache) {
             return Ok(snapshot);
@@ -3713,6 +3758,23 @@ mod tests {
             etag: None,
             card,
         }
+    }
+
+    #[test]
+    fn google_discovery_cache_expires_and_can_be_invalidated() {
+        let mut session = GoogleContactsSession::default();
+        assert!(session.recent_books().is_none());
+        let book = lookout_dav::AddressBookInfo {
+            account_id: AccountId("test".into()),
+            display_name: "Contacts".into(),
+            href: "/book/".into(),
+        };
+        session.books = Some((std::time::Instant::now(), vec![book.clone()]));
+        assert_eq!(session.recent_books().unwrap()[0].href, book.href);
+        session.books = Some((std::time::Instant::now() - GOOGLE_BOOK_DISCOVERY_TTL, vec![book]));
+        assert!(session.recent_books().is_none());
+        session.books = None;
+        assert!(session.recent_books().is_none());
     }
 
     #[test]

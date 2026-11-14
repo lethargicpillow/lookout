@@ -16,6 +16,10 @@ const NS_APPLE_ICAL: &[u8] = b"http://apple.com/ns/ical/";
 
 const ADDRESSBOOK_PROPS: [&str; 2] = ["D:displayname", "D:resourcetype"];
 
+fn google_carddav_read_method(method: &str) -> bool {
+    matches!(method, "PROPFIND" | "REPORT")
+}
+
 /// The maximum size of a downloaded webcal feed body. Feeds are untrusted
 /// URLs (a misconfigured subscription can point at anything), so a body over
 /// this is rejected rather than buffered.
@@ -545,6 +549,7 @@ impl DavClient {
 /// A thin CalDAV/WebDAV HTTP client for one account's calendar endpoint.
 /// Holds no credentials - a fresh [`Credential`] is passed to every request,
 /// matching `lookout-mail`'s "never cache credentials ourselves" convention.
+#[derive(Clone)]
 pub struct DavClient {
     http: reqwest::Client,
     base_url: reqwest::Url,
@@ -1049,11 +1054,26 @@ impl DavClient {
         let google = self.uses_google_contacts();
         let started = std::time::Instant::now();
         if google { tracing::info!(method = method_name, "Google CardDAV HTTP request started"); }
+        // A fresh connection can fail intermittently. Only replay read-only
+        // CardDAV requests, once, on a transport/connect timeout before
+        // response headers. Never explicitly replay PUT or DELETE.
+        let retry = if google && google_carddav_read_method(method_name) { req.try_clone() } else { None };
         let response = match req.send().await {
             Ok(response) => response,
             Err(error) => {
-                if google { tracing::warn!(method = method_name, timeout = error.is_timeout(), elapsed_ms = started.elapsed().as_millis(), "Google CardDAV HTTP request failed"); }
-                return Err(error.into());
+                if google { tracing::warn!(method = method_name, timeout = error.is_timeout(), connect = error.is_connect(), elapsed_ms = started.elapsed().as_millis(), "Google CardDAV HTTP request failed"); }
+                if let Some(retry) = retry.filter(|_| error.is_timeout() || error.is_connect()) {
+                    tracing::info!(method = method_name, "Google CardDAV retrying read request once");
+                    match retry.send().await {
+                        Ok(response) => response,
+                        Err(error) => {
+                            tracing::warn!(method = method_name, timeout = error.is_timeout(), connect = error.is_connect(), "Google CardDAV read retry failed");
+                            return Err(error.into());
+                        }
+                    }
+                } else {
+                    return Err(error.into());
+                }
             }
         };
         let status = response.status();
@@ -2002,6 +2022,15 @@ END:VCALENDAR
             .unwrap_err();
         assert!(err.to_string().contains("412"), "error should surface the HTTP status: {err}");
         assert!(err.to_string().contains("stale etag"), "error should include the server's explanation: {err}");
+    }
+
+    #[test]
+    fn google_carddav_retries_only_read_methods() {
+        assert!(google_carddav_read_method("PROPFIND"));
+        assert!(google_carddav_read_method("REPORT"));
+        assert!(!google_carddav_read_method("DELETE"));
+        assert!(!google_carddav_read_method("PUT"));
+        assert!(!google_carddav_read_method("POST"));
     }
 
     #[tokio::test]
