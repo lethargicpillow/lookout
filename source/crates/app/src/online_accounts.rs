@@ -58,16 +58,27 @@ pub async fn open_online_accounts() {
     // Unsandboxed fallback: the control-center CLI still accepts panel ids.
     // A `GSubprocess` is reaped by GLib's own child watch, so the exited
     // process never lingers as a zombie until Lookout quits.
-    let Some(program) = gtk::glib::find_program_in_path("gnome-control-center") else {
-        return;
-    };
-    let argv = [program.as_os_str(), std::ffi::OsStr::new(ONLINE_ACCOUNTS_PANEL)];
-    // GNOME Settings rejects non-GNOME desktops by default. Set the
-    // desktop identifier for this child only, not the KDE session.
-    let launcher = gtk::gio::SubprocessLauncher::new(gtk::gio::SubprocessFlags::NONE);
-    launcher.setenv("XDG_CURRENT_DESKTOP", "GNOME", true);
-    match launcher.spawn(&argv) {
-        Ok(process) => process.wait_async(None::<&gtk::gio::Cancellable>, |_| {}),
-        Err(e) => tracing::debug!("couldn't run gnome-control-center: {e}"),
-    }
+    // This async entry point runs on Tokio. GIO wait_async requires a
+    // thread owning its GLib MainContext, so dispatch the entire fallback
+    // onto the GTK main loop instead of starting an async GIO operation
+    // on the worker. The idle source is safe to schedule from any thread.
+    gtk::glib::idle_add_once(|| {
+        let Some(program) = gtk::glib::find_program_in_path("gnome-control-center") else {
+            tracing::warn!("Online Accounts settings unavailable: gnome-control-center not installed");
+            return;
+        };
+        let argv = [program.as_os_str(), std::ffi::OsStr::new(ONLINE_ACCOUNTS_PANEL)];
+        // GNOME Settings rejects non-GNOME desktops by default. Set the
+        // desktop identifier for this child only, not the KDE session.
+        let launcher = gtk::gio::SubprocessLauncher::new(gtk::gio::SubprocessFlags::NONE);
+        launcher.setenv("XDG_CURRENT_DESKTOP", "GNOME", true);
+        match launcher.spawn(&argv) {
+            Ok(process) => process.wait_async(None::<&gtk::gio::Cancellable>, |result| {
+                if let Err(e) = result {
+                    tracing::warn!("Online Accounts process wait failed: {e}");
+                }
+            }),
+            Err(e) => tracing::warn!("couldn't run gnome-control-center: {e}"),
+        }
+    });
 }
