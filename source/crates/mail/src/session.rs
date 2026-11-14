@@ -35,6 +35,11 @@ use crate::send::{build_draft_raw_message, send_smtp, ComposedMessage, OutboxMes
 /// is on.
 const INITIAL_FETCH_LIMIT: u32 = 200;
 
+// A short compressed UID range can still request thousands of envelopes.
+// Bound response work independently of the sequence-set byte budget.
+const ENVELOPE_SYNC_BATCH: usize = 100;
+const IMAP_SYNC_STEP_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// How long a single IDLE wait runs before we re-enter it purely as a
 /// keepalive, well under RFC 2177's ~29-minute server timeout. On-demand
 /// commands don't wait for this timeout: the IDLE wait future is raced
@@ -2023,8 +2028,13 @@ async fn connect_and_run(
         tracing::info!("DavMail compatibility: full MIME on demand, no background body fetch");
     }
     let account_id = config.account_id.clone();
-    let (mut folders, list_counts_supplied) = list_mailboxes(&mut session, &account_id, condstore, has_list_status).await?;
-    tracing::debug!(account = %account_id, count = folders.len(), "initial IMAP folder list received");
+    tracing::info!(account = %account_id, host = %config.imap.host, "requesting initial IMAP folder list");
+    let (mut folders, list_counts_supplied) = if davmail_compat {
+        list_mailboxes(&mut session, &account_id, condstore, has_list_status).await?
+    } else {
+        imap_sync_step(&account_id, "LIST", list_mailboxes(&mut session, &account_id, condstore, has_list_status)).await?
+    };
+    tracing::info!(account = %account_id, count = folders.len(), "initial IMAP folder list received");
     // Fast first paint: the folder tree shows immediately and the INBOX sync
     // that fills the message list starts right away. On a LIST-STATUS (RFC
     // 5819) connection the list just answered every folder's counts in that
@@ -7266,6 +7276,41 @@ async fn list_mailboxes(session: &mut Session<SessionStream>, account_id: &Accou
     Ok((mailboxes, false))
 }
 
+// A timeout invalidates the current command stream. Callers propagate the
+// error out of the session so the reconnect loop creates a fresh connection.
+async fn imap_sync_step<T>(
+    account: &AccountId,
+    stage: &'static str,
+    future: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let started = std::time::Instant::now();
+    tracing::debug!(%account, stage, "IMAP sync step starting");
+    match tokio::time::timeout(IMAP_SYNC_STEP_TIMEOUT, future).await {
+        Ok(Ok(value)) => {
+            tracing::debug!(%account, stage, elapsed_ms = started.elapsed().as_millis() as u64, "IMAP sync step completed");
+            Ok(value)
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(%account, stage, elapsed_ms = started.elapsed().as_millis() as u64, "IMAP sync step failed");
+            Err(error)
+        }
+        Err(_) => {
+            tracing::warn!(%account, stage, elapsed_ms = started.elapsed().as_millis() as u64, "IMAP sync step timed out");
+            Err(Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, format!("IMAP {stage} timed out"))))
+        }
+    }
+}
+
+// Bound the number of UIDs, not just the length of the command. Newest
+// first, with no missing or duplicate UIDs; the final folder snapshot is
+// still complete, not restricted to a recent window.
+fn envelope_sync_sets(uids: &[Uid]) -> Vec<String> {
+    let mut sorted = uids.to_vec();
+    sorted.sort_unstable_by_key(|uid| std::cmp::Reverse(uid.0));
+    sorted.dedup();
+    sorted.chunks(ENVELOPE_SYNC_BATCH).flat_map(uid_set_chunks).collect()
+}
+
 /// The STATUS data items a folder-count refresh asks for. `HIGHESTMODSEQ`
 /// (RFC 7162 §3.2.1) rides along on CONDSTORE connections - it's the one
 /// pass that visits every folder, so folders that never get SELECTed still
@@ -7708,7 +7753,17 @@ async fn sync_mailbox(
     // then taken from the folder list, which the SELECT/STATUS paths keep
     // fresh (see the pre-IDLE re-select's write-back above).
     let already_selected = session_selected.is_some_and(|selected| selected == mailbox_id);
-    let mailbox_meta = if already_selected { None } else { Some(session.select(folder_path).await?) };
+    let mailbox_meta = if already_selected {
+        None
+    } else if davmail_compat {
+        Some(session.select(folder_path).await?)
+    } else {
+        tracing::debug!(account = %account_id, mailbox = %folder_path, "selecting mailbox");
+        Some(imap_sync_step(account_id, "SELECT", async { Ok(session.select(folder_path).await?) }).await?)
+    };
+    if let Some(meta) = &mailbox_meta {
+        tracing::debug!(account = %account_id, mailbox = %folder_path, exists = meta.exists, "mailbox selected");
+    }
     let uidvalidity = mailbox_meta
         .as_ref()
         .map(|meta| UidValidity(meta.uid_validity.unwrap_or(0)))
@@ -7749,15 +7804,20 @@ async fn sync_mailbox(
     .unwrap_or_default();
     let baseline = folders.iter().find(|f| f.id == *mailbox_id).and_then(|f| f.highest_modseq);
     let delta = already_selected && condstore && baseline.is_some();
-    let flag_fetches: Vec<_> = if delta {
-        // The `MODSEQ` data item rides along so the fetch's responses carry
-        // each message's modseq - the baseline can then advance without an
-        // extra SELECT/STATUS round trip (see the folder update below).
-        let bound = baseline.expect("delta requires a baseline, checked above");
-        session.fetch("1:*", &format!("(UID FLAGS MODSEQ) (CHANGEDSINCE {bound})")).await?.try_collect().await?
-    } else {
-        session.fetch("1:*", "(UID FLAGS)").await?.try_collect().await?
+    tracing::debug!(account = %account_id, mailbox = %folder_path, cached = cached.len(), delta, "requesting mailbox flags");
+    let flags = async {
+        let rows: Vec<Fetch> = if delta {
+            let bound = baseline.expect("delta requires a baseline, checked above");
+            session.fetch("1:*", &format!("(UID FLAGS MODSEQ) (CHANGEDSINCE {bound})")).await?.try_collect().await?
+        } else {
+            session.fetch("1:*", "(UID FLAGS)").await?.try_collect().await?
+        };
+        Ok(rows)
     };
+    let flag_fetches = if davmail_compat { flags.await? } else {
+        imap_sync_step(account_id, "FETCH FLAGS", flags).await?
+    };
+    tracing::debug!(account = %account_id, mailbox = %folder_path, count = flag_fetches.len(), "mailbox flags received");
     // The full current UID set. On the plain-CONDSTORE delta it comes from
     // `UID SEARCH ALL`, run *after* the fetch: a message arriving between the
     // two lands in both (its modseq exceeds the baseline, so the fetch
@@ -7843,23 +7903,30 @@ async fn sync_mailbox(
     // `has_attachment` without any body fetch - it's what lets opening a
     // message download only its text parts.
     if !new_uids.is_empty() {
-        // An empty pre-sync cache means this is the folder's first sync (or a
-        // UIDVALIDITY change wiped everything cached), so the new set *is* the
-        // whole folder - `1:*` then covers it in one short command line where
-        // spelling out every uid could exceed the server's command-line limit
-        // (the same `1:*` the flag fetch above already uses). Otherwise the
-        // new arrivals are chunked into server-safe sequence-set lines.
-        let fetches: Vec<_> = if cached.is_empty() {
-            session.uid_fetch("1:*", envelope_fetch_items(davmail_compat)).await?.try_collect().await?
-        } else {
-            let mut fetches = Vec::new();
-            for uid_set in &uid_set_chunks(&new_uids) {
-                let chunk: Vec<_> = session.uid_fetch(uid_set, envelope_fetch_items(davmail_compat)).await?.try_collect().await?;
-                fetches.extend(chunk);
+        // Retain the DavMail compatibility path. Other IMAP servers get
+        // bounded UID batches. The full snapshot is committed only after
+        // every batch succeeds; a partial response must not purge old mail.
+        let mut new_messages: Vec<EmailSummary> = Vec::with_capacity(new_uids.len());
+        if davmail_compat {
+            let sets = if cached.is_empty() { vec!["1:*".to_owned()] } else { uid_set_chunks(&new_uids) };
+            for uid_set in sets {
+                let fetches: Vec<Fetch> = session.uid_fetch(&uid_set, envelope_fetch_items(true)).await?.try_collect().await?;
+                new_messages.extend(fetches.iter().filter_map(|f| summary_from_fetch(mailbox_id, f)));
             }
-            fetches
-        };
-        let mut new_messages: Vec<EmailSummary> = fetches.iter().filter_map(|f| summary_from_fetch(mailbox_id, f)).collect();
+        } else {
+            let sets = envelope_sync_sets(&new_uids);
+            tracing::info!(account = %account_id, mailbox = %folder_path, count = new_uids.len(), batches = sets.len(), "fetching new message envelopes");
+            for (index, uid_set) in sets.iter().enumerate() {
+                tracing::debug!(account = %account_id, mailbox = %folder_path, batch = index + 1, batches = sets.len(), "requesting envelope batch");
+                let fetches: Vec<Fetch> = imap_sync_step(account_id, "UID FETCH ENVELOPE", async {
+                    Ok(session.uid_fetch(uid_set, envelope_fetch_items(false)).await?.try_collect().await?)
+                }).await?;
+                new_messages.extend(fetches.iter().filter_map(|f| summary_from_fetch(mailbox_id, f)));
+                if index == 0 || (index + 1) % 10 == 0 || index + 1 == sets.len() {
+                    tracing::info!(account = %account_id, mailbox = %folder_path, batch = index + 1, batches = sets.len(), received = new_messages.len(), "envelope sync progress");
+                }
+            }
+        }
 
         // A Sent folder is never supposed to carry unread mail, regardless of
         // which client (or which path - this app's own send, another
@@ -9495,6 +9562,16 @@ mod tests {
     fn status_query_asks_for_modseq_only_on_condstore_connections() {
         assert_eq!(status_count_query(true), "(MESSAGES UNSEEN UIDNEXT UIDVALIDITY HIGHESTMODSEQ)");
         assert_eq!(status_count_query(false), "(MESSAGES UNSEEN UIDNEXT UIDVALIDITY)");
+    }
+
+    #[test]
+    fn envelope_sync_sets_bounds_dense_ranges_and_preserves_all_uids() {
+        let mut uids: Vec<Uid> = (1..=205).map(Uid).collect();
+        uids.push(Uid(205));
+        uids.reverse();
+        assert_eq!(envelope_sync_sets(&uids), vec!["106:205", "6:105", "1:5"]);
+        assert!(envelope_sync_sets(&[]).is_empty());
+        assert_eq!(envelope_sync_sets(&[Uid(1), Uid(7), Uid(3)]), vec!["1,3,7"]);
     }
 
     #[test]
