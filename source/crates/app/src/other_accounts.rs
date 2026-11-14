@@ -343,6 +343,33 @@ impl lookout_dav::session::CalendarCredentialProvider for OtherCredentialProvide
 /// id, after both the keyring write and the `settings.json` write have
 /// landed) the caller connects or reconnects the account. Returns the dialog,
 /// so a caller can tell when it closes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SetupPrimaryAction {
+    Discover,
+    Connect,
+    Save,
+}
+
+impl SetupPrimaryAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Discover => "Find settings",
+            Self::Connect => "Connect account",
+            Self::Save => "Save",
+        }
+    }
+}
+
+fn setup_primary_action(is_edit: bool, discovered: bool, manual: bool) -> SetupPrimaryAction {
+    if is_edit {
+        SetupPrimaryAction::Save
+    } else if discovered || manual {
+        SetupPrimaryAction::Connect
+    } else {
+        SetupPrimaryAction::Discover
+    }
+}
+
 pub fn show_add_account_dialog(
     anchor: &gtk::Widget,
     worker: Rc<Worker>,
@@ -429,8 +456,6 @@ pub fn show_add_account_dialog(
         .build();
 
     let mut row = 0;
-    let detect_button = gtk::Button::with_label("Find settings");
-    detect_button.set_halign(gtk::Align::End);
     let setup_status = gtk::Label::builder().wrap(true).halign(gtk::Align::Start)
         .xalign(0.0).css_classes(["dim-label"]).visible(false).build();
     let approve_button = gtk::Button::with_label("Trust this server and continue");
@@ -452,8 +477,6 @@ pub fn show_add_account_dialog(
     form.attach(&name_entry, 1, row, 1, 1);
     row += 1;
     if !is_edit {
-        form.attach(&detect_button, 1, row, 1, 1);
-        row += 1;
         form.attach(&setup_status, 0, row, 2, 1);
         row += 1;
         form.attach(&approve_button, 1, row, 1, 1);
@@ -610,7 +633,7 @@ pub fn show_add_account_dialog(
         .build();
     let cancel_button = gtk::Button::builder().label("Cancel").build();
     let save_button = gtk::Button::builder()
-        .label(if is_edit { "Save" } else { "Add account" })
+        .label(setup_primary_action(is_edit, prefill.is_some(), false).label())
         .css_classes(["suggested-action"])
         .build();
     footer.append(&cancel_button);
@@ -637,19 +660,30 @@ pub fn show_add_account_dialog(
     // before saving. Editing an existing profile retains its saved secret.
     let ready = Rc::new(std::cell::Cell::new(is_edit || prefill.is_some()));
     let running = Rc::new(std::cell::Cell::new(false));
+    let saving = Rc::new(std::cell::Cell::new(false));
+    let primary_action: Rc<dyn Fn() -> SetupPrimaryAction> = {
+        let ready = ready.clone();
+        let advanced = advanced.clone();
+        let host = imap_host_entry.clone();
+        Rc::new(move || setup_primary_action(is_edit, ready.get(),
+            advanced.is_expanded() && !host.text().trim().is_empty()))
+    };
     let refresh_actions: Rc<dyn Fn()> = {
         let email = email_entry.clone();
         let password = imap_password_entry.clone();
-        let button = detect_button.clone();
         let save = save_button.clone();
-        let advanced = advanced.clone();
-        let ready = ready.clone();
         let running = running.clone();
+        let primary_action = primary_action.clone();
         Rc::new(move || {
             let address_valid = crate::recipient_entry::is_plausible_address(email.text().trim());
-            let credentials = address_valid && !password.text().is_empty();
-            button.set_sensitive(!running.get() && address_valid);
-            save.set_sensitive(!running.get() && (is_edit || (credentials && (ready.get() || advanced.is_expanded()))));
+            let action = primary_action();
+            save.set_label(action.label());
+            let enabled = match action {
+                SetupPrimaryAction::Save => true,
+                SetupPrimaryAction::Discover => address_valid,
+                SetupPrimaryAction::Connect => address_valid && !password.text().is_empty(),
+            };
+            save.set_sensitive(!running.get() && enabled);
         })
     };
     refresh_actions();
@@ -661,14 +695,26 @@ pub fn show_add_account_dialog(
         let oab = oab_entry.clone();
         let name = name_entry.clone();
         let password = imap_password_entry.clone();
+        let ih = imap_host_entry.clone();
+        let iu = imap_username_entry.clone();
+        let sh = smtp_host_entry.clone();
+        let su = smtp_username_entry.clone();
+        let smtp_password = smtp_password_entry.clone();
         let previous = Rc::new(RefCell::new(email_entry.text().trim().to_owned()));
         email_entry.connect_changed(move |entry| {
             let address = entry.text().trim().to_owned();
             let mut old = previous.borrow_mut();
             if *old != address {
                 if ready.replace(false) {
+                    // A discovered configuration belongs to the old address.
+                    // Do not let expanding Advanced reuse those endpoints.
                     password.set_text("");
+                    smtp_password.set_text("");
                     oab.set_text("");
+                    ih.set_text("");
+                    iu.set_text("");
+                    sh.set_text("");
+                    su.set_text("");
                     if name.text().as_str() == old.as_str() { name.set_text(""); }
                 }
                 *old = address;
@@ -681,6 +727,8 @@ pub fn show_add_account_dialog(
         imap_password_entry.connect_changed(move |_| refresh());
         let refresh = refresh_actions.clone();
         advanced.connect_expanded_notify(move |_| refresh());
+        let refresh = refresh_actions.clone();
+        imap_host_entry.connect_changed(move |_| refresh());
     }
 
     {
@@ -688,7 +736,7 @@ pub fn show_add_account_dialog(
         cancel_button.connect_clicked(move |_| dialog.close());
     }
 
-    if !is_edit {
+    let detect_action: Option<Rc<dyn Fn()>> = if !is_edit {
         use crate::account_setup::Discovery;
         // Shared apply function: both discovery and gateway setup use the
         // exact same persisted manual-account fields, not a second account type.
@@ -728,10 +776,9 @@ pub fn show_add_account_dialog(
         let approved = Rc::new(RefCell::new(Vec::<String>::new()));
         let pending = Rc::new(RefCell::new(None::<String>));
         let detected_address = Rc::new(RefCell::new(String::new()));
-        let detect = {
+        let detect: Rc<dyn Fn()> = {
             let email = email_entry.clone();
             let password = imap_password_entry.clone();
-            let button = detect_button.clone();
             let approve = approve_button.clone();
             let oab = oab_entry.clone();
             let status = setup_status.clone();
@@ -754,7 +801,6 @@ pub fn show_add_account_dialog(
                     pending.borrow_mut().take();
                     *detected_address.borrow_mut() = address.clone();
                 }
-                button.set_sensitive(false);
                 approve.set_visible(false);
                 save_button.set_sensitive(false);
                 status.set_label("Discovering mail and Exchange settings…");
@@ -805,7 +851,7 @@ pub fn show_add_account_dialog(
                                 "Enter your password or app password."
                             };
                             status.set_label(&format!("{endpoints}
-{instruction} Confirm these settings by adding the account."));
+{instruction} Select Connect account to verify and save."));
                             if password.text().is_empty() { password.grab_focus(); }
                         }
                         Ok(Ok(Discovery::Exchange { ews: Some(_), oab: discovered_oab })) => {
@@ -814,10 +860,10 @@ pub fn show_add_account_dialog(
                             apply(server(1143), server(1025));
                             ready.set(true);
                             refresh();
-                            status.set_label("Exchange found. Mail, calendar and contacts are ready to connect.");
+                            status.set_label("Exchange found. Select Connect account to verify and save mail, calendar and contacts.");
                         }
                         Ok(Ok(Discovery::PasswordRequired | Discovery::Exchange { ews: None, .. })) => {
-                            status.set_label("Exchange requires authentication. Enter your password and find settings again.");
+                            status.set_label("Exchange requires authentication. Enter your password and select Find settings.");
                             password.grab_focus();
                         }
                         Ok(Ok(Discovery::ApproveHost(host))) => {
@@ -848,18 +894,6 @@ pub fn show_add_account_dialog(
         };
         {
             let detect = detect.clone();
-            detect_button.connect_clicked(move |_| detect());
-        }
-        {
-            let detect = detect.clone();
-            email_entry.connect_activate(move |_| { detect(); });
-        }
-        {
-            let detect = detect.clone();
-            imap_password_entry.connect_activate(move |_| detect());
-        }
-        {
-            let detect = detect.clone();
             let email = email_entry.clone();
             approve_button.connect_clicked(move |_| {
                 if *detected_address.borrow() != email.text().trim() { return; }
@@ -869,8 +903,21 @@ pub fn show_add_account_dialog(
                 detect();
             });
         }
-    }
+        Some(detect)
+    } else {
+        None
+    };
 
+    // While verifying and persisting, the captured account and form must
+    // not diverge. Discovery remains cancellable, but a credential/config
+    // commit is atomic from the user's perspective.
+    {
+        let saving = saving.clone();
+        dialog.connect_close_request(move |_| {
+            if saving.get() { glib::Propagation::Stop } else { glib::Propagation::Proceed }
+        });
+    }
+    let password_activate = imap_password_entry.clone();
     let save = {
         let existing = existing.clone();
         // These three are also needed after `save` is defined below
@@ -880,8 +927,13 @@ pub fn show_add_account_dialog(
         let save_button = save_button.clone();
         let email_entry = email_entry.clone();
         let dialog = dialog.clone();
+        let saving = saving.clone();
+        let running = running.clone();
+        let refresh = refresh_actions.clone();
+        let form = form.clone();
+        let cancel = cancel_button.clone();
         move || {
-            if !save_button.is_sensitive() { return; }
+            if running.get() || !save_button.is_sensitive() { return; }
             let email = email_entry.text().trim().to_string();
             let name = if name_entry.text().trim().is_empty() { email.clone() } else { name_entry.text().trim().to_string() };
             let imap_host = imap_host_entry.text().trim().to_string();
@@ -952,7 +1004,11 @@ pub fn show_add_account_dialog(
             // a failed keyring write leaves settings.json untouched so the
             // account isn't half-configured. Blank edit fields must resolve to existing secrets;
             // both slots are verified before committing settings.
-            save_button.set_sensitive(false);
+            running.set(true);
+            saving.set(true);
+            form.set_sensitive(false);
+            cancel.set_sensitive(false);
+            refresh();
             let verify = existing.is_none();
             if verify {
                 error_label.set_label("Checking IMAP and SMTP authentication…");
@@ -995,10 +1051,19 @@ pub fn show_add_account_dialog(
             // closure's own captured fields into the async block - rather
             // than a clone made just for it - would make `save` callable
             // only once.
-            let save_button = save_button.clone();
             let error_label = error_label.clone();
+            let saving = saving.clone();
+            let running = running.clone();
+            let refresh = refresh.clone();
+            let form = form.clone();
+            let cancel = cancel.clone();
             glib::spawn_future_local(async move {
-                let Ok(result) = result_rx.recv().await else { return };
+                let result = result_rx.recv().await.unwrap_or_else(|_| Err("Account verification stopped. Try again.".into()));
+                saving.set(false);
+                running.set(false);
+                form.set_sensitive(true);
+                cancel.set_sensitive(true);
+                refresh();
                 match result {
                     Ok(()) => {
                         {
@@ -1012,7 +1077,6 @@ pub fn show_add_account_dialog(
                         on_saved(&account_id);
                     }
                     Err(e) => {
-                        save_button.set_sensitive(true);
                         error_label.set_label(&e);
                         error_label.set_visible(true);
                     }
@@ -1020,12 +1084,27 @@ pub fn show_add_account_dialog(
             });
         }
     };
-    let save_for_activate = {
-        let save = save.clone();
-        move || save()
+    let activate: Rc<dyn Fn()> = {
+        let button = save_button.clone();
+        Rc::new(move || {
+            if !button.is_sensitive() { return; }
+            match primary_action() {
+                SetupPrimaryAction::Discover => {
+                    if let Some(detect) = &detect_action { detect(); }
+                }
+                SetupPrimaryAction::Connect | SetupPrimaryAction::Save => save(),
+            }
+        })
     };
-    save_button.connect_clicked(move |_| save());
-    if is_edit { email_entry.connect_activate(move |_| save_for_activate()); }
+    {
+        let activate = activate.clone();
+        save_button.connect_clicked(move |_| activate());
+    }
+    {
+        let activate = activate.clone();
+        email_entry.connect_activate(move |_| activate());
+    }
+    password_activate.connect_activate(move |_| activate());
 
     dialog.present();
     dialog
@@ -1170,6 +1249,14 @@ mod tests {
 
     fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(fut)
+    }
+
+    #[test]
+    fn setup_primary_action_uses_one_action_for_discovery_connect_and_edit() {
+        assert_eq!(setup_primary_action(false, false, false), SetupPrimaryAction::Discover);
+        assert_eq!(setup_primary_action(false, true, false), SetupPrimaryAction::Connect);
+        assert_eq!(setup_primary_action(false, false, true), SetupPrimaryAction::Connect);
+        assert_eq!(setup_primary_action(true, false, false), SetupPrimaryAction::Save);
     }
 
     #[test]
