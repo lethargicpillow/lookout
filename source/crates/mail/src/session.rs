@@ -212,11 +212,26 @@ impl PrefetchState {
 
     fn advance(&mut self) {
         self.current += 1;
+        self.reset_envelopes();
+        self.current_folder_name.clear();
+    }
+
+    // Keep the announced folder, but discard every UID and structure learned
+    // under the previous UIDVALIDITY. The next pass enumerates it afresh.
+    fn reset_envelopes(&mut self) {
         self.pending_uids.clear();
         self.uidvalidity = UidValidity(0);
         self.envelopes_fetched = false;
-        self.current_folder_name.clear();
         self.structures.clear();
+    }
+
+    fn validate_body_selection(&mut self, actual: Option<u32>) -> bool {
+        if self.uidvalidity.0 != 0 && actual == Some(self.uidvalidity.0) {
+            true
+        } else {
+            self.reset_envelopes();
+            false
+        }
     }
 
     /// Drops the folder `root` and everything beneath it from the pass, after
@@ -5526,6 +5541,11 @@ async fn connect_and_run(
                 // query also asks for BODYSTRUCTURE so the body fetches below
                 // can be text-parts-only rather than whole-message downloads
                 // (see `fetch_body_partial`).
+                // A SELECT in this iteration is authoritative for the
+                // first body batch. Every resumed batch must re-select:
+                // user commands and IDLE may have changed the connection's
+                // mailbox since the envelope scan, even if its UIDs overlap.
+                let mut selected_for_prefetch = false;
                 if !pf.envelopes_fetched {
                     // Check before SELECT to avoid blocking the session if a
                     // user command arrived during the previous body fetch.
@@ -5535,6 +5555,8 @@ async fn connect_and_run(
                     let folder_name = pf.current_folder_name.clone();
                     let mailbox_meta = session.select(&folder_name).await?;
                     session_selected = pf.mailboxes[pf.current].clone();
+                    selected_for_prefetch = true;
+                    did_prefetch_work = true;
                     // The prefetch is the first SELECT most folders ever get
                     // (only the open folder and STATUS-dirty ones go through
                     // `sync_mailbox`), so it's the primary place their
@@ -5549,9 +5571,14 @@ async fn connect_and_run(
                     // list's copy may predate it (or be 0 before any STATUS),
                     // and the envelopes indexed below must be keyed by the
                     // value `sync_mailbox` will look them up under.
-                    if let Some(validity) = mailbox_meta.uid_validity {
-                        pf.uidvalidity = UidValidity(validity);
-                    }
+                    let Some(validity) = mailbox_meta.uid_validity.filter(|v| *v != 0) else {
+                        tracing::warn!(mailbox = %pf.mailboxes[pf.current], "prefetch: missing UIDVALIDITY; skipping unsafe body fetch");
+                        let finished = pf.mailboxes[pf.current].clone();
+                        pf.advance();
+                        let _ = events.send(AccountEvent::PrefetchFinished { mailbox: finished }).await;
+                        continue;
+                    };
+                    pf.uidvalidity = UidValidity(validity);
                     // A folder with no full-sync snapshot (never opened) isn't
                     // in the search index at all. Its envelopes ride along on
                     // this same newest-N fetch and are indexed as `partial`
@@ -5673,6 +5700,25 @@ async fn connect_and_run(
                     if !(deferred_interactive.is_empty() && no_work_pending(commands, interactive_commands, idle_notify)) {
                         continue;
                     }
+                    if !selected_for_prefetch {
+                        let target = pf.mailboxes[pf.current].clone();
+                        let before = pf.uidvalidity;
+                        let meta = session.select(&pf.current_folder_name).await?;
+                        session_selected = target.clone();
+                        did_prefetch_work = true;
+                        if !pf.validate_body_selection(meta.uid_validity) {
+                            tracing::warn!(mailbox = %target, expected = before.0, actual = ?meta.uid_validity,
+                                "prefetch: UIDVALIDITY changed; discarding queued UIDs and structures");
+                            // Keep the same folder in the pass. Re-enumerate
+                            // on the next iteration rather than fetch recycled
+                            // UIDs with stale MIME part paths.
+                            continue;
+                        }
+                        tracing::debug!(mailbox = %target, uidvalidity = before.0, "prefetch: selected mailbox before resumed body batch");
+                        if !deferred_interactive.is_empty() || !no_work_pending(commands, interactive_commands, idle_notify) {
+                            continue;
+                        }
+                    }
                     let batch: Vec<Uid> = pf.pending_uids.drain(..pf.pending_uids.len().min(prefetch_policy.batch_size)).collect();
                     let batch_len = batch.len();
                     let started = std::time::Instant::now();
@@ -5720,7 +5766,8 @@ async fn connect_and_run(
         // fetch or body fetches). Skip if a user command is pending — the
         // command handler will SELECT the folder it needs, and the top-of-loop
         // check re-selects the user's folder anyway.
-        if did_prefetch_work && (deferred_interactive.is_empty() && no_work_pending(commands, interactive_commands, idle_notify)) {
+        if did_prefetch_work && session_selected != current_mailbox_id
+            && deferred_interactive.is_empty() && no_work_pending(commands, interactive_commands, idle_notify) {
             session.select(&current_mailbox_name).await?;
             session_selected = current_mailbox_id.clone();
         }
@@ -10559,6 +10606,28 @@ mod tests {
         assert!(plan_create_mailbox(Some(&id("Work")), "a/b", &account, &folders).is_err(), "delimiter in the name");
         folders.iter_mut().find(|m| m.id == id("Old")).unwrap().flags.push("NoInferiors".into());
         assert!(plan_create_mailbox(Some(&id("Old")), "Child", &account, &folders).is_err(), "\\Noinferiors parent");
+    }
+
+    #[test]
+    fn prefetch_rejects_recycled_or_unknown_uidvalidity_before_resuming() {
+        let id = MailboxId::new(&AccountId("acc".into()), "Work");
+        let mut pf = PrefetchState::new(vec![id.clone()]);
+        pf.current_folder_name = "Work".into();
+        pf.uidvalidity = UidValidity(7);
+        pf.pending_uids = vec![Uid(56)];
+        pf.structures.insert(Uid(56), Vec::new());
+        pf.envelopes_fetched = true;
+        assert!(pf.validate_body_selection(Some(7)));
+        assert_eq!(pf.pending_uids, vec![Uid(56)]);
+        assert!(!pf.validate_body_selection(Some(8)));
+        assert!(pf.pending_uids.is_empty());
+        assert!(pf.structures.is_empty());
+        assert!(!pf.envelopes_fetched);
+        assert_eq!(pf.uidvalidity, UidValidity(0));
+        assert_eq!(pf.mailboxes[pf.current], id);
+        assert_eq!(pf.current_folder_name, "Work");
+        assert!(!pf.validate_body_selection(None));
+        assert!(!pf.validate_body_selection(Some(0)));
     }
 
     #[test]
