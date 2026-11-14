@@ -39,6 +39,8 @@ const INITIAL_FETCH_LIMIT: u32 = 200;
 // Bound response work independently of the sequence-set byte budget.
 const ENVELOPE_SYNC_BATCH: usize = 100;
 const IMAP_SYNC_STEP_TIMEOUT: Duration = Duration::from_secs(90);
+// A failed metadata request is retried on a later sync, not every wake.
+const ENVELOPE_RETRY_COOLDOWN_SECS: i64 = 5 * 60;
 
 /// How long a single IDLE wait runs before we re-enter it purely as a
 /// keepalive, well under RFC 2177's ~29-minute server timeout. On-demand
@@ -7331,6 +7333,18 @@ async fn persist_envelope_checkpoint(cache: &CacheHandle, mailbox: &MailboxId, v
     }
 }
 
+/// Separate UIDs eligible for a metadata request from live UIDs whose
+/// earlier failure is still cooling down. A recovered checkpoint wins.
+fn partition_envelope_retry(new_uids: &[Uid], received: &HashSet<Uid>, deferred: &HashSet<Uid>) -> (Vec<Uid>, usize) {
+    let mut eligible = Vec::new();
+    let mut postponed = 0;
+    for &uid in new_uids {
+        if received.contains(&uid) { continue; }
+        if deferred.contains(&uid) { postponed += 1; } else { eligible.push(uid); }
+    }
+    (eligible, postponed)
+}
+
 /// Combine the live cached membership with staged envelopes. This is
 /// deliberately a display snapshot: no deletion, notification, rule run,
 /// or authoritative cache replacement happens until the final sync.
@@ -8010,7 +8024,18 @@ async fn sync_mailbox(
                     new_messages.push(msg);
                 }
             }
-            remaining.extend(new_uids.iter().copied().filter(|uid| !received.contains(uid)));
+            let deferred = cache_op(cache, {
+                let mailbox = mailbox_id.clone();
+                move |c| c.deferred_imap_envelopes(&mailbox, uidvalidity, chrono::Utc::now().timestamp())
+            }).await.and_then(|r| r.ok()).unwrap_or_default();
+            // Only live UIDs without a reusable checkpoint count as
+            // unresolved. Cached and expunged UIDs never block new mail.
+            let (eligible, postponed) = partition_envelope_retry(&new_uids, &received, &deferred);
+            remaining.extend(eligible);
+            unresolved_envelopes = postponed;
+            if postponed != 0 {
+                tracing::debug!(account = %account_id, mailbox = %folder_path, postponed, "deferring unavailable message envelopes until retry deadline");
+            }
             let sets = envelope_sync_sets(&remaining);
             // Avoid extra GTK rebuilds on small deltas. Sent retains its
             // existing auto-mark-as-read step before first publication.
@@ -8051,8 +8076,19 @@ async fn sync_mailbox(
             // A server can omit a response for an expunged UID or fail to
             // return an envelope. Try a genuinely different request using
             // RFC 5322 headers, not the same failing ENVELOPE/BODYSTRUCTURE.
-            let missing: Vec<Uid> = new_uids.iter().copied().filter(|uid| !received.contains(uid)).collect();
+            let missing: Vec<Uid> = remaining.iter().copied().filter(|uid| !received.contains(uid)).collect();
             if !missing.is_empty() {
+                // Save the retry deadline BEFORE the fallback network
+                // requests. A broken TLS connection during that fallback
+                // must not immediately replay the same expensive work.
+                if let Some(Err(error)) = cache_op(cache, {
+                    let mailbox = mailbox_id.clone();
+                    let missing = missing.clone();
+                    move |c| c.defer_imap_envelopes(&mailbox, uidvalidity, &missing,
+                        chrono::Utc::now().timestamp() + ENVELOPE_RETRY_COOLDOWN_SECS)
+                }).await {
+                    tracing::warn!(%mailbox_id, "could not save envelope retry deadline: {error}");
+                }
                 tracing::info!(account = %account_id, mailbox = %folder_path, missing = missing.len(), "checking missing message envelopes");
                 let live = imap_sync_step(account_id, "UID SEARCH missing envelopes", uids_still_present(session, &missing)).await?;
                 for group in live.chunks(20) {
@@ -8062,6 +8098,9 @@ async fn sync_mailbox(
                         }).await?;
                         let batch: Vec<EmailSummary> = fetches.iter().filter_map(|f| summary_from_header_fetch(mailbox_id, f))
                             .filter(|m| wanted.contains(&m.uid) && received.insert(m.uid)).collect();
+                        tracing::debug!(account = %account_id, mailbox = %folder_path,
+                            responses = fetches.len(), headers = fetches.iter().filter(|f| f.header().is_some()).count(),
+                            recovered = batch.len(), "header fallback result");
                         persist_envelope_checkpoint(cache, mailbox_id, uidvalidity, &batch).await;
                         let grew = !batch.is_empty();
                         new_messages.extend(batch);
@@ -8075,11 +8114,10 @@ async fn sync_mailbox(
                 if !missing.is_empty() {
                     let still_live = imap_sync_step(account_id, "UID SEARCH unresolved envelopes", uids_still_present(session, &missing)).await?;
                     if !still_live.is_empty() {
-                        unresolved_envelopes = still_live.len();
+                        unresolved_envelopes += still_live.len();
                         // These UIDs are new, not existing cached rows. Keep
-                        // all known messages usable and retry missing UIDs
-                        // during the next full membership sync.
-                        tracing::warn!(account = %account_id, mailbox = %folder_path, missing = unresolved_envelopes, first_uid = still_live[0].0, "some live envelopes unavailable; publishing available mail");
+                        // all known messages usable; retry after cooldown.
+                        tracing::warn!(account = %account_id, mailbox = %folder_path, missing = still_live.len(), first_uid = still_live[0].0, retry_after_secs = ENVELOPE_RETRY_COOLDOWN_SECS, "some live envelopes unavailable; publishing available mail");
                     }
                 }
             }
@@ -9623,6 +9661,15 @@ mod tests {
             list_id: None,
             structure: None,
         }
+    }
+
+    #[test]
+    fn envelope_retry_keeps_new_and_recovered_messages_eligible() {
+        let live = [Uid(1), Uid(2), Uid(3), Uid(4)];
+        let received = HashSet::from([Uid(2)]);
+        let deferred = HashSet::from([Uid(1), Uid(2), Uid(99)]);
+        assert_eq!(partition_envelope_retry(&live, &received, &deferred), (vec![Uid(3), Uid(4)], 1));
+        assert_eq!(partition_envelope_retry(&live, &received, &HashSet::new()), (vec![Uid(1), Uid(3), Uid(4)], 0));
     }
 
     #[test]
