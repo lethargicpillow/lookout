@@ -402,7 +402,8 @@ impl DavClient {
     /// PROPFIND membership and ETags instead, fetching only changed cards.
     pub fn uses_google_contacts(&self) -> bool {
         self.base_url.host_str() == Some("www.googleapis.com")
-            && self.base_url.path().starts_with("/carddav/")
+            && (self.base_url.path().starts_with("/carddav/")
+                || self.base_url.path().trim_end_matches('/') == "/.well-known/carddav")
     }
 
     /// Return complete membership separately from changed card data.
@@ -1133,6 +1134,20 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+
+    #[test]
+    fn google_contacts_recognizes_goa_well_known_discovery_url() {
+        for url in ["https://www.googleapis.com/.well-known/carddav",
+                    "https://www.googleapis.com/.well-known/carddav/",
+                    "https://www.googleapis.com/carddav/v1/principals/alice@example.test/lists/default/"] {
+            assert!(DavClient::new(url, false, "alice".into()).unwrap().uses_google_contacts());
+        }
+        for url in ["https://www.googleapis.com/calendar/v3/",
+                    "https://apidata.googleusercontent.com/caldav/v2/alice/user",
+                    "https://example.test/.well-known/carddav"] {
+            assert!(!DavClient::new(url, false, "alice".into()).unwrap().uses_google_contacts());
+        }
+    }
 
     #[tokio::test]
     async fn contact_delete_404_reconciles_only_verified_absence() {
