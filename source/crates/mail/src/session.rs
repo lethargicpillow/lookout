@@ -295,6 +295,17 @@ fn queue_new_prefetch_mailboxes(prefetch: &mut Option<PrefetchState>, folders: &
 /// reaches [`PREFETCH_FAILURE_LIMIT`] consecutive failures the rebuilt
 /// prefetch pass skips it instead of looping the account on the one message
 /// that can't be parsed.
+fn prefetch_select_failure(failures: &mut HashMap<MailboxId, u32>, mailbox_id: &MailboxId, error: async_imap::error::Error) -> Error {
+    // A refused SELECT may leave the session authenticated rather than
+    // selected. Reconnect once to restore protocol state, but never queue
+    // a known nonexistent mailbox again during this account actor's life.
+    if matches!(&error, async_imap::error::Error::No(reason) if reason.to_ascii_uppercase().contains("[NONEXISTENT]")) {
+        failures.insert(mailbox_id.clone(), PREFETCH_FAILURE_LIMIT);
+        tracing::warn!(mailbox = %mailbox_id, "prefetch: server reports nonexistent mailbox; skipping for this account session");
+    }
+    error.into()
+}
+
 fn note_prefetch_failure(failures: &mut HashMap<MailboxId, u32>, mailbox_id: &MailboxId, error: Error) -> Error {
     let count = failures.entry(mailbox_id.clone()).or_insert(0);
     *count += 1;
@@ -5561,7 +5572,8 @@ async fn connect_and_run(
                         continue;
                     }
                     let folder_name = pf.current_folder_name.clone();
-                    let mailbox_meta = session.select(&folder_name).await?;
+                    let mailbox_meta = session.select(&folder_name).await
+                        .map_err(|e| prefetch_select_failure(prefetch_failures, &pf.mailboxes[pf.current], e))?;
                     session_selected = pf.mailboxes[pf.current].clone();
                     selected_for_prefetch = true;
                     // The prefetch is the first SELECT most folders ever get
@@ -5710,7 +5722,8 @@ async fn connect_and_run(
                     if !selected_for_prefetch {
                         let target = pf.mailboxes[pf.current].clone();
                         let before = pf.uidvalidity;
-                        let meta = session.select(&pf.current_folder_name).await?;
+                        let meta = session.select(&pf.current_folder_name).await
+                            .map_err(|e| prefetch_select_failure(prefetch_failures, &target, e))?;
                         session_selected = target.clone();
                         did_prefetch_work = true;
                         if !pf.validate_body_selection(meta.uid_validity) {
@@ -7324,10 +7337,16 @@ async fn login(config: &AccountConfig, credential: Credential) -> Result<(Sessio
 /// a later SELECT/STATUS). `None` for a `\NoSelect` name - those aren't
 /// selectable mailboxes and get no STATUS items (RFC 5819 §2).
 fn mailbox_from_list_parts(account_id: &AccountId, name: &str, delimiter: Option<&str>, attributes: &[NameAttribute]) -> Option<Mailbox> {
-    let attrs: Vec<String> = attributes.iter().map(|a| format!("{a:?}")).collect();
-    if attrs.iter().any(|a| a.contains("NoSelect")) {
+    // LIST-EXTENDED can advertise a hierarchy placeholder as
+    // \\NonExistent instead of \\Noselect. Neither is a real mailbox.
+    if attributes.iter().any(|a| match a {
+        NameAttribute::NoSelect => true,
+        NameAttribute::Extension(name) => name.eq_ignore_ascii_case("\\NonExistent") || name.eq_ignore_ascii_case("\\Noselect"),
+        _ => false,
+    }) {
         return None;
     }
+    let attrs: Vec<String> = attributes.iter().map(|a| format!("{a:?}")).collect();
     let delimiter = delimiter.and_then(|d| d.chars().next()).unwrap_or('/');
     // The id keeps the raw wire path; only the displayed segment is decoded
     // from modified UTF-7, so a non-ASCII folder name reads as typed.
@@ -10542,11 +10561,29 @@ mod tests {
         let account = AccountId("acc".into());
         assert!(mailbox_from_list_parts(&account, "INBOX", Some("/"), &[]).is_some());
         assert!(mailbox_from_list_parts(&account, "NoAccess", Some("/"), &[NameAttribute::NoSelect]).is_none());
+        assert!(mailbox_from_list_parts(&account, "[Gmail]", Some("/"), &[NameAttribute::Extension("\\NonExistent".into())]).is_none());
+        assert!(mailbox_from_list_parts(&account, "[Gmail]/Sent Mail", Some("/"), &[NameAttribute::Sent]).is_some());
         let m = mailbox_from_list_parts(&account, "Work/Sent", Some("/"), &[NameAttribute::Sent]).unwrap();
         assert_eq!(m.id, MailboxId::new(&account, "Work/Sent"));
         assert_eq!(m.name, "Sent");
         assert_eq!(m.delimiter, '/');
         assert_eq!(m.role, MailboxRole::Sent);
+    }
+
+    #[test]
+    fn prefetch_select_nonexistent_is_skipped_after_reconnect() {
+        let account = AccountId("acc".into());
+        let root = MailboxId::new(&account, "[Gmail]");
+        let mut failures = HashMap::new();
+        let error = prefetch_select_failure(&mut failures, &root,
+            async_imap::error::Error::No("code: None, info: Some(\"[NONEXISTENT] Unknown Mailbox\")".into()));
+        assert!(matches!(error, Error::Imap(async_imap::error::Error::No(_))));
+        assert_eq!(failures.get(&root), Some(&PREFETCH_FAILURE_LIMIT));
+        let folders = vec![mailbox(&account, "[Gmail]", MailboxRole::Custom, 0),
+            mailbox(&account, "[Gmail]/Sent Mail", MailboxRole::Sent, 0)];
+        let mut prefetch = None;
+        queue_new_prefetch_mailboxes(&mut prefetch, &folders, &MailboxId::new(&account, "INBOX"), &failures);
+        assert_eq!(prefetch.unwrap().mailboxes, vec![MailboxId::new(&account, "[Gmail]/Sent Mail")]);
     }
 
     #[test]
