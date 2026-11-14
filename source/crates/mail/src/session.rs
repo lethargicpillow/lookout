@@ -7489,6 +7489,14 @@ fn partition_envelope_retry(new_uids: &[Uid], received: &HashSet<Uid>, deferred:
     (eligible, postponed)
 }
 
+/// Progressive display is independent of the folder role. Only a stable
+/// UIDVALIDITY can safely expose staged messages to interactive reads.
+fn progressive_sync_allowed(new_count: usize, validity: UidValidity, folder: Option<&Mailbox>) -> bool {
+    new_count > ENVELOPE_SYNC_BATCH
+        && validity.0 != 0
+        && folder.is_some_and(|f| f.uidvalidity.0 == 0 || f.uidvalidity == validity)
+}
+
 /// Combine the live cached membership with staged envelopes. This is
 /// deliberately a display snapshot: no deletion, notification, rule run,
 /// or authoritative cache replacement happens until the final sync.
@@ -8250,14 +8258,13 @@ async fn sync_mailbox(
             remaining.dedup();
             let sets = envelope_sync_sets(&remaining);
             let mut unavailable = HashSet::new();
-            // Avoid extra GTK rebuilds on small deltas. Sent retains its
-            // existing auto-mark-as-read step before first publication.
-            // A real UIDVALIDITY reset must take the full invalidation path.
-            let progressive = new_uids.len() > ENVELOPE_SYNC_BATCH
-                && !is_sent
-                && uidvalidity.0 != 0
-                && folders.iter().find(|f| f.id == *mailbox_id)
-                    .is_some_and(|f| f.uidvalidity.0 == 0 || f.uidvalidity == uidvalidity);
+            // Avoid extra GTK rebuilds on small deltas. Sent can publish
+            // the server's actual flags too; the existing final auto-mark
+            // as read runs after all new metadata has been fetched. Do not
+            // fake Seen in intermediate snapshots before STORE succeeds.
+            // A real UIDVALIDITY reset still takes the full invalidation path.
+            let progressive = progressive_sync_allowed(new_uids.len(), uidvalidity,
+                folders.iter().find(|f| f.id == *mailbox_id));
             let mut last_progress = None::<std::time::Instant>;
             if progressive && !new_messages.is_empty() {
                 emit_mailbox_sync_progress(mailbox_id, uidvalidity, &messages, &new_messages, events, cache).await;
@@ -9937,6 +9944,27 @@ mod tests {
         let deferred = HashSet::from([Uid(1), Uid(2), Uid(99)]);
         assert_eq!(partition_envelope_retry(&live, &received, &deferred), (vec![Uid(3), Uid(4)], 1));
         assert_eq!(partition_envelope_retry(&live, &received, &HashSet::new()), (vec![Uid(1), Uid(3), Uid(4)], 0));
+    }
+
+    #[test]
+    fn progressive_sync_includes_sent_with_real_flags_and_staged_body_requests() {
+        let account = AccountId("acc".into());
+        let mut sent = mailbox(&account, "Sent", MailboxRole::Sent, 0);
+        let validity = sent.uidvalidity;
+        assert!(progressive_sync_allowed(305, validity, Some(&sent)));
+        assert!(!progressive_sync_allowed(ENVELOPE_SYNC_BATCH, validity, Some(&sent)));
+        assert!(!progressive_sync_allowed(305, UidValidity(0), Some(&sent)));
+        assert!(!progressive_sync_allowed(305, UidValidity(validity.0 + 1), Some(&sent)));
+        assert!(!progressive_sync_allowed(305, validity, None));
+        sent.uidvalidity = UidValidity(0);
+        assert!(progressive_sync_allowed(305, validity, Some(&sent)));
+
+        let staged = vec![summary(42, &sent.id, false), summary(43, &sent.id, true)];
+        let snapshot = progressive_mailbox_snapshot(&[], &staged);
+        assert!(snapshot[0].is_unread(), "don't fake Seen before server STORE succeeds");
+        assert!(!snapshot[1].is_unread());
+        let request = AccountCommand::FetchBody { mailbox: sent.id.clone(), uid: Uid(42) };
+        assert_eq!(sync_body_request_uid(&request, &sent.id, &[], &staged), Some(Uid(42)));
     }
 
     #[test]
