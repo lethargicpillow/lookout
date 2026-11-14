@@ -50,16 +50,13 @@ const ENVELOPE_RETRY_COOLDOWN_SECS: i64 = 5 * 60;
 /// so a command arriving mid-IDLE is picked up right away.
 const IDLE_SLICE: Duration = Duration::from_secs(25 * 60);
 
-/// Yandex connections in the field have been dropping after a few minutes.
-/// Renew IDLE before that observed interval on both connections, without
-/// changing other providers or the polling path for servers without IDLE.
-const YANDEX_IDLE_SLICE: Duration = Duration::from_secs(90);
-
-fn idle_keepalive_slice(host: &str) -> Duration {
-    match host.trim_end_matches('.').to_ascii_lowercase().as_str() {
-        "imap.yandex.com" | "imap.yandex.ru" => YANDEX_IDLE_SLICE,
-        _ => IDLE_SLICE,
-    }
+/// Yandex connections have failed during quiet IDLE and again at the
+/// shortened IDLE renewal deadline. Use the existing bounded polling path
+/// instead of IDLE on both connections. This is a transport compatibility
+/// policy, not a claim that the server does not advertise IDLE.
+fn imap_idle_allowed(host: &str) -> bool {
+    !matches!(host.trim_end_matches('.').to_ascii_lowercase().as_str(),
+        "imap.yandex.com" | "imap.yandex.ru")
 }
 /// Normal prefetch must advance even on a quiet mailbox.
 const NORMAL_PREFETCH_INTERVAL: Duration = Duration::from_secs(5);
@@ -1708,7 +1705,8 @@ pub async fn run_account_session(
     let (idle_notify_tx, idle_notify_rx) = async_channel::unbounded::<MailboxId>();
     // A launch that starts already offline must not even attempt the spare
     // IDLE connection; it is spawned when the account first goes online.
-    let mut idle_task = AccountTaskGuard((!*offline_rx.borrow()).then(|| tokio::spawn(run_idle_supervisor(config.clone(), credentials.clone(), mailbox_rx, idle_notify_tx.clone()))));
+    let allow_idle = imap_idle_allowed(&config.imap.host);
+    let mut idle_task = AccountTaskGuard((allow_idle && !*offline_rx.borrow()).then(|| tokio::spawn(run_idle_supervisor(config.clone(), credentials.clone(), mailbox_rx, idle_notify_tx.clone()))));
     // A separate, ordered draft lane survives primary IMAP reconnects.
     let draft_jobs = if davmail_saves_sent(&config.imap, &config.smtp) {
         let (tx, rx) = async_channel::unbounded();
@@ -1752,12 +1750,14 @@ pub async fn run_account_session(
             {
                 OfflineWait::Online => {
                     backoff = INITIAL_BACKOFF;
-                    idle_task.0 = Some(tokio::spawn(run_idle_supervisor(
-                        config.clone(),
-                        credentials.clone(),
-                        mailbox_tx.subscribe(),
-                        idle_notify_tx.clone(),
-                    )));
+                    if allow_idle {
+                        idle_task.0 = Some(tokio::spawn(run_idle_supervisor(
+                            config.clone(),
+                            credentials.clone(),
+                            mailbox_tx.subscribe(),
+                            idle_notify_tx.clone(),
+                        )));
+                    }
                     continue;
                 }
                 OfflineWait::Shutdown => {
@@ -1827,7 +1827,7 @@ pub async fn run_account_session(
                 // otherwise awaits it, respawn here so a silently-dead IDLE
                 // connection doesn't linger unnoticed for the rest of the
                 // session.
-                if idle_task.0.as_ref().is_none_or(|task| task.is_finished()) {
+                if allow_idle && idle_task.0.as_ref().is_none_or(|task| task.is_finished()) {
                     idle_task.0 = Some(tokio::spawn(run_idle_supervisor(
                         config.clone(),
                         credentials.clone(),
@@ -2117,10 +2117,14 @@ async fn connect_and_run(
     // DavMail's default loopback IMAP endpoint needs a conservative body
     // fetch path. Keep other IMAP accounts on the existing optimized path.
     let davmail_compat = is_local_davmail_endpoint(&config.imap, has_idle);
-    let idle_slice = idle_keepalive_slice(&config.imap.host);
-    if has_idle {
+    let use_idle = has_idle && imap_idle_allowed(&config.imap.host);
+    if use_idle {
         tracing::info!(account = %config.account_id, host = %config.imap.host,
-            keepalive_secs = idle_slice.as_secs(), "IMAP IDLE keepalive configured");
+            keepalive_secs = IDLE_SLICE.as_secs(), "IMAP IDLE keepalive configured");
+    } else if !imap_idle_allowed(&config.imap.host) {
+        tracing::info!(account = %config.account_id, host = %config.imap.host,
+            server_has_idle = has_idle, poll_secs = NO_IDLE_POLL_INTERVAL.as_secs(),
+            "IMAP polling compatibility configured (IDLE disabled)");
     }
     if davmail_compat {
         tracing::info!("DavMail compatibility: full MIME on demand, no background body fetch");
@@ -2636,7 +2640,7 @@ async fn connect_and_run(
                         Ok(cmd) => Wake::Command(cmd),
                         Err(async_channel::TryRecvError::Closed) => return Ok(ShutdownReason::Requested),
                         Err(async_channel::TryRecvError::Empty) => {
-                            if !has_idle {
+                            if !use_idle {
                                 // No IDLE/DONE on this connection. Keep the socket open,
                                 // wake immediately for interactive work, and poll on a
                                 // monotonic deadline that commands cannot reset.
@@ -2751,7 +2755,7 @@ async fn connect_and_run(
                                     // Normal prefetch also needs timer wakes while work
                                     // remains. Once done, only aggressive mode keeps its
                                     // periodic rescan tick; normal mode resumes keepalive.
-                                    let slice = prefetch_idle_slice(idle_slice,
+                                    let slice = prefetch_idle_slice(IDLE_SLICE,
                                         prefetch.as_ref().is_some_and(|pf| !pf.is_done()), prefetch_policy);
                                     // Wake early if a scheduled outbox send is
                                     // due sooner than the keepalive slice.
@@ -2878,6 +2882,10 @@ async fn connect_and_run(
                 session_selected = current_mailbox_id.clone();
             }
             Wake::Poll => {
+                let poll_started = std::time::Instant::now();
+                if !imap_idle_allowed(&config.imap.host) {
+                    tracing::debug!(account = %account_id, host = %config.imap.host, "IMAP compatibility poll started");
+                }
                 // Refresh INBOX even while another folder is on screen. A
                 // fresh SELECT catches UIDVALIDITY changes and updates the
                 // server's view before the flags/membership refresh.
@@ -2889,6 +2897,10 @@ async fn connect_and_run(
                 dirty_mailboxes.remove(&current_mailbox_id);
                 session_selected = current_mailbox_id.clone();
                 next_poll = tokio::time::Instant::now() + NO_IDLE_POLL_INTERVAL;
+                if !imap_idle_allowed(&config.imap.host) {
+                    tracing::info!(account = %account_id, host = %config.imap.host,
+                        elapsed_ms = poll_started.elapsed().as_millis(), "IMAP compatibility poll complete");
+                }
             }
             Wake::Idle(Err(e)) => return Err(Error::Imap(e)),
             Wake::IdlePush(mailbox_id) => match idle_push_outcome(&mailbox_id, &current_mailbox_id) {
@@ -5966,7 +5978,7 @@ async fn run_idle_connection(
             take_mailbox_change(&unsolicited);
             continue;
         }
-        let (wait_fut, stop_source) = handle.wait_with_timeout(idle_keepalive_slice(&config.imap.host));
+        let (wait_fut, stop_source) = handle.wait_with_timeout(IDLE_SLICE);
         // A mailbox switch mid-wait re-selects the new target on the next
         // loop iteration; dropping `wait_fut`/`stop_source` (via `select!`'s
         // implicit drop of the losing branch) cancels the IDLE wait
@@ -10754,15 +10766,15 @@ mod tests {
     }
 
     #[test]
-    fn yandex_idle_keepalive_is_shorter_without_affecting_other_hosts() {
-        assert_eq!(idle_keepalive_slice("imap.yandex.com"), Duration::from_secs(90));
-        assert_eq!(idle_keepalive_slice("IMAP.YANDEX.RU."), Duration::from_secs(90));
-        assert_eq!(idle_keepalive_slice("imap.gmail.com"), IDLE_SLICE);
-        assert_eq!(idle_keepalive_slice("127.0.0.1"), IDLE_SLICE);
-        assert_eq!(idle_keepalive_slice("imap.yandex.com.example.org"), IDLE_SLICE);
+    fn yandex_uses_polling_without_affecting_other_hosts() {
+        assert!(!imap_idle_allowed("imap.yandex.com"));
+        assert!(!imap_idle_allowed("IMAP.YANDEX.RU."));
+        assert!(imap_idle_allowed("imap.gmail.com"));
+        assert!(imap_idle_allowed("127.0.0.1"));
+        assert!(imap_idle_allowed("imap.yandex.com.example.org"));
         let policy = PrefetchPolicy::default();
-        assert_eq!(prefetch_idle_slice(idle_keepalive_slice("imap.yandex.com"), true, &policy), NORMAL_PREFETCH_INTERVAL);
-        assert_eq!(prefetch_idle_slice(idle_keepalive_slice("imap.yandex.com"), false, &policy), YANDEX_IDLE_SLICE);
+        assert_eq!(prefetch_idle_slice(NO_IDLE_POLL_INTERVAL, true, &policy), NORMAL_PREFETCH_INTERVAL);
+        assert_eq!(prefetch_idle_slice(NO_IDLE_POLL_INTERVAL, false, &policy), NO_IDLE_POLL_INTERVAL);
     }
 
     #[test]
