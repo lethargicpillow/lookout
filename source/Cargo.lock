@@ -2314,6 +2314,7 @@ version = "0.9.313"
 dependencies = [
  "async-channel 2.5.0",
  "async-trait",
+ "aws-lc-rs",
  "base64 0.22.1",
  "chrono",
  "chrono-tz",
@@ -2326,6 +2327,7 @@ dependencies = [
  "ksni",
  "ldap3",
  "libadwaita",
+ "libc",
  "lookout-core",
  "lookout-dav",
  "lookout-eds",

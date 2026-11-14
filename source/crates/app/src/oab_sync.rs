@@ -1,6 +1,7 @@
 //! Opt-in Exchange OAB refresh, scoped to the configured DavMail account.
-//! The helper uses the system Python NTLM stack rather than libcurl, whose
-//! newer builds can omit NTLM. Only a verified complete book reaches SQLite.
+//! Native libcurl transport and isolated libmspack decompression are the
+//! primary path. The legacy helper is only for Negotiate-only servers.
+//! Only a verified complete book reaches SQLite.
 use std::{cell::RefCell, collections::{HashMap, HashSet}, io::Write, path::{Path, PathBuf}, process::{Command, Stdio}, rc::Rc, time::{Duration, Instant}};
 use gtk::{glib, prelude::*};
 use lookout_core::AccountId;
@@ -31,6 +32,19 @@ impl Drop for Scratch {
 }
 
 fn download(url: &str, login: &str, password: &str, known: Option<String>, dir: &Path) -> Result<Option<String>, String> {
+    match crate::oab_native::download(url, login, password, known.as_deref(), dir) {
+        Ok(result) => return Ok(result),
+        Err(crate::oab_native::Error::Failure(message)) => return Err(message),
+        Err(crate::oab_native::Error::LegacyNegotiate) => {
+            tracing::debug!("OAB server requires Negotiate compatibility transport");
+        }
+    }
+    // The native path never falls back after rejected credentials or an
+    // integrity/TLS error. Only the unsupported auth scheme can get here.
+    download_legacy(url, login, password, known, dir)
+}
+
+fn download_legacy(url: &str, login: &str, password: &str, known: Option<String>, dir: &Path) -> Result<Option<String>, String> {
     if !valid_url(url) { return Err("Invalid OAB URL".into()); }
     let input = serde_json::to_vec(&serde_json::json!({
         "url": url, "login": login, "password": password, "known": known

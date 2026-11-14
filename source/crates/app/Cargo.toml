@@ -40,6 +40,10 @@ curl = { version = "=0.4.51", features = ["static-curl", "ntlm"] }
 curl-sys = "=0.4.91"
 base64.workspace = true
 sha2.workspace = true
+# OAB manifests specify legacy SHA-1 for compressed payload integrity.
+# Reuse the AWS-LC backend already built by reqwest/rustls.
+aws-lc-rs = { version = "1.17", default-features = false, features = ["aws-lc-sys"] }
+libc = "0.2"
 getrandom.workspace = true
 uuid.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -79,7 +83,7 @@ license-file = ["../../../LICENSE", "0"]
 depends = "libgtk-4-1 (>= 4.14), libadwaita-1-0 (>= 1.5), libwebkitgtk-6.0-4, libglib2.0-0"
 # Optional: enables EDS address-book search and the desktop calendar mirror.
 # Lookout still runs without EDS, so this must never become a hard dependency.
-recommends = "evolution-data-server, poppler-utils, libreoffice-writer, libreoffice-calc, bubblewrap, davmail, python3-requests, python3-requests-ntlm, python3-dnspython"
+recommends = "evolution-data-server, poppler-utils, libreoffice-writer, libreoffice-calc, bubblewrap, davmail, python3-requests, python3-requests-ntlm, python3-dnspython, libmspack0t64 | libmspack0"
 section = "mail"
 priority = "optional"
 assets = [
