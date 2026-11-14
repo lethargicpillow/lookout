@@ -1620,6 +1620,8 @@ pub async fn run_account_session(
     // processed once a session exists again, exactly as if it had arrived
     // right after connecting.
     let mut carried_command: Option<AccountCommand> = None;
+    // Requests deferred inside a sync survive transport reconnects.
+    let mut deferred_interactive = VecDeque::new();
 
     // Folders whose background-prefetch envelope `FETCH` keeps failing,
     // keyed to a consecutive-failure count. Deliberately lives outside the
@@ -1732,6 +1734,7 @@ pub async fn run_account_session(
             &mailbox_tx,
             &idle_notify_rx,
             carried_command.take(),
+            &mut deferred_interactive,
             &mut prefetch_failures,
             &mut local_focus,
             &mut prefetch_policy,
@@ -2015,6 +2018,7 @@ async fn connect_and_run(
     mailbox_tx: &tokio::sync::watch::Sender<MailboxId>,
     idle_notify: &async_channel::Receiver<MailboxId>,
     mut carried_command: Option<AccountCommand>,
+    deferred_interactive: &mut VecDeque<AccountCommand>,
     prefetch_failures: &mut HashMap<MailboxId, u32>,
     local_focus: &mut LocalFocusSettings,
     prefetch_policy: &mut PrefetchPolicy,
@@ -2122,6 +2126,7 @@ async fn connect_and_run(
         cache,
         &mut folders,
         interactive_commands,
+        deferred_interactive,
         None,
         condstore,
         qresync,
@@ -2203,6 +2208,8 @@ async fn connect_and_run(
     enum Wake {
         Idle(std::result::Result<async_imap::extensions::idle::IdleResponse, async_imap::error::Error>),
         Command(AccountCommand),
+        /// A sync deferred an interactive request to the normal drain.
+        DeferredInteractive,
         /// The dedicated IDLE-only connection (`run_idle_supervisor`) saw a
         /// change on the mailbox it's watching. Carries just the mailbox id -
         /// the two connections share no protocol state, so this session
@@ -2262,7 +2269,7 @@ async fn connect_and_run(
         // send goes out as soon as the (outbox-capped) IDLE slice wakes. Gated
         // on a due time and `no_work_pending`, so an empty outbox costs one
         // comparison and a queued command always wins over delivery.
-        if next_outbox_due.is_some_and(|due| due <= chrono::Utc::now()) && no_work_pending(commands, interactive_commands, idle_notify) {
+        if next_outbox_due.is_some_and(|due| due <= chrono::Utc::now()) && (deferred_interactive.is_empty() && no_work_pending(commands, interactive_commands, idle_notify)) {
             let due = cache_op(cache, {
                 let now = chrono::Utc::now();
                 move |c| c.due_outbox(now)
@@ -2397,6 +2404,7 @@ async fn connect_and_run(
                         cache,
                         &mut folders,
                         interactive_commands,
+                        deferred_interactive,
                         Some(&session_selected),
                         condstore,
                         qresync,
@@ -2423,6 +2431,7 @@ async fn connect_and_run(
                             cache,
                             &mut folders,
                             interactive_commands,
+                            deferred_interactive,
                             Some(&session_selected),
                             condstore,
                             qresync,
@@ -2465,7 +2474,7 @@ async fn connect_and_run(
         let scheduled = scheduled_folder(&folders, &account_id);
         let local_due = local_snooze_wake.is_some_and(|due| due <= now);
         let server_due = scheduled.is_some() && scheduled_keywords_ok != Some(false) && (server_snooze_wake.is_some_and(|due| due <= now) || next_scheduled_scan <= now);
-        if (local_due || server_due) && no_work_pending(commands, interactive_commands, idle_notify) {
+        if (local_due || server_due) && (deferred_interactive.is_empty() && no_work_pending(commands, interactive_commands, idle_notify)) {
             if local_due {
                 let woken = cache_op(cache, move |c| c.purge_expired_snoozed(now)).await.and_then(|r| r.ok()).unwrap_or_default();
                 for mailbox in woken {
@@ -2523,6 +2532,7 @@ async fn connect_and_run(
                                     cache,
                                     &mut folders,
                                     interactive_commands,
+                                    deferred_interactive,
                                     Some(&session_selected),
                                     condstore,
                                     qresync,
@@ -2557,6 +2567,7 @@ async fn connect_and_run(
         // search), but never outranks an explicit user click already queued.
         let wake = match carried_command.take() {
             Some(cmd) => Wake::Command(cmd),
+            None if !deferred_interactive.is_empty() => Wake::DeferredInteractive,
             None => match interactive_commands.try_recv() {
                 Ok(cmd) => Wake::Command(cmd),
                 // A closed interactive channel just means no interactive
@@ -2804,6 +2815,7 @@ async fn connect_and_run(
                     cache,
                     &mut folders,
                     interactive_commands,
+                    deferred_interactive,
                     Some(&session_selected),
                     condstore,
                     qresync,
@@ -2819,10 +2831,10 @@ async fn connect_and_run(
                 // fresh SELECT catches UIDVALIDITY changes and updates the
                 // server's view before the flags/membership refresh.
                 if current_mailbox_id != inbox_id {
-                    sync_mailbox(&mut session, &account_id, "INBOX", &inbox_id, events, cache, &mut folders, interactive_commands, None, condstore, qresync, local_focus, davmail_compat).await?;
+                    sync_mailbox(&mut session, &account_id, "INBOX", &inbox_id, events, cache, &mut folders, interactive_commands, deferred_interactive, None, condstore, qresync, local_focus, davmail_compat).await?;
                     dirty_mailboxes.remove(&inbox_id);
                 }
-                sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache, &mut folders, interactive_commands, None, condstore, qresync, local_focus, davmail_compat).await?;
+                sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache, &mut folders, interactive_commands, deferred_interactive, None, condstore, qresync, local_focus, davmail_compat).await?;
                 dirty_mailboxes.remove(&current_mailbox_id);
                 session_selected = current_mailbox_id.clone();
                 next_poll = tokio::time::Instant::now() + NO_IDLE_POLL_INTERVAL;
@@ -2854,6 +2866,7 @@ async fn connect_and_run(
                         cache,
                         &mut folders,
                         interactive_commands,
+                        deferred_interactive,
                         if davmail_compat { None } else { Some(&session_selected) },
                         condstore,
                         qresync,
@@ -2869,6 +2882,7 @@ async fn connect_and_run(
                 }
             },
             Wake::Command(cmd) => woke_on_command = Some(cmd),
+            Wake::DeferredInteractive => {},
             Wake::Offline => {
                 let _ = session.logout().await;
                 return Ok(ShutdownReason::Offline);
@@ -2895,9 +2909,9 @@ async fn connect_and_run(
         // that in-flight command is itself bounded.
         let mut pending: VecDeque<AccountCommand> = woke_on_command.into_iter().collect();
         loop {
-            let command = match interactive_commands.try_recv() {
-                Ok(cmd) => cmd,
-                Err(_) => match pending.pop_front().or_else(|| commands.try_recv().ok()) {
+            let command = match deferred_interactive.pop_front().or_else(|| interactive_commands.try_recv().ok()) {
+                Some(cmd) => cmd,
+                None => match pending.pop_front().or_else(|| commands.try_recv().ok()) {
                     Some(cmd) => cmd,
                     None => break,
                 },
@@ -2930,6 +2944,7 @@ async fn connect_and_run(
                         cache,
                         &mut folders,
                         interactive_commands,
+                        deferred_interactive,
                         Some(&session_selected),
                         condstore,
                         qresync,
@@ -3013,6 +3028,7 @@ async fn connect_and_run(
                             cache,
                             &mut folders,
                             interactive_commands,
+                            deferred_interactive,
                             Some(&session_selected),
                             condstore,
                             qresync,
@@ -3086,6 +3102,7 @@ async fn connect_and_run(
                             tracing::debug!(?mailbox, ?vanished, "FetchBody: refreshing mailbox after stale UID");
                             sync_mailbox(&mut session, &account_id, &path, &mailbox,
                                 events, cache, &mut folders, interactive_commands,
+                                deferred_interactive,
                                 None, condstore, qresync, local_focus, davmail_compat).await?;
                             session_selected = mailbox.clone();
                             dirty_mailboxes.remove(&mailbox);
@@ -3457,6 +3474,7 @@ async fn connect_and_run(
                                 cache,
                                 &mut folders,
                                 interactive_commands,
+                                deferred_interactive,
                                 Some(&session_selected),
                                 condstore,
                                 qresync,
@@ -3627,6 +3645,7 @@ async fn connect_and_run(
                                 cache,
                                 &mut folders,
                                 interactive_commands,
+                                deferred_interactive,
                                 Some(&session_selected),
                                 condstore,
                                 qresync,
@@ -3702,6 +3721,7 @@ async fn connect_and_run(
                                 cache,
                                 &mut folders,
                                 interactive_commands,
+                                deferred_interactive,
                                 Some(&session_selected),
                                 condstore,
                                 qresync,
@@ -3782,6 +3802,7 @@ async fn connect_and_run(
                                 cache,
                                 &mut folders,
                                 interactive_commands,
+                                deferred_interactive,
                                 Some(&session_selected),
                                 condstore,
                                 qresync,
@@ -3896,6 +3917,7 @@ async fn connect_and_run(
                                 cache,
                                 &mut folders,
                                 interactive_commands,
+                                deferred_interactive,
                                 Some(&session_selected),
                                 condstore,
                                 qresync,
@@ -3963,6 +3985,7 @@ async fn connect_and_run(
                                 cache,
                                 &mut folders,
                                 interactive_commands,
+                                deferred_interactive,
                                 Some(&session_selected),
                                 condstore,
                                 qresync,
@@ -4026,6 +4049,7 @@ async fn connect_and_run(
                                 cache,
                                 &mut folders,
                                 interactive_commands,
+                                deferred_interactive,
                                 Some(&session_selected),
                                 condstore,
                                 qresync,
@@ -4065,7 +4089,7 @@ async fn connect_and_run(
                             emit_cached_messages_after_removal(cache, &mailbox, events).await;
                             dirty_mailboxes.insert(mailbox.clone());
                             sync_mailbox(&mut session, &account_id, &path, &mailbox, events,
-                                cache, &mut folders, interactive_commands, None, condstore,
+                                cache, &mut folders, interactive_commands, deferred_interactive, None, condstore,
                                 qresync, local_focus, davmail_compat).await?;
                             dirty_mailboxes.remove(&mailbox);
                         }
@@ -4126,6 +4150,7 @@ async fn connect_and_run(
                                 cache,
                                 &mut folders,
                                 interactive_commands,
+                                deferred_interactive,
                                 Some(&session_selected),
                                 condstore,
                                 qresync,
@@ -4181,6 +4206,7 @@ async fn connect_and_run(
                                 cache,
                                 &mut folders,
                                 interactive_commands,
+                                deferred_interactive,
                                 Some(&session_selected),
                                 condstore,
                                 qresync,
@@ -4329,6 +4355,7 @@ async fn connect_and_run(
                         cache,
                         &mut folders,
                         interactive_commands,
+                        deferred_interactive,
                         Some(&session_selected),
                         condstore,
                         qresync,
@@ -4478,6 +4505,7 @@ async fn connect_and_run(
                         cache,
                         &mut folders,
                         interactive_commands,
+                        deferred_interactive,
                         Some(&session_selected),
                         condstore,
                         qresync,
@@ -4559,6 +4587,7 @@ async fn connect_and_run(
                         cache,
                         &mut folders,
                         interactive_commands,
+                        deferred_interactive,
                         Some(&session_selected),
                         condstore,
                         qresync,
@@ -4618,6 +4647,7 @@ async fn connect_and_run(
                                 cache,
                                 &mut folders,
                                 interactive_commands,
+                                deferred_interactive,
                                 Some(&session_selected),
                                 condstore,
                                 qresync,
@@ -4684,6 +4714,7 @@ async fn connect_and_run(
                                     cache,
                                     &mut folders,
                                     interactive_commands,
+                                    deferred_interactive,
                                     Some(&session_selected),
                                     condstore,
                                     qresync,
@@ -4772,6 +4803,7 @@ async fn connect_and_run(
                                     cache,
                                     &mut folders,
                                     interactive_commands,
+                                    deferred_interactive,
                                     Some(&session_selected),
                                     condstore,
                                     qresync,
@@ -4885,6 +4917,7 @@ async fn connect_and_run(
                                         cache,
                                         &mut folders,
                                         interactive_commands,
+                                        deferred_interactive,
                                         Some(&session_selected),
                                         condstore,
                                         qresync,
@@ -4926,6 +4959,7 @@ async fn connect_and_run(
                                 cache,
                                 &mut folders,
                                 interactive_commands,
+                                deferred_interactive,
                                 Some(&session_selected),
                                 condstore,
                                 qresync,
@@ -4992,6 +5026,7 @@ async fn connect_and_run(
                                         cache,
                                         &mut folders,
                                         interactive_commands,
+                                        deferred_interactive,
                                         Some(&session_selected),
                                         condstore,
                                         qresync,
@@ -5033,6 +5068,7 @@ async fn connect_and_run(
                                 cache,
                                 &mut folders,
                                 interactive_commands,
+                                deferred_interactive,
                                 Some(&session_selected),
                                 condstore,
                                 qresync,
@@ -5084,6 +5120,7 @@ async fn connect_and_run(
                                     cache,
                                     &mut folders,
                                     interactive_commands,
+                                    deferred_interactive,
                                     Some(&session_selected),
                                     condstore,
                                     qresync,
@@ -5369,7 +5406,7 @@ async fn connect_and_run(
         if !counts_pending.is_empty() {
             let mut since_emit = 0usize;
             let mut dirty = false;
-            while no_work_pending(commands, interactive_commands, idle_notify) {
+            while (deferred_interactive.is_empty() && no_work_pending(commands, interactive_commands, idle_notify)) {
                 let Some(mailbox_id) = counts_pending.pop_front() else { break };
                 // The folder may have vanished from a re-list between being
                 // queued and being drained; skip it rather than miscounting.
@@ -5398,6 +5435,7 @@ async fn connect_and_run(
                             cache,
                             &mut folders,
                             interactive_commands,
+                            deferred_interactive,
                             Some(&session_selected),
                             condstore,
                             qresync,
@@ -5462,7 +5500,7 @@ async fn connect_and_run(
                 // Check before starting any batch work (SELECT, envelope
                 // fetch, body fetch) so a rapid stream of user clicks
                 // never waits for even one IMAP round trip.
-                if !no_work_pending(commands, interactive_commands, idle_notify) {
+                if !(deferred_interactive.is_empty() && no_work_pending(commands, interactive_commands, idle_notify)) {
                     continue;
                 }
 
@@ -5491,7 +5529,7 @@ async fn connect_and_run(
                 if !pf.envelopes_fetched {
                     // Check before SELECT to avoid blocking the session if a
                     // user command arrived during the previous body fetch.
-                    if !no_work_pending(commands, interactive_commands, idle_notify) {
+                    if !(deferred_interactive.is_empty() && no_work_pending(commands, interactive_commands, idle_notify)) {
                         continue;
                     }
                     let folder_name = pf.current_folder_name.clone();
@@ -5632,7 +5670,7 @@ async fn connect_and_run(
                 // raise it.
                 if !pf.pending_uids.is_empty() {
                     // Check before starting the batch fetch.
-                    if !no_work_pending(commands, interactive_commands, idle_notify) {
+                    if !(deferred_interactive.is_empty() && no_work_pending(commands, interactive_commands, idle_notify)) {
                         continue;
                     }
                     let batch: Vec<Uid> = pf.pending_uids.drain(..pf.pending_uids.len().min(prefetch_policy.batch_size)).collect();
@@ -5682,7 +5720,7 @@ async fn connect_and_run(
         // fetch or body fetches). Skip if a user command is pending — the
         // command handler will SELECT the folder it needs, and the top-of-loop
         // check re-selects the user's folder anyway.
-        if did_prefetch_work && no_work_pending(commands, interactive_commands, idle_notify) {
+        if did_prefetch_work && (deferred_interactive.is_empty() && no_work_pending(commands, interactive_commands, idle_notify)) {
             session.select(&current_mailbox_name).await?;
             session_selected = current_mailbox_id.clone();
         }
@@ -7856,6 +7894,71 @@ async fn select_with_qresync(session: &mut Session<SessionStream>, folder_path: 
     Ok(vanished)
 }
 
+// A sync cannot interrupt an in-flight IMAP command, but it can service
+// reads between bounded envelope batches without changing SELECT state.
+// Other interactive requests remain queued for the normal command drain.
+fn sync_body_request_uid(command: &AccountCommand, mailbox: &MailboxId, cached: &[EmailSummary], staged: &[EmailSummary]) -> Option<Uid> {
+    match command {
+        AccountCommand::FetchBody { mailbox: requested, uid } if requested == mailbox
+            && cached.iter().chain(staged).any(|m| m.uid == *uid) => Some(*uid),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn service_sync_body_requests(
+    session: &mut Session<SessionStream>,
+    cache: &CacheHandle,
+    events: &async_channel::Sender<AccountEvent>,
+    mailbox: &MailboxId,
+    validity: UidValidity,
+    cached: &mut [EmailSummary],
+    staged: &mut [EmailSummary],
+    interactive: &async_channel::Receiver<AccountCommand>,
+    deferred: &mut VecDeque<AccountCommand>,
+) -> Result<()> {
+    // Bound work per batch so rapid paging cannot starve metadata.
+    for _ in 0..8 {
+        let Ok(command) = interactive.try_recv() else { break; };
+        let Some(uid) = sync_body_request_uid(&command, mailbox, cached, staged) else {
+            deferred.push_back(command);
+            continue;
+        };
+        let summary = cached.iter_mut().chain(staged.iter_mut()).find(|m| m.uid == uid)
+            .expect("sync body request matched a summary");
+        let started = std::time::Instant::now();
+        // Staged summaries aren't in the authoritative messages table yet.
+        // Supply their structure explicitly and use the selected validity.
+        let structure = summary.structure.clone();
+        let result = tokio::time::timeout(IMAP_SYNC_STEP_TIMEOUT,
+            fetch_body_cached(cache, session, mailbox, uid, validity, structure.as_deref(), false)).await;
+        let body = match result {
+            Ok(Ok(Some(body))) => body,
+            Ok(Ok(None)) | Ok(Err(Error::Imap(async_imap::error::Error::No(_)))) => {
+                // A tagged NO leaves the stream synchronized. Let the normal
+                // request path handle the refusal after metadata sync.
+                deferred.push_back(command);
+                continue;
+            }
+            Ok(Err(error)) => {
+                deferred.push_front(command);
+                return Err(error);
+            }
+            Err(_) => {
+                deferred.push_front(command);
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "interactive body during envelope sync timed out").into());
+            }
+        };
+        if let Some(preview) = crate::body::preview_from_body(&body) {
+            summary.preview = Some(preview);
+        }
+        summary.mentions |= crate::body::mentions_in_body(&mention_matcher(cache), &body);
+        tracing::debug!(%mailbox, uid = uid.0, elapsed_ms = started.elapsed().as_millis(), "served interactive body during envelope sync");
+        let _ = events.send(AccountEvent::BodyFetched { mailbox: mailbox.clone(), uid, body }).await;
+    }
+    Ok(())
+}
+
 // The extra `session_selected`/`qresync` arguments are what let the IDLE-wake
 // path skip its re-SELECT and use the QRESYNC SELECT, so the count is worth it
 // for the session-critical helper.
@@ -7869,6 +7972,7 @@ async fn sync_mailbox(
     cache: &CacheHandle,
     folders: &mut [Mailbox],
     interactive_commands: &async_channel::Receiver<AccountCommand>,
+    deferred_interactive: &mut VecDeque<AccountCommand>,
     session_selected: Option<&MailboxId>,
     condstore: bool,
     qresync: bool,
@@ -8115,6 +8219,10 @@ async fn sync_mailbox(
             }
             tracing::info!(account = %account_id, mailbox = %folder_path, count = new_uids.len(), reused_checkpoint = new_messages.len(), remaining = remaining.len(), batches = sets.len(), "fetching new message envelopes");
             for (index, uid_set) in sets.iter().enumerate() {
+                if progressive {
+                    service_sync_body_requests(session, cache, events, mailbox_id, uidvalidity,
+                        &mut messages, &mut new_messages, interactive_commands, deferred_interactive).await?;
+                }
                 tracing::debug!(account = %account_id, mailbox = %folder_path, batch = index + 1, batches = sets.len(), "requesting envelope batch");
                 let (fetches, refusal) = imap_sync_step(account_id, "UID FETCH ENVELOPE", async {
                     collect_metadata_fetches(session.uid_fetch(uid_set, envelope_fetch_items(false)).await?).await
@@ -8146,6 +8254,10 @@ async fn sync_mailbox(
                 }
             }
 
+            if progressive {
+                service_sync_body_requests(session, cache, events, mailbox_id, uidvalidity,
+                    &mut messages, &mut new_messages, interactive_commands, deferred_interactive).await?;
+            }
             // A server can omit a response for an expunged UID or fail to
             // return an envelope. Try a genuinely different request using
             // RFC 5322 headers, not the same failing ENVELOPE/BODYSTRUCTURE.
@@ -8171,6 +8283,10 @@ async fn sync_mailbox(
                 }
                 for group in fallback.chunks(20) {
                     for set in uid_set_chunks(group) {
+                        if progressive {
+                            service_sync_body_requests(session, cache, events, mailbox_id, uidvalidity,
+                                &mut messages, &mut new_messages, interactive_commands, deferred_interactive).await?;
+                        }
                         let (fetches, refusal) = imap_sync_step(account_id, "UID FETCH HEADER fallback", async {
                             collect_metadata_fetches(session.uid_fetch(&set, "(UID FLAGS RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER])").await?).await
                         }).await?;
@@ -9775,6 +9891,20 @@ mod tests {
         let deferred = HashSet::from([Uid(1), Uid(2), Uid(99)]);
         assert_eq!(partition_envelope_retry(&live, &received, &deferred), (vec![Uid(3), Uid(4)], 1));
         assert_eq!(partition_envelope_retry(&live, &received, &HashSet::new()), (vec![Uid(1), Uid(3), Uid(4)], 0));
+    }
+
+    #[test]
+    fn progressive_sync_body_requests_only_accept_known_uids_in_selected_mailbox() {
+        let mailbox = MailboxId::new(&AccountId("acc".into()), "INBOX");
+        let other = MailboxId::new(&AccountId("acc".into()), "Archive");
+        let cached = vec![summary(1, &mailbox, true)];
+        let staged = vec![summary(2, &mailbox, false)];
+        let request = |mailbox: &MailboxId, uid| AccountCommand::FetchBody { mailbox: mailbox.clone(), uid: Uid(uid) };
+        assert_eq!(sync_body_request_uid(&request(&mailbox, 1), &mailbox, &cached, &staged), Some(Uid(1)));
+        assert_eq!(sync_body_request_uid(&request(&mailbox, 2), &mailbox, &cached, &staged), Some(Uid(2)));
+        assert_eq!(sync_body_request_uid(&request(&mailbox, 3), &mailbox, &cached, &staged), None);
+        assert_eq!(sync_body_request_uid(&request(&other, 1), &mailbox, &cached, &staged), None);
+        assert_eq!(sync_body_request_uid(&AccountCommand::Shutdown, &mailbox, &cached, &staged), None);
     }
 
     #[test]
