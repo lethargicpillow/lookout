@@ -363,7 +363,7 @@ pub fn show_add_account_dialog(
     approve_button.set_visible(false);
     if !is_edit {
         let intro = gtk::Label::builder()
-            .label("Enter your email and password. Lookout will find your mail server settings automatically.")
+            .label("Enter your email and find settings. Lookout will determine how to sign in. Password-based accounts may require an app password.")
             .wrap(true).halign(gtk::Align::Start).xalign(0.0).build();
         form.attach(&intro, 0, row, 2, 1);
         row += 1;
@@ -572,9 +572,9 @@ pub fn show_add_account_dialog(
         let ready = ready.clone();
         let running = running.clone();
         Rc::new(move || {
-            let credentials = crate::recipient_entry::is_plausible_address(email.text().trim())
-                && !password.text().is_empty();
-            button.set_sensitive(!running.get() && credentials);
+            let address_valid = crate::recipient_entry::is_plausible_address(email.text().trim());
+            let credentials = address_valid && !password.text().is_empty();
+            button.set_sensitive(!running.get() && address_valid);
             save.set_sensitive(!running.get() && (is_edit || (credentials && (ready.get() || advanced.is_expanded()))));
         })
     };
@@ -669,7 +669,7 @@ pub fn show_add_account_dialog(
             let ready = ready.clone();
             let refresh = refresh_actions.clone();
             Rc::new(move || {
-                if running.get() || !crate::recipient_entry::is_plausible_address(email.text().trim()) || password.text().is_empty() { return; }
+                if running.get() || !crate::recipient_entry::is_plausible_address(email.text().trim()) { return; }
                 running.set(true);
                 ready.set(false);
                 let address = email.text().trim().to_owned();
@@ -710,18 +710,24 @@ pub fn show_add_account_dialog(
                     (email.clone(), approve.clone(), oab.clone(), status.clone(), apply.clone(), running.clone(), pending.clone(), password.clone());
                 let ready = ready.clone();
                 let refresh = refresh.clone();
+                let oauth_worker = worker.clone();
                 glib::spawn_future_local(async move {
                     let result = rx.recv().await;
                     running.set(false);
                     refresh();
                     if email.text().trim() != address { status.set_label("Email changed. Find settings again."); return; }
                     match result {
-                        Ok(Ok(Discovery::Mail { imap, smtp })) => {
+                        Ok(Ok(Discovery::Mail { imap, smtp, oauth_available })) => {
                             oab.set_text("");
                             apply(imap, smtp);
                             ready.set(true);
                             refresh();
-                            status.set_label("Mail settings found. Add account to verify and connect.");
+                            status.set_label(if oauth_available {
+                                "Mail settings found. Use a password or an app password supported by your provider, then add the account."
+                            } else {
+                                "Mail settings found. Enter your password (or app password), then add the account."
+                            });
+                            if password.text().is_empty() { password.grab_focus(); }
                         }
                         Ok(Ok(Discovery::Exchange { ews: Some(_), oab: discovered_oab })) => {
                             oab.set_text(discovered_oab.as_deref().unwrap_or(""));
@@ -740,7 +746,19 @@ pub fn show_add_account_dialog(
                             *pending.borrow_mut() = Some(host);
                             approve.set_visible(true);
                         }
-                        Ok(Ok(Discovery::Microsoft365)) => status.set_label("Microsoft 365 detected. Use the Microsoft 365 sign-in option in Accounts (OAuth)."),
+                        Ok(Ok(Discovery::Google)) => {
+                            password.set_text("");
+                            status.set_label("Google detected. Sign in to Google in Online Accounts and enable Mail. Lookout will connect automatically.");
+                            oauth_worker.spawn(crate::online_accounts::open_online_accounts());
+                        }
+                        Ok(Ok(Discovery::OAuthRequired(provider))) => {
+                            password.set_text("");
+                            status.set_label(&format!("{provider} requires OAuth2. Lookout does not yet have an OAuth sign-in adapter for this provider. Use a supported Online Accounts provider if available."));
+                        }
+                        Ok(Ok(Discovery::Microsoft365)) => {
+                            password.set_text("");
+                            status.set_label("Microsoft 365 detected. Use the Microsoft 365 sign-in option in Accounts (OAuth).");
+                        }
                         Ok(Err(message)) => status.set_label(&message),
                         Err(_) => status.set_label("Discovery stopped. Try again."),
                     }
@@ -752,8 +770,8 @@ pub fn show_add_account_dialog(
             detect_button.connect_clicked(move |_| detect());
         }
         {
-            let password = imap_password_entry.clone();
-            email_entry.connect_activate(move |_| { password.grab_focus(); });
+            let detect = detect.clone();
+            email_entry.connect_activate(move |_| { detect(); });
         }
         {
             let detect = detect.clone();

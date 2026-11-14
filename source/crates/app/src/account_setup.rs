@@ -17,9 +17,11 @@ pub(crate) struct Server {
 }
 #[derive(Clone, Debug)]
 pub(crate) enum Discovery {
-    Mail { imap: Server, smtp: Server },
+    Mail { imap: Server, smtp: Server, oauth_available: bool },
     Exchange { ews: Option<String>, oab: Option<String> },
     Microsoft365,
+    Google,
+    OAuthRequired(String),
     PasswordRequired,
     ApproveHost(String),
 }
@@ -72,15 +74,28 @@ fn leaves(xml: &str) -> Option<Vec<(Vec<String>, String)>> {
     reader.config_mut().trim_text(true);
     let mut stack = Vec::<String>::new();
     let mut out = Vec::new();
+    let mut server_count = 0usize;
+    let mut provider_seen = false;
     loop {
         match reader.read_event().ok()? {
             Event::Start(e) => {
                 let name = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
-                let server = if name == "incomingServer" || name == "outgoingServer" {
+                if name == "emailProvider" && stack == ["clientConfig"] {
+                    if provider_seen { return None; }
+                    provider_seen = true;
+                    if let Some(id) = e.attributes().filter_map(Result::ok).find(|a| a.key.as_ref() == b"id") {
+                        let id = id.decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, reader.decoder()).ok()?.into_owned();
+                        out.push((vec!["clientConfig".into(), "emailProvider".into(), "@id".into()], id));
+                    }
+                }
+                let server = if (name == "incomingServer" || name == "outgoingServer")
+                    && stack == ["clientConfig", "emailProvider"] {
+                    server_count += 1;
+                    if server_count > 128 { return None; }
                     e.attributes().filter_map(Result::ok).find(|a| a.key.as_ref() == b"type")
                         .map(|a| String::from_utf8_lossy(a.value.as_ref()).into_owned())
                 } else { None };
-                stack.push(server.map_or(name.clone(), |kind| format!("{name}:{kind}")));
+                stack.push(server.map_or(name.clone(), |kind| format!("{name}:{kind}:{server_count}")));
                 if stack.len() > 32 { return None; }
             }
             Event::Text(t) => {
@@ -98,32 +113,105 @@ fn leaves(xml: &str) -> Option<Vec<(Vec<String>, String)>> {
     stack.is_empty().then_some(out)
 }
 
-fn parse_mail(xml: &str, email: &str) -> Option<Discovery> {
+// Discovery and authentication are separate: the ISPDB supplies server
+// addresses, ports and available methods. These are stable OAuth provider
+// identities, not a host/port table maintained in Lookout.
+fn oauth_adapter(issuer: Option<&str>, provider_id: Option<&str>) -> Option<Discovery> {
+    match issuer.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("accounts.google.com") | Some("https://accounts.google.com") => return Some(Discovery::Google),
+        Some("login.microsoftonline.com") | Some("https://login.microsoftonline.com") |
+        Some("login.live.com") | Some("https://login.live.com") => return Some(Discovery::Microsoft365),
+        Some(_) => return None,
+        None => {}
+    }
+    // Some ISPDB files predate the oAuth2 metadata. Their stable provider
+    // identifier is the fallback identity, independent of email aliases.
+    match provider_id.map(str::to_ascii_lowercase).as_deref() {
+        Some("googlemail.com") => Some(Discovery::Google),
+        Some("hotmail.com") | Some("office365.com") => Some(Discovery::Microsoft365),
+        _ => None,
+    }
+}
+
+#[derive(Debug)]
+struct MailEndpoint {
+    server: Server,
+    password: bool,
+    oauth: bool,
+}
+
+fn parse_mail_config(xml: &str, email: &str, catalog_domain: Option<&str>) -> Option<Discovery> {
     let entries = leaves(xml)?;
-    let get = |section: &str, key: &str| -> Option<&str> {
-        entries.iter().find(|(path, _)| path.iter().any(|p| p == section) && path.last().is_some_and(|p| p == key))
-            .map(|(_, value)| value.as_str())
-    };
-    let endpoint = |section: &str| -> Option<Server> {
-        let host = get(section, "hostname")?.to_owned();
-        if domain(&format!("x@{host}")).is_none() { return None; }
-        let port = get(section, "port")?.parse::<u16>().ok().filter(|p| *p != 0)?;
-        let security = match get(section, "socketType")? {
-            "SSL" => Security::ImplicitTls,
-            "STARTTLS" => Security::StartTls,
-            _ => return None,
-        };
-        // Do not fill password fields for OAuth-only endpoints.
-        if !entries.iter().any(|(path, val)| path.iter().any(|p| p == section)
-            && path.last().is_some_and(|p| p == "authentication") && matches!(val.as_str(), "password-cleartext" | "password-encrypted")) {
+    let value = |path: &[&str]| entries.iter().find(|(p, _)| p.iter().map(String::as_str).eq(path.iter().copied())).map(|(_, v)| v.as_str());
+    // A catalog response must describe the queried domain, not an unrelated
+    // provider returned by a captive portal, proxy or erroneous redirect.
+    if let Some(d) = catalog_domain {
+        if !entries.iter().any(|(p, v)| p == &["clientConfig", "emailProvider", "domain"] && v.eq_ignore_ascii_case(d)) {
             return None;
         }
-        let username = get(section, "username")?.replace("%EMAILADDRESS%", email)
-            .replace("%EMAILLOCALPART%", email.rsplit_once('@')?.0).replace("%EMAILDOMAIN%", &domain(email)?);
-        if username.is_empty() || username.contains('%') { return None; }
-        Some(Server { host, port, security, username })
-    };
-    Some(Discovery::Mail { imap: endpoint("incomingServer:imap")?, smtp: endpoint("outgoingServer:smtp")? })
+    }
+    let provider_id = value(&["clientConfig", "emailProvider", "@id"]);
+    let issuer = value(&["clientConfig", "oAuth2", "issuer"]);
+    let display = value(&["clientConfig", "emailProvider", "displayName"])
+        .or(provider_id).unwrap_or("This mail provider");
+    let mut seen = Vec::<String>::new();
+    for (path, _) in &entries {
+        if path.len() == 4 && path[0] == "clientConfig" && path[1] == "emailProvider"
+            && (path[2].starts_with("incomingServer:imap:") || path[2].starts_with("outgoingServer:smtp:"))
+            && !seen.contains(&path[2]) {
+            seen.push(path[2].clone());
+        }
+    }
+    let mut imap = Vec::new();
+    let mut smtp = Vec::new();
+    for section in seen {
+        // Each block is independent. Never borrow a hostname, port or auth
+        // method from a different alternative endpoint.
+        let endpoint = (|| -> Option<MailEndpoint> {
+            let get = |key: &str| value(&["clientConfig", "emailProvider", &section, key]);
+            let host = get("hostname")?.to_owned();
+            domain(&format!("x@{host}"))?;
+            let port = get("port")?.parse::<u16>().ok().filter(|p| *p != 0)?;
+            let security = match get("socketType")? {
+                "SSL" => Security::ImplicitTls,
+                "STARTTLS" => Security::StartTls,
+                _ => return None,
+            };
+            let username = get("username")?.replace("%EMAILADDRESS%", email)
+                .replace("%EMAILLOCALPART%", email.rsplit_once('@')?.0)
+                .replace("%EMAILDOMAIN%", &domain(email)?);
+            if username.is_empty() || username.contains('%') { return None; }
+            let auth = |method: &str| entries.iter().any(|(p, v)| {
+                p == &["clientConfig", "emailProvider", section.as_str(), "authentication"]
+                    && v.eq_ignore_ascii_case(method)
+            });
+            let password = auth("password-cleartext") || auth("password-encrypted");
+            let oauth = auth("OAuth2");
+            if !password && !oauth { return None; }
+            Some(MailEndpoint { server: Server { host, port, security, username }, password, oauth })
+        })();
+        if let Some(endpoint) = endpoint {
+            if section.starts_with("incomingServer:imap:") { imap.push(endpoint); } else { smtp.push(endpoint); }
+        }
+    }
+    if imap.is_empty() || smtp.is_empty() { return None; }
+    let oauth_available = imap.iter().any(|e| e.oauth) && smtp.iter().any(|e| e.oauth);
+    if oauth_available {
+        if let Some(adapter) = oauth_adapter(issuer, provider_id) { return Some(adapter); }
+    }
+    // An unknown OAuth provider can still use a password/app password if
+    // its published endpoints explicitly advertise that alternative.
+    if let (Some(imap), Some(smtp)) = (imap.iter().find(|e| e.password), smtp.iter().find(|e| e.password)) {
+        return Some(Discovery::Mail { imap: imap.server.clone(), smtp: smtp.server.clone(), oauth_available });
+    }
+    if imap.iter().any(|e| e.oauth) || smtp.iter().any(|e| e.oauth) {
+        return Some(Discovery::OAuthRequired(display.to_owned()));
+    }
+    None
+}
+
+fn parse_mail(xml: &str, email: &str) -> Option<Discovery> {
+    parse_mail_config(xml, email, None)
 }
 
 async fn xml_response(mut response: reqwest::Response) -> Option<String> {
@@ -150,8 +238,6 @@ fn exchange_discovery(email: String, password: String, approved: Vec<String>) ->
 
 pub(crate) async fn discover(email: &str, password: &str, approved: Vec<String>) -> Result<Discovery, String> {
     let d = domain(email).ok_or("Enter a valid email address")?;
-    if matches!(d.as_str(), "outlook.com" | "hotmail.com" | "live.com" | "msn.com" | "outlook.office365.com")
-        || d.ends_with(".onmicrosoft.com") { return Ok(Discovery::Microsoft365); }
     let client = reqwest::Client::builder().timeout(Duration::from_secs(8))
         .redirect(reqwest::redirect::Policy::none()).build().map_err(|_| "Cannot initialize account discovery")?;
     let (a,b) = tokio::join!(
@@ -159,6 +245,13 @@ pub(crate) async fn discover(email: &str, password: &str, approved: Vec<String>)
         mail_probe(&client, format!("https://{d}/.well-known/autoconfig/mail/config-v1.1.xml"), email),
     );
     if let Some(result) = a.or(b) { return Ok(result); }
+    // ISPDB is a maintained provider database. Only the domain is sent to
+    // this third-party service, never the full address or a password.
+    if let Ok(response) = client.get(format!("https://autoconfig.thunderbird.net/v1.1/{d}")).send().await {
+        if let Some(xml) = xml_response(response).await {
+            if let Some(result) = parse_mail_config(&xml, email, Some(&d)) { return Ok(result); }
+        }
+    }
     let address = email.to_owned();
     let password = password.to_owned();
     tokio::task::spawn_blocking(move || exchange_discovery(address, password, approved))
@@ -271,6 +364,33 @@ pub(crate) async fn verify_credentials(account: &crate::app_config::OtherAccount
 mod tests {
     use super::*;
     #[test]
+    fn account_setup_catalog_routes_oauth_by_provider_not_email_host() {
+        let xml = r#"<clientConfig><emailProvider id="googlemail.com"><domain>custom.example</domain>
+        <incomingServer type="imap"><hostname>imap.gmail.com</hostname><port>993</port><socketType>SSL</socketType><username>%EMAILADDRESS%</username><authentication>OAuth2</authentication><authentication>password-cleartext</authentication></incomingServer>
+        <outgoingServer type="smtp"><hostname>smtp.gmail.com</hostname><port>465</port><socketType>SSL</socketType><username>%EMAILADDRESS%</username><authentication>OAuth2</authentication><authentication>password-cleartext</authentication></outgoingServer>
+        </emailProvider><oAuth2><issuer>accounts.google.com</issuer></oAuth2></clientConfig>"#;
+        assert!(matches!(parse_mail_config(xml, "alice@custom.example", Some("custom.example")), Some(Discovery::Google)));
+        assert!(parse_mail_config(xml, "alice@other.example", Some("other.example")).is_none());
+        let other = xml.replace("accounts.google.com", "login.provider.example").replace("googlemail.com", "provider.example");
+        assert!(matches!(parse_mail_config(&other, "alice@custom.example", Some("custom.example")), Some(Discovery::Mail { oauth_available: true, .. })));
+    }
+
+    #[test]
+    fn account_setup_does_not_mix_endpoint_alternatives() {
+        let xml = r#"<clientConfig><emailProvider id="example.test"><domain>example.test</domain>
+        <incomingServer type="imap"><hostname>oauth.example.test</hostname><port>993</port><socketType>SSL</socketType><username>%EMAILADDRESS%</username><authentication>OAuth2</authentication></incomingServer>
+        <incomingServer type="imap"><hostname>password.example.test</hostname><port>143</port><socketType>STARTTLS</socketType><username>%EMAILLOCALPART%</username><authentication>password-cleartext</authentication></incomingServer>
+        <outgoingServer type="smtp"><hostname>smtp.example.test</hostname><port>465</port><socketType>SSL</socketType><username>%EMAILADDRESS%</username><authentication>password-cleartext</authentication></outgoingServer>
+        </emailProvider></clientConfig>"#;
+        let Some(Discovery::Mail { imap, smtp, .. }) = parse_mail_config(xml, "alice@example.test", Some("example.test")) else { panic!("no password endpoints") };
+        assert_eq!(imap.host, "password.example.test");
+        assert_eq!(imap.port, 143);
+        assert_eq!(imap.username, "alice");
+        assert_eq!(imap.security, Security::StartTls);
+        assert_eq!(smtp.port, 465);
+    }
+
+    #[test]
     fn account_setup_validates_addresses_and_ews() {
         assert_eq!(domain("alice@Example.test").as_deref(), Some("example.test"));
         assert!(domain("alice@bad/path").is_none());
@@ -282,11 +402,11 @@ mod tests {
     #[test]
     fn account_setup_parses_secure_autoconfig() {
         let xml = r#"<clientConfig><emailProvider><incomingServer type="imap"><hostname>imap.example.test</hostname><port>993</port><socketType>SSL</socketType><username>%EMAILADDRESS%</username><authentication>password-cleartext</authentication></incomingServer><outgoingServer type="smtp"><hostname>smtp.example.test</hostname><port>587</port><socketType>STARTTLS</socketType><username>%EMAILLOCALPART%</username><authentication>password-cleartext</authentication></outgoingServer></emailProvider></clientConfig>"#;
-        let Some(Discovery::Mail { imap, smtp }) = parse_mail(xml, "alice@example.test") else { panic!("no configuration") };
+        let Some(Discovery::Mail { imap, smtp, .. }) = parse_mail(xml, "alice@example.test") else { panic!("no configuration") };
         assert_eq!(imap.username, "alice@example.test");
         assert_eq!(smtp.username, "alice");
         assert_eq!(smtp.port, 587);
-        assert!(parse_mail(&xml.replace("password-cleartext", "OAuth2"), "alice@example.test").is_none());
+        assert!(matches!(parse_mail(&xml.replace("password-cleartext", "OAuth2"), "alice@example.test"), Some(Discovery::OAuthRequired(_))));
         assert!(parse_mail(&xml.replace("STARTTLS", "plain"), "alice@example.test").is_none());
     }
 }

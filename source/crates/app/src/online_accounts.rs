@@ -62,7 +62,11 @@ pub async fn open_online_accounts() {
         return;
     };
     let argv = [program.as_os_str(), std::ffi::OsStr::new(ONLINE_ACCOUNTS_PANEL)];
-    match gtk::gio::Subprocess::newv(&argv, gtk::gio::SubprocessFlags::NONE) {
+    // GNOME Settings rejects non-GNOME desktops by default. Set the
+    // desktop identifier for this child only, not the KDE session.
+    let launcher = gtk::gio::SubprocessLauncher::new(gtk::gio::SubprocessFlags::NONE);
+    launcher.setenv("XDG_CURRENT_DESKTOP", "GNOME", true);
+    match launcher.spawn(&argv) {
         Ok(process) => process.wait_async(None::<&gtk::gio::Cancellable>, |_| {}),
         Err(e) => tracing::debug!("couldn't run gnome-control-center: {e}"),
     }
