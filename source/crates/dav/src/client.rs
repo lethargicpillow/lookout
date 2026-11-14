@@ -401,9 +401,13 @@ impl DavClient {
     /// Google rejects an empty RFC 6578 sync-token. Compare its verified
     /// PROPFIND membership and ETags instead, fetching only changed cards.
     pub fn uses_google_contacts(&self) -> bool {
-        self.base_url.host_str() == Some("www.googleapis.com")
-            && (self.base_url.path().starts_with("/carddav/")
-                || self.base_url.path().trim_end_matches('/') == "/.well-known/carddav")
+        Self::is_google_contacts_url(&self.base_url)
+    }
+
+    fn is_google_contacts_url(url: &reqwest::Url) -> bool {
+        url.host_str() == Some("www.googleapis.com")
+            && (url.path().starts_with("/carddav/")
+                || url.path().trim_end_matches('/') == "/.well-known/carddav")
     }
 
     /// Return complete membership separately from changed card data.
@@ -557,6 +561,12 @@ impl DavClient {
         // which some front-ends reject; scrub it so every request goes out clean.
         let _ = base_url.set_username("");
         let mut builder = reqwest::Client::builder().danger_accept_invalid_certs(accept_ssl_errors);
+        if Self::is_google_contacts_url(&base_url) {
+            // Bound each HTTP request including its response body, separately
+            // from the caller's whole synchronization deadline.
+            builder = builder.connect_timeout(std::time::Duration::from_secs(8))
+                .timeout(std::time::Duration::from_secs(15));
+        }
         if Self::is_local_davmail(&base_url) {
             builder = builder.no_proxy().redirect(reqwest::redirect::Policy::none());
         }
@@ -1036,8 +1046,18 @@ impl DavClient {
             Credential::OAuth2AccessToken(token) => req.bearer_auth(token),
         };
 
-        let response = req.send().await?;
+        let google = self.uses_google_contacts();
+        let started = std::time::Instant::now();
+        if google { tracing::info!(method = method_name, "Google CardDAV HTTP request started"); }
+        let response = match req.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                if google { tracing::warn!(method = method_name, timeout = error.is_timeout(), elapsed_ms = started.elapsed().as_millis(), "Google CardDAV HTTP request failed"); }
+                return Err(error.into());
+            }
+        };
         let status = response.status();
+        if google { tracing::info!(method = method_name, status = status.as_u16(), elapsed_ms = started.elapsed().as_millis(), "Google CardDAV HTTP headers received"); }
         if !status.is_success() {
             if accept_not_found && status == reqwest::StatusCode::NOT_FOUND {
                 return Ok(response);
@@ -1078,7 +1098,11 @@ impl DavClient {
             .await?;
         let status = response.status();
         let text = response.text().await?;
-        tracing::debug!("DAV {method_name} {request_url} -> {status}, body:\n{text}");
+        if self.uses_google_contacts() {
+            tracing::info!(method = method_name, bytes = text.len(), "Google CardDAV XML body received");
+        } else {
+            tracing::debug!("DAV {method_name} {request_url} -> {status}, body:\n{text}");
+        }
         xml::parse_multistatus(&text)
     }
 

@@ -641,7 +641,7 @@ pub(crate) fn refresh_contact_accounts(state: &Rc<RefCell<UiState>>, toast_overl
     let mut failures = Vec::new();
     for id in &account_ids {
         if let Some(rx) = dispatch_contact_command(state, id, |reply| ContactCommand::RefreshWithReply { reply }) {
-            replies.push(rx);
+            replies.push((id.clone(), rx));
         } else {
             failures.push("A contacts session isn't running.".to_string());
         }
@@ -654,13 +654,19 @@ pub(crate) fn refresh_contact_accounts(state: &Rc<RefCell<UiState>>, toast_overl
     let toast_overlay = toast_overlay.clone();
     let button = button.clone();
     glib::spawn_future_local(async move {
+        use futures_util::{stream::FuturesUnordered, StreamExt};
+        let total = replies.len() + failures.len();
         let mut ok = 0usize;
-        for rx in replies {
-            match rx.recv().await {
+        let mut waiting: FuturesUnordered<_> = replies.into_iter().map(|(id, rx)| async move { (id, rx.recv().await) }).collect();
+        while let Some((id, result)) = waiting.next().await {
+            let success = matches!(&result, Ok(Ok(())));
+            match result {
                 Ok(Ok(())) => ok += 1,
                 Ok(Err(message)) => failures.push(message),
                 Err(_) => failures.push("A contacts session ended before refresh completed.".to_string()),
             }
+            tracing::info!(account = %id, success, "contacts manual refresh account completed");
+            pending.set_title(&format!("Refreshing contacts… {}/{total} accounts finished", ok + failures.len()));
         }
         pending.dismiss();
         button.set_sensitive(true);
@@ -3018,10 +3024,25 @@ pub fn sync_contacts_account(
 /// executed between polls authenticates exactly like a poll would.
 async fn carddav_connection(goa_client: &Option<GoaClient>, account: &GoaContactsAccount) -> Result<(DavClient, Credential), String> {
     let credential = if let Some(goa_client) = goa_client {
-        goa_client.ensure_credentials_contacts(account).await.map_err(|e| e.to_string())?;
+        let google = account.provider_type.as_deref() == Some("google");
+        // Google GOA GetAccessToken already refreshes an expired OAuth token.
+        // EnsureCredentials can perform an additional provider network check
+        // for each contact operation; do not serialize that redundant check
+        // ahead of every Google CardDAV request.
+        if !google || !matches!(&account.auth, ContactsAuthMethod::OAuth2) {
+            goa_client.ensure_credentials_contacts(account).await.map_err(|e| e.to_string())?;
+        }
         match &account.auth {
             ContactsAuthMethod::OAuth2 => {
-                let (token, _expires_in) = goa_client.get_access_token_contacts(account).await.map_err(|e| e.to_string())?;
+                if google { tracing::info!(account = %account.account_id, "Google contacts OAuth token requested"); }
+                let token_result = if google {
+                    tokio::time::timeout(std::time::Duration::from_secs(12), goa_client.get_access_token_contacts(account)).await
+                        .map_err(|_| "Google contacts OAuth token request timed out".to_string())?
+                } else {
+                    goa_client.get_access_token_contacts(account).await
+                };
+                let (token, _expires_in) = token_result.map_err(|e| e.to_string())?;
+                if google { tracing::info!(account = %account.account_id, "Google contacts OAuth token received"); }
                 Credential::OAuth2AccessToken(token)
             }
             ContactsAuthMethod::Password { .. } => {
@@ -3164,9 +3185,10 @@ async fn sync_addressbook_into(
         let cached: HashMap<String, Option<String>> = cache.load_contacts().map_err(|e| e.to_string())?
             .into_iter().filter(|contact| contact.book_href == book.href)
             .map(|contact| (contact.href, contact.etag)).collect();
+        tracing::info!(account = %book.account_id, cached = cached.len(), "Google CardDAV ETag sync started");
         let (hrefs, records) = client.fetch_addressbook_etag_snapshot(book, credential, &cached).await.map_err(|e| e.to_string())?;
         cache.apply_membership_snapshot(&book.href, &hrefs, &records).map_err(|e| e.to_string())?;
-        tracing::debug!(mailbox = %book.href, live = hrefs.len(), changed = records.len(), "Google CardDAV ETag sync complete");
+        tracing::info!(account = %book.account_id, live = hrefs.len(), changed = records.len(), "Google CardDAV ETag sync complete");
         return Ok(records);
     }
     let stored_token = cache.sync_token(&book.href).map_err(|e| e.to_string())?;
@@ -3205,8 +3227,12 @@ async fn sync_addressbook_into(
 
 async fn fetch_carddav_contacts(goa_client: Option<GoaClient>, account: GoaContactsAccount, cache: Option<&ContactsCache>) -> Result<ContactsAccountSnapshot, String> {
     let (client, credential) = carddav_connection(&goa_client, &account).await?;
-    let home = client.discover_addressbook_home(&credential).await.map_err(|e| e.to_string())?;
-    let books = client.list_addressbooks(&home, &account.account_id, &credential).await.map_err(|e| e.to_string())?;
+    let google = client.uses_google_contacts();
+    if google { tracing::info!(account = %account.account_id, "Google CardDAV discovering addressbook home"); }
+    let home = client.discover_addressbook_home(&credential).await.map_err(|e| format!("Address book discovery: {e}"))?;
+    if google { tracing::info!(account = %account.account_id, "Google CardDAV listing addressbooks"); }
+    let books = client.list_addressbooks(&home, &account.account_id, &credential).await.map_err(|e| format!("Address book listing: {e}"))?;
+    if google { tracing::info!(account = %account.account_id, books = books.len(), "Google CardDAV addressbooks listed"); }
     tracing::debug!("CardDAV discovery for {}: home={home:?}, {} addressbook(s) found", account.display_name, books.len());
 
     if let Some(cache) = cache {
