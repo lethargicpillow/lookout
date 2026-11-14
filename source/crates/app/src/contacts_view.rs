@@ -667,11 +667,11 @@ fn route_contact_delete(state: &Rc<RefCell<UiState>>, account_id: AccountId, hre
 /// card. Deleted-bucket cards (`href` empty, display-only) are skipped.
 pub fn delete_contact_entries(state: &Rc<RefCell<UiState>>, toast_overlay: &adw::ToastOverlay, entries: &[ContactsListEntry]) {
     let writable: Vec<ContactsListEntry> = entries.iter().filter(|entry| !entry.href().is_empty()).cloned().collect();
+    tracing::info!(selected = entries.len(), writable = writable.len(), "contact delete requested");
     if writable.is_empty() {
         toast_overlay.add_toast(adw::Toast::new("No deletable contacts selected."));
         return;
     }
-    tracing::debug!(selected = entries.len(), writable = writable.len(), "contact delete requested");
     let mut replies = Vec::new();
     let mut dispatch_failures = 0usize;
     for entry in &writable {
@@ -687,6 +687,22 @@ pub fn delete_contact_entries(state: &Rc<RefCell<UiState>>, toast_overlay: &adw:
         replies.push(reply_rx);
     }
     let toast_overlay = toast_overlay.clone();
+    // A write can queue behind a live contact sync. Acknowledge it at the
+    // click, rather than leaving the user to guess whether Delete worked.
+    let pending = adw::Toast::new(&format!("Deleting {} contact(s)…", writable.len()));
+    pending.set_timeout(0);
+    toast_overlay.add_toast(pending.clone());
+    let completed = Rc::new(Cell::new(false));
+    {
+        let completed = completed.clone();
+        let pending = pending.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_secs(15), move || {
+            if !completed.get() {
+                pending.set_title("Waiting for the contacts server…");
+                tracing::warn!("contact delete still awaiting confirmation");
+            }
+        });
+    }
     glib::spawn_future_local(async move {
         let mut ok = 0usize;
         let mut failures = vec!["The contacts session isn't running.".to_string(); dispatch_failures];
@@ -700,7 +716,9 @@ pub fn delete_contact_entries(state: &Rc<RefCell<UiState>>, toast_overlay: &adw:
                 }
             }
         }
-        tracing::debug!(confirmed = ok, failed = failures.len(), "contact delete requests completed");
+        completed.set(true);
+        pending.dismiss();
+        tracing::info!(confirmed = ok, failed = failures.len(), "contact delete requests completed");
         if failures.is_empty() {
             let text = if ok == 1 { "Contact deleted".to_string() } else { format!("{ok} contacts deleted") };
             toast_overlay.add_toast(adw::Toast::new(&text));
@@ -2785,12 +2803,23 @@ pub fn sync_contacts_account(
                         }
                     }
                     ContactCommand::Delete { href, etag, reply } => {
-                        tracing::debug!(account = %account.account_id, has_etag = etag.is_some(), "contact delete received by session");
-                        let result = match &graph {
-                            Some(client) => graph_delete_contact(client, &href, etag.as_deref()).await,
-                            None => delete_contact(goa_client.clone(), account.clone(), href.clone(), etag).await,
+                        tracing::info!(account = %account.account_id, has_etag = etag.is_some(), "contact delete received by session");
+                        let result = match tokio::time::timeout(std::time::Duration::from_secs(45), async {
+                            match &graph {
+                                Some(client) => graph_delete_contact(client, &href, etag.as_deref()).await,
+                                None => delete_contact(goa_client.clone(), account.clone(), href.clone(), etag).await,
+                            }
+                        }).await {
+                            Ok(result) => result,
+                            Err(_) => {
+                                // The remote outcome may be unknown after a
+                                // timeout. Reconcile, never remove a local card
+                                // or automatically replay an uncertain write.
+                                resync = true;
+                                Err("Deletion was not confirmed before the server timeout. Refresh contacts before trying again.".to_string())
+                            }
                         };
-                        tracing::debug!(account = %account.account_id, confirmed = result.is_ok(), "contact delete server result");
+                        tracing::info!(account = %account.account_id, confirmed = result.is_ok(), "contact delete server result");
                         if result.is_ok() {
                             // The server confirmed deletion (or verified absence).
                             // Don't leave the live UI dependent on a later full

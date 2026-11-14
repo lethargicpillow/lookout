@@ -8616,6 +8616,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let contacts_entries = contacts_entries.clone();
         let contacts_selected = contacts_selected.clone();
         contacts_delete_button.connect_clicked(move |_| {
+            tracing::info!("contacts ribbon Delete clicked");
             let entries: Vec<ContactsListEntry> = contacts_entries
                 .borrow()
                 .iter()
