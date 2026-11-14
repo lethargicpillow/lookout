@@ -5,6 +5,9 @@ use std::{collections::HashMap, fs, io::Write, net::{SocketAddr, TcpStream}, os:
 use lookout_mail::Security;
 use quick_xml::{events::Event, Reader};
 
+#[path = "exchange_native.rs"]
+mod exchange_native;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Server {
     pub host: String,
@@ -146,6 +149,13 @@ async fn mail_probe(client: &reqwest::Client, url: String, email: &str) -> Optio
 const AUTODISCOVER: &str = include_str!("exchange_discover.py");
 
 fn exchange_discovery(email: String, password: String, approved: Vec<String>) -> Result<Discovery, String> {
+    match exchange_native::discover(&email, &password, &approved) {
+        Ok(result) => return Ok(result),
+        Err(exchange_native::Error::LegacyNegotiate) => {},
+        Err(error) => return Err(error.message().into()),
+    }
+    // Only a server offering Negotiate without native NTLM uses the old
+    // compatibility transport. Never retry a rejected password this way.
     let input = serde_json::to_vec(&serde_json::json!({
         "email": email, "password": password, "approved": approved,
     })).map_err(|_| "Cannot prepare Autodiscover request")?;

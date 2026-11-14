@@ -33,6 +33,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 reqwest = { workspace = true, features = ["form", "json"] }
 quick-xml = "0.41"
+# Bundled libcurl explicitly enables NTLM, independently of the distro curl.
+curl = { version = "=0.4.51", features = ["static-curl", "ntlm"] }
 base64.workspace = true
 sha2.workspace = true
 getrandom.workspace = true
