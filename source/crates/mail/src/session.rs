@@ -5406,7 +5406,7 @@ async fn connect_and_run(
         if !counts_pending.is_empty() {
             let mut since_emit = 0usize;
             let mut dirty = false;
-            while (deferred_interactive.is_empty() && no_work_pending(commands, interactive_commands, idle_notify)) {
+            while deferred_interactive.is_empty() && no_work_pending(commands, interactive_commands, idle_notify) {
                 let Some(mailbox_id) = counts_pending.pop_front() else { break };
                 // The folder may have vanished from a re-list between being
                 // queued and being drained; skip it rather than miscounting.
