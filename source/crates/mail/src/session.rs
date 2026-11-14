@@ -7318,6 +7318,24 @@ async fn list_mailboxes(session: &mut Session<SessionStream>, account_id: &Accou
     Ok((mailboxes, false))
 }
 
+// A tagged NO completes the command without necessarily returning all
+// requested rows. Preserve any successful FETCH rows and let the envelope
+// recovery path handle missing UIDs. BAD, I/O and parse failures remain
+// errors; they must not be converted into an authoritative snapshot.
+async fn collect_metadata_fetches(
+    mut stream: impl futures::Stream<Item = async_imap::error::Result<Fetch>> + Unpin,
+) -> Result<(Vec<Fetch>, Option<String>)> {
+    let mut rows = Vec::new();
+    loop {
+        match stream.try_next().await {
+            Ok(Some(row)) => rows.push(row),
+            Ok(None) => return Ok((rows, None)),
+            Err(async_imap::error::Error::No(reason)) => return Ok((rows, Some(reason))),
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 // A timeout invalidates the current command stream. Callers propagate the
 // error out of the session so the reconnect loop creates a fresh connection.
 async fn imap_sync_step<T>(
@@ -8086,9 +8104,12 @@ async fn sync_mailbox(
             tracing::info!(account = %account_id, mailbox = %folder_path, count = new_uids.len(), reused_checkpoint = new_messages.len(), remaining = remaining.len(), batches = sets.len(), "fetching new message envelopes");
             for (index, uid_set) in sets.iter().enumerate() {
                 tracing::debug!(account = %account_id, mailbox = %folder_path, batch = index + 1, batches = sets.len(), "requesting envelope batch");
-                let fetches: Vec<Fetch> = imap_sync_step(account_id, "UID FETCH ENVELOPE", async {
-                    Ok(session.uid_fetch(uid_set, envelope_fetch_items(false)).await?.try_collect().await?)
+                let (fetches, refusal) = imap_sync_step(account_id, "UID FETCH ENVELOPE", async {
+                    collect_metadata_fetches(session.uid_fetch(uid_set, envelope_fetch_items(false)).await?).await
                 }).await?;
+                if let Some(reason) = refusal {
+                    tracing::warn!(account = %account_id, mailbox = %folder_path, responses = fetches.len(), %reason, "server refused envelope fetch; retaining returned rows");
+                }
                 let batch: Vec<EmailSummary> = fetches.iter().filter_map(|f| summary_from_fetch(mailbox_id, f))
                     .filter(|m| wanted.contains(&m.uid) && received.insert(m.uid)).collect();
                 persist_envelope_checkpoint(cache, mailbox_id, uidvalidity, &batch).await;
@@ -8126,9 +8147,12 @@ async fn sync_mailbox(
                 let live = imap_sync_step(account_id, "UID SEARCH missing envelopes", uids_still_present(session, &missing)).await?;
                 for group in live.chunks(20) {
                     for set in uid_set_chunks(group) {
-                        let fetches: Vec<Fetch> = imap_sync_step(account_id, "UID FETCH HEADER fallback", async {
-                            Ok(session.uid_fetch(&set, "(UID FLAGS RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER])").await?.try_collect().await?)
+                        let (fetches, refusal) = imap_sync_step(account_id, "UID FETCH HEADER fallback", async {
+                            collect_metadata_fetches(session.uid_fetch(&set, "(UID FLAGS RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER])").await?).await
                         }).await?;
+                        if let Some(reason) = refusal {
+                            tracing::warn!(account = %account_id, mailbox = %folder_path, responses = fetches.len(), %reason, "server refused header fallback");
+                        }
                         let batch: Vec<EmailSummary> = fetches.iter().filter_map(|f| summary_from_header_fetch(mailbox_id, f))
                             .filter(|m| wanted.contains(&m.uid) && received.insert(m.uid)).collect();
                         tracing::debug!(account = %account_id, mailbox = %folder_path,
@@ -9379,6 +9403,17 @@ mod tests {
         smtp.host = "localhost".into();
         imap.port = 143;
         assert!(!davmail_saves_sent(&imap, &smtp));
+    }
+
+    #[tokio::test]
+    async fn metadata_fetch_distinguishes_no_from_bad() {
+        use async_imap::error::Error as ImapError;
+        let no = futures::stream::iter([Err(ImapError::No("unavailable".into()))]);
+        let (rows, refusal) = collect_metadata_fetches(no).await.unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(refusal.as_deref(), Some("unavailable"));
+        let bad = futures::stream::iter([Err(ImapError::Bad("invalid".into()))]);
+        assert!(matches!(collect_metadata_fetches(bad).await, Err(Error::Imap(ImapError::Bad(_)))));
     }
 
     #[tokio::test]

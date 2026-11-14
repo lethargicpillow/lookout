@@ -61,25 +61,34 @@ pub(crate) fn parse_fetches<T: Stream<Item = io::Result<ResponseData>> + Unpin +
     unsolicited: channel::Sender<UnsolicitedResponse>,
     command_tag: RequestId,
 ) -> impl Stream<Item = Result<Fetch>> + '_ + Send + Unpin {
-    use futures::{FutureExt, StreamExt};
+    use futures::StreamExt;
 
-    StreamExt::filter_map(StreamExt::take_while(stream, move |res| filter(res, &command_tag)), move |resp| {
-        let unsolicited = unsolicited.clone();
-
-        async move {
-            match resp {
+    // The tagged completion belongs to this FETCH, even when the server
+    // sent some untagged FETCH rows first. The old take_while discarded
+    // NO/BAD along with OK, making rejected commands look successful.
+    futures::stream::unfold((stream, unsolicited, command_tag, false), |(stream, unsolicited, tag, done)| async move {
+        if done { return None; }
+        loop {
+            let response = stream.next().await?;
+            match response {
+                Err(error) => return Some((Err(error.into()), (stream, unsolicited, tag, true))),
                 Ok(resp) => match resp.parsed() {
-                    Response::Fetch(..) => Some(Ok(Fetch::new(resp))),
-                    _ => {
-                        handle_unilateral(resp, unsolicited);
-                        None
+                    Response::Done { tag: response_tag, status, code, information } if response_tag == &tag => {
+                        use imap_proto::Status;
+                        let error = match status {
+                            Status::Ok => return None,
+                            Status::No => Error::No(format!("code: {code:?}, info: {information:?}")),
+                            Status::Bad => Error::Bad(format!("code: {code:?}, info: {information:?}")),
+                            _ => Error::Io(io::Error::other(format!("status: {status:?}, code: {code:?}, information: {information:?}"))),
+                        };
+                        return Some((Err(error), (stream, unsolicited, tag, true)));
                     }
+                    Response::Fetch(..) => return Some((Ok(Fetch::new(resp)), (stream, unsolicited, tag, false))),
+                    _ => handle_unilateral(resp, unsolicited.clone()),
                 },
-                Err(err) => Some(Err(err.into())),
             }
         }
-        .boxed()
-    })
+    }).boxed()
 }
 
 pub(crate) async fn parse_status<T: Stream<Item = io::Result<ResponseData>> + Unpin + Send>(
@@ -475,6 +484,38 @@ mod tests {
         assert_eq!(fetches[1].uid, None);
         assert_eq!(fetches[1].body(), None);
         assert_eq!(fetches[1].header(), None);
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    async fn parse_fetches_reports_tagged_no_and_preserves_following_command() {
+        let (send, _recv) = bounded(10);
+        let responses = input_stream(&[
+            "* 1 FETCH (UID 42)\r\n",
+            "a NO message unavailable\r\n",
+            "* 2 FETCH (UID 43)\r\n",
+            "b OK completed\r\n",
+        ]);
+        let mut stream = async_std::stream::from_iter(responses);
+        {
+            let mut fetches = parse_fetches(&mut stream, send.clone(), RequestId("a".into()));
+            assert_eq!(fetches.try_next().await.unwrap().unwrap().uid, Some(42));
+            assert!(matches!(fetches.try_next().await, Err(Error::No(message)) if message.contains("message unavailable")));
+            assert!(fetches.try_next().await.unwrap().is_none());
+        }
+        let next = parse_fetches(&mut stream, send, RequestId("b".into())).try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].uid, Some(43));
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    async fn parse_fetches_reports_tagged_bad_without_rows() {
+        let (send, _recv) = bounded(10);
+        let responses = input_stream(&["a BAD invalid FETCH\r\n"]);
+        let mut stream = async_std::stream::from_iter(responses);
+        let result = parse_fetches(&mut stream, send, RequestId("a".into())).try_collect::<Vec<_>>().await;
+        assert!(matches!(result, Err(Error::Bad(message)) if message.contains("invalid FETCH")));
     }
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
