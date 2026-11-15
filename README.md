@@ -122,6 +122,8 @@ CI (`.github/workflows/ci.yml`) runs fmt, clippy, unit tests, the fake-GOA D-Bus
 
 ## Roadmap
 
+For this fork, see [FORK_ROADMAP.md](FORK_ROADMAP.md) for the comparison with upstream and [PACKAGING.md](PACKAGING.md) for local DEB validation and upgrade instructions. The upstream scorecard below and the original parity plan are retained as historical references.
+
 Lookout tracks its remaining distance to Outlook in [OUTLOOK_PARITY.md](OUTLOOK_PARITY.md): a feature-by-feature gap analysis (mail, compose, calendar, people, tasks, accounts, security, desktop), an Outlook interop reference (headers, iCalendar properties, Graph endpoints, file formats, keyboard maps), and a phased roadmap through the remaining Outlook parity work. That document is kept current as features land.
 
 ## License

@@ -2,7 +2,7 @@
 Type=Application
 Name=Lookout
 GenericName=Mail Client
-Comment=Read and send mail through accounts configured in GNOME Online Accounts
+Comment=Mail, calendar, contacts and tasks with IMAP, SMTP, Exchange and online accounts
 Exec=lookout
 Icon=io.github.gavindi.Lookout
 Terminal=false

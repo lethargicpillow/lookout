@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
-# Builds everything in the Lookout repo:
-#   1. The Rust Cargo workspace (crates live under source/).
-#   2. The webmail frontend (Next.js app under webmail/).
+# Build the Lookout Rust workspace; optionally package the desktop app.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$SCRIPT_DIR/source"
-WEBMAIL_DIR="$SCRIPT_DIR/webmail"
 
 RELEASE=true
 DEB=false
@@ -61,6 +58,10 @@ if [ "$DEB" = true ]; then
     esac
     export PATH
 
+    if ! command -v dpkg-deb >/dev/null 2>&1; then
+        echo "error: dpkg-deb is required for Debian packaging" >&2
+        exit 1
+    fi
     if ! command -v cargo-deb >/dev/null 2>&1; then
         echo "error: cargo-deb not found. Install it with: cargo install cargo-deb --locked" >&2
         exit 1
@@ -70,10 +71,10 @@ fi
 cd "$WORKSPACE_DIR"
 
 if [ "$RELEASE" = true ]; then
-    cargo build --workspace --release
+    cargo build --locked --workspace --release
     BINARY_PATH="$WORKSPACE_DIR/target/release/lookout"
 else
-    cargo build --workspace
+    cargo build --locked --workspace
     BINARY_PATH="$WORKSPACE_DIR/target/debug/lookout"
 fi
 
@@ -90,7 +91,23 @@ if [ "$DEB" = true ]; then
     # git commit instead: still reproducible for a given commit, but an
     # accurate date rather than an arbitrary checkout-time one.
     export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$WORKSPACE_DIR" log -1 --format=%ct)}"
-    cargo deb --no-build -p lookout-app
-    DEB_PATH="$(ls -t "$WORKSPACE_DIR"/target/debian/*.deb | head -n1)"
+    # Keep the upstream Cargo version, but distinguish this fork's Debian
+    # builds from upstream's -1 package. Commit time and hash identify the
+    # source revision without depending on a full (non-shallow) history.
+    COMMIT_TIME="$(git -C "$WORKSPACE_DIR" log -1 --format=%ct)"
+    COMMIT_SHA="$(git -C "$WORKSPACE_DIR" rev-parse --short=12 HEAD)"
+    REVISION="${LOOKOUT_DEB_REVISION:-1+lookout.${COMMIT_TIME}.g${COMMIT_SHA}}"
+
+    # Never select an unrelated older .deb by its modification time.
+    # Stage the exact output, then derive its final name from its own metadata.
+    DEB_DIR="$WORKSPACE_DIR/target/debian"
+    mkdir -p "$DEB_DIR"
+    STAGING="$(mktemp -d "$DEB_DIR/.lookout-build.XXXXXX")"
+    trap 'rm -rf -- "$STAGING"' EXIT
+    cargo deb --no-build -p lookout-app --deb-revision "$REVISION" --output "$STAGING/lookout.deb"
+    VERSION="$(dpkg-deb -f "$STAGING/lookout.deb" Version)"
+    ARCH="$(dpkg-deb -f "$STAGING/lookout.deb" Architecture)"
+    DEB_PATH="$DEB_DIR/lookout_${VERSION}_${ARCH}.deb"
+    mv -- "$STAGING/lookout.deb" "$DEB_PATH"
     echo "Built package: $DEB_PATH"
 fi
