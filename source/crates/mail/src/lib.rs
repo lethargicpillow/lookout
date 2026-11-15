@@ -16,6 +16,8 @@ pub mod body;
 mod cache;
 mod config;
 mod connection;
+#[cfg(test)]
+mod smtp_probe;
 mod envelope;
 mod error;
 pub mod mailbox_name;
