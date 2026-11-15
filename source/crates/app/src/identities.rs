@@ -27,6 +27,12 @@ fn parse_addresses(field: &str) -> Vec<EmailAddress> {
         .collect()
 }
 
+/// The visible default is the address, but the MIME identity has no name.
+fn normalize_sender_name(value: &str, email: &str) -> String {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case(email) { String::new() } else { value.to_owned() }
+}
+
 /// Presents the modal manage-identities window, anchored to `anchor`'s
 /// window when one exists (tests have no window). `on_changed` fires after
 /// every persisted change so live views of the identity list can refresh.
@@ -45,7 +51,8 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, app_config: Rc<RefCell<AppConfig
     };
     let names = adw::PreferencesGroup::builder().title("Primary account").build();
     let account_entry = adw::EntryRow::builder().title("Account name").text(&account_name).build();
-    let sender_entry = adw::EntryRow::builder().title("Sender display name").text(&sender_name).build();
+    let sender_text = if sender_name.trim().is_empty() { email } else { &sender_name };
+    let sender_entry = adw::EntryRow::builder().title("Sender display name").text(sender_text).build();
     crate::privacy::mark_content(&account_entry);
     crate::privacy::mark_content(&sender_entry);
     names.add(&account_entry);
@@ -54,7 +61,7 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, app_config: Rc<RefCell<AppConfig
         .subtitle(gtk::glib::markup_escape_text(email)).build();
     crate::privacy::mark_row(&email_row);
     names.add(&email_row);
-    let note = gtk::Label::builder().label("Account name is used only in Lookout. Sender display name appears in outgoing messages. Leave it empty to send without a client-supplied display name. Your mail server may supply its own name (for example, Exchange).")
+    let note = gtk::Label::builder().label("Account name is used only in Lookout. Sender display name defaults to your email address. Enter a different name to use it in outgoing messages. Clear the field to restore the default. Your mail server may supply its own name (for example, Exchange).")
         .wrap(true).xalign(0.0).css_classes(["dim-label"]).build();
     let save_names = gtk::Button::with_label("Save names");
     save_names.add_css_class("suggested-action");
@@ -64,26 +71,30 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, app_config: Rc<RefCell<AppConfig
         let account_entry = account_entry.clone();
         let sender_entry = sender_entry.clone();
         let save_names = save_names.clone();
-        let saved = Rc::new(RefCell::new((account_name, sender_name)));
+        let email = email.to_owned();
+        let saved = Rc::new(RefCell::new((account_name, normalize_sender_name(&sender_name, &email))));
         let app_config = app_config.clone();
         let account_id = account_id.clone();
         let on_changed = on_changed.clone();
         let save_saved = saved.clone();
         let account_for_save = account_entry.clone();
         let sender_for_save = sender_entry.clone();
+        let email_for_save = email.clone();
         save_names.connect_clicked(move |button| {
             let account = account_for_save.text().trim().to_string();
-            let sender = sender_for_save.text().trim().to_string();
+            let sender = normalize_sender_name(&sender_for_save.text(), &email_for_save);
             if account.is_empty() || sender.contains(['\r', '\n']) { return; }
             app_config.borrow_mut().set_mail_account_names(&account_id, account.clone(), sender.clone());
             crate::app_config::save(&app_config.borrow());
+            let display_default = sender.is_empty();
             *save_saved.borrow_mut() = (account, sender);
+            if display_default { sender_for_save.set_text(&email_for_save); }
             button.set_sensitive(false);
             on_changed();
         });
         Rc::new(move || {
             let account = account_entry.text().trim().to_string();
-            let sender = sender_entry.text().trim().to_string();
+            let sender = normalize_sender_name(&sender_entry.text(), &email);
             save_names.set_sensitive(!account.is_empty() && !sender.contains(['\r', '\n']) && (account, sender) != *saved.borrow());
         })
     };
@@ -310,5 +321,18 @@ mod tests {
     fn parse_addresses_of_empty_or_garbage_field_is_empty() {
         assert!(parse_addresses("").is_empty());
         assert!(parse_addresses("hello world, ,").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod sender_name_tests {
+    use super::normalize_sender_name;
+
+    #[test]
+    fn address_is_the_implicit_sender_name() {
+        let email = "user@example.com";
+        assert_eq!(normalize_sender_name("", email), "");
+        assert_eq!(normalize_sender_name(" USER@example.com ", email), "");
+        assert_eq!(normalize_sender_name(" Ada Lovelace ", email), "Ada Lovelace");
     }
 }
