@@ -624,10 +624,12 @@ fn mail_quote_style_preserves_message_markup_and_security_policy() {
     let wrapped = wrap_mail_message_with_csp(html, false, false);
     assert!(wrapped.starts_with("<!doctype html><meta"));
     assert!(wrapped.contains("script-src 'none'"));
-    assert!(wrapped.contains("border-top: 1px solid #808080"));
+    assert!(wrapped.contains("border-top: 2px solid #808080 !important"));
     assert!(wrapped.contains("#divRplyFwdMsg"));
     assert!(wrapped.ends_with(&html["<!doctype html>".len()..]));
-    assert!(!wrap_message_with_csp(html, false, false).contains("border-top: 1px solid #808080"));
+    let plain = wrap_message_with_csp(html, false, false);
+    assert!(!plain.contains("border-top: 2px solid #808080"));
+    assert!(!plain.contains("lookout-reply-boundary"));
 }
 
 #[test]
@@ -2907,6 +2909,10 @@ fn body_cache_invalidates_a_recreated_mailbox_and_a_removed_account() {
     assert!(cache.contains(&other, &Uid(3)));
 
     cache.retain(|mailbox| !mailbox.0.starts_with("acct:"));
+    assert!(!cache.contains(&archive, &Uid(2)));
+    assert!(cache.contains(&other, &Uid(3)), "other accounts must keep their cached bodies");
+    assert_eq!(cache.entries.len(), 1);
+    cache.retain(|mailbox| !mailbox.0.starts_with("other:"));
     assert!(cache.entries.is_empty());
 }
 

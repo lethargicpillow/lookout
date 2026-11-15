@@ -1128,7 +1128,7 @@ mod tests {
         assert!(!calendar.contains("Far away"), "{calendar}");
 
         let second = sync_mirror_blocking(&config, &path).expect("second sync is a no-op");
-        assert!(!second.written);
+        assert!(!second.written, "unchanged mirror must not be rewritten: {:?}", second.plan);
         assert!(second.plan.is_empty());
 
         cache.store_month(month, &[far]).unwrap();

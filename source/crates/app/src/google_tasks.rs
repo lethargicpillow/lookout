@@ -976,10 +976,13 @@ mod tests {
             etag: None,
         }];
         store_cache(&email, &lists, &tasks);
+        let stored = load_cache(&email).expect("test cache must be readable before starting the session");
+        assert_eq!(stored.lists[0].id, "l1");
+        assert_eq!(stored.tasks[0].uid.0, "cached-task");
 
         let (cmd_tx, cmd_rx) = async_channel::unbounded();
         let (evt_tx, evt_rx) = async_channel::unbounded();
-        let (offline_tx, offline_rx) = tokio::sync::watch::channel(true);
+        let (_offline_tx, offline_rx) = tokio::sync::watch::channel(true);
         let handle = tokio::spawn(run_google_tasks_session(email.clone(), cmd_rx, evt_tx, offline_rx));
 
         let mut saw_lists = false;
@@ -1004,16 +1007,20 @@ mod tests {
             })
             .await
             .unwrap();
-        let refused = loop {
-            if let Ok(Ok(GoogleTasksEvent::Error(message))) = tokio::time::timeout(Duration::from_secs(2), evt_rx.recv()).await {
-                break message;
+        let refused = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match evt_rx.recv().await.expect("offline session still running") {
+                    GoogleTasksEvent::Error(message) => break message,
+                    _ => {}
+                }
             }
-        };
+        }).await.expect("offline write must be refused promptly");
         assert!(refused.contains("working offline"), "unexpected refusal: {refused}");
 
-        offline_tx.send(false).unwrap();
+        // Closing the command channel while still offline must terminate
+        // without making a real OAuth request during test teardown.
         drop(cmd_tx);
-        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        tokio::time::timeout(Duration::from_secs(5), handle).await.expect("offline session stops").expect("session did not panic");
         let _ = std::fs::remove_file(cache_path(&email));
     }
 

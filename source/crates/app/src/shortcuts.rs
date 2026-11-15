@@ -615,6 +615,30 @@ mod tests {
 
     #[test]
     fn display_accel_is_human_readable() {
+        // GTK has a single owning thread per process. Other widget tests
+        // may already have initialized it on a different libtest thread.
+        // Run the real label assertions in a fresh test process rather than
+        // racing the GTK initialization or silently skipping on contention.
+        const CHILD: &str = "LOOKOUT_SHORTCUT_LABEL_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+                eprintln!("shortcut label test requires a graphical display");
+                return;
+            }
+            let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", "shortcuts::tests::display_accel_is_human_readable", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .expect("launch isolated GTK label test");
+            assert!(
+                output.status.success(),
+                "isolated GTK label test failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        gtk::init().expect("GTK initializes in the isolated test process");
         assert_eq!(display_accel("F5"), "F5");
         let mail = display_accel("<Primary>1");
         assert!(mail.ends_with('1'), "{mail}");

@@ -669,20 +669,12 @@ mod tests {
     // A fresh engine over a real UiStateStore, pre-ingested with
     // `occurrences`. The store is returned too, so tests can check what the
     // engine persisted (`persisted_row` flushes the writer first).
-    //
-    // `UiStateStore::open()` derives its path from the process-global
-    // `XDG_CACHE_HOME`, which `ui_state_db`'s tests also set - so the
-    // set-env-then-open window is serialized across both modules by the
-    // shared `ui_state_db::CACHE_HOME_LOCK` (each test still gets its own
-    // pid-scoped subdirectory).
+    // Each engine gets its own SQLite file, without mutating XDG_CACHE_HOME.
     #[track_caller]
     fn engine_with(test_name: &str, occurrences: &[EventOccurrence]) -> (ReminderEngine, Rc<UiStateStore>) {
         let dir = std::env::temp_dir().join(format!("lookout-reminders-test-{}", std::process::id())).join(test_name);
-        let _guard = crate::ui_state_db::CACHE_HOME_LOCK.lock().unwrap();
-        std::env::set_var("XDG_CACHE_HOME", &dir);
         let _ = std::fs::remove_dir_all(&dir);
-        let db = Rc::new(UiStateStore::open().expect("fresh database should open"));
-        drop(_guard);
+        let db = Rc::new(UiStateStore::open_at(&dir.join("ui-state.sqlite")).expect("fresh database should open"));
         let mut engine = ReminderEngine::new(Some(db.clone()));
         engine.ingest(&AccountId("test-account".into()), occurrences);
         (engine, db)

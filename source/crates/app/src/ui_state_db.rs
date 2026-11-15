@@ -54,7 +54,7 @@
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use lookout_core::{AccountId, MailboxId};
 use rusqlite::Connection;
@@ -151,8 +151,7 @@ impl UiStateDb {
     /// Opens (creating if needed) the UI-state database. Any failure is
     /// reported as an error; callers treat it as "favourites won't persist"
     /// and continue.
-    pub fn open() -> Result<Self, Box<dyn std::error::Error>> {
-        let path = db_path();
+    fn open_at(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -638,8 +637,14 @@ impl UiStateStore {
     /// writer thread. Either failing is an error; callers treat it as
     /// "nothing persists this session".
     pub fn open() -> Result<Self, Box<dyn std::error::Error>> {
-        let reader = UiStateDb::open()?;
-        let writer = UiStateDb::open()?;
+        Self::open_at(&db_path())
+    }
+
+    /// Opens both connections at the same explicit path. Tests use their
+    /// own temporary database without changing process-wide XDG settings.
+    pub(crate) fn open_at(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let reader = UiStateDb::open_at(path)?;
+        let writer = UiStateDb::open_at(path)?;
         let (tx, rx) = std::sync::mpsc::channel::<Job>();
         let worker = std::thread::Builder::new().name("ui-state-db".into()).spawn(move || {
             for job in rx {
@@ -813,17 +818,6 @@ impl Drop for UiStateStore {
     }
 }
 
-/// `XDG_CACHE_HOME` is process-global, so every test that touches it - this
-/// module's and `reminders`'s (which opens a `UiStateDb` of its own) - must
-/// take this lock first: a unique directory per test alone doesn't stop one
-/// thread's `set_var` from redirecting another's open (or `remove_dir_all`)
-/// into the wrong tree, and SQLite then reports "database is locked" against
-/// the other test's live connection. The single-test `XDG_CONFIG_HOME`
-/// modules (`background_image`/`tags`) get away without a lock only because
-/// they have nothing to race against.
-#[cfg(test)]
-pub(crate) static CACHE_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -833,17 +827,14 @@ mod tests {
     // `FAVORITES_GROUP_KEY` uses.
     const FAVORITES_SENTINEL_TEST: &str = "\u{0}favorites";
 
-    // A single test owns `XDG_CACHE_HOME`: the env var is process-global and
-    // parallel test threads would race over it otherwise (the same rule as
-    // the `XDG_CONFIG_HOME` tests in `background_image`/`tags`).
+    // Each test opens its own database; never redirect the process-wide
+    // cache directory while other tests or background workers are running.
     #[test]
     fn open_uses_wal_and_normal_sync() {
-        let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("lookout-ui-state-test-{}", std::process::id())).join("pragmas");
-        std::env::set_var("XDG_CACHE_HOME", &dir);
         let _ = std::fs::remove_dir_all(&dir);
 
-        let db = UiStateDb::open().expect("fresh database should open");
+        let db = UiStateDb::open_at(&dir.join("ui-state.sqlite")).expect("fresh database should open");
         let journal: String = db.conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
         let synchronous: i64 = db.conn.query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap();
         assert_eq!(journal, "wal");
@@ -852,12 +843,10 @@ mod tests {
 
     #[test]
     fn store_writes_land_in_order_after_flush() {
-        let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("lookout-ui-state-test-{}", std::process::id())).join("store-order");
-        std::env::set_var("XDG_CACHE_HOME", &dir);
         let _ = std::fs::remove_dir_all(&dir);
 
-        let store = UiStateStore::open().expect("fresh store should open");
+        let store = UiStateStore::open_at(&dir.join("ui-state.sqlite")).expect("fresh store should open");
         let account = AccountId("acc".into());
         store.set_starred(&account, "ada", true);
         store.set_starred(&account, "grace", true);
@@ -877,25 +866,21 @@ mod tests {
 
     #[test]
     fn dropping_the_store_commits_queued_writes() {
-        let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("lookout-ui-state-test-{}", std::process::id())).join("store-drop");
-        std::env::set_var("XDG_CACHE_HOME", &dir);
         let _ = std::fs::remove_dir_all(&dir);
 
-        let store = UiStateStore::open().expect("fresh store should open");
+        let store = UiStateStore::open_at(&dir.join("ui-state.sqlite")).expect("fresh store should open");
         store.set_recent_searches(&["from:ada".to_string()]);
         drop(store);
-        assert_eq!(UiStateDb::open().unwrap().load_recent_searches().unwrap(), ["from:ada"]);
+        assert_eq!(UiStateDb::open_at(&dir.join("ui-state.sqlite")).unwrap().load_recent_searches().unwrap(), ["from:ada"]);
     }
 
     #[test]
     fn folder_prefs_round_trip_and_skip_defaults() {
-        let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("lookout-ui-state-test-{}", std::process::id())).join("folder-prefs");
-        std::env::set_var("XDG_CACHE_HOME", &dir);
         let _ = std::fs::remove_dir_all(&dir);
 
-        let db = UiStateDb::open().expect("fresh database should open");
+        let db = UiStateDb::open_at(&dir.join("ui-state.sqlite")).expect("fresh database should open");
         assert!(db.load_folder_prefs().unwrap().is_empty());
         let colored = MailboxId("acc:Work".into());
         let total = MailboxId("acc:Archive".into());
@@ -918,7 +903,7 @@ mod tests {
             (plain, FolderPrefs::default()),
         ]);
         db.set_folder_prefs(&prefs).unwrap();
-        let loaded = UiStateDb::open().unwrap().load_folder_prefs().unwrap();
+        let loaded = UiStateDb::open_at(&dir.join("ui-state.sqlite")).unwrap().load_folder_prefs().unwrap();
         assert_eq!(loaded.len(), 2, "a folder left at the defaults stores no row");
         assert_eq!(loaded[&colored].color.as_deref(), Some("#e01b24"));
         assert_eq!(loaded[&total].count_mode, FolderCountMode::Total);
@@ -928,12 +913,10 @@ mod tests {
 
     #[test]
     fn ignored_threads_round_trip() {
-        let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("lookout-ui-state-test-{}", std::process::id())).join("ignored-threads");
-        std::env::set_var("XDG_CACHE_HOME", &dir);
         let _ = std::fs::remove_dir_all(&dir);
 
-        let db = UiStateDb::open().expect("fresh database should open");
+        let db = UiStateDb::open_at(&dir.join("ui-state.sqlite")).expect("fresh database should open");
         assert!(db.load_ignored_threads().unwrap().is_empty());
         let account = AccountId("acc".into());
         db.set_ignored_thread(&account, "root@x", "Project kickoff").unwrap();
@@ -941,23 +924,21 @@ mod tests {
         db.set_ignored_thread(&account, "root@x", "Project kickoff v2").unwrap();
         db.set_ignored_thread(&account, "other@y", "Other thread").unwrap();
 
-        let loaded = UiStateDb::open().unwrap().load_ignored_threads().unwrap();
+        let loaded = UiStateDb::open_at(&dir.join("ui-state.sqlite")).unwrap().load_ignored_threads().unwrap();
         assert_eq!(loaded.len(), 2);
         assert!(loaded.contains(&(account.clone(), "root@x".into(), "Project kickoff v2".into())));
 
         db.remove_ignored_thread(&account, "root@x").unwrap();
-        assert_eq!(UiStateDb::open().unwrap().load_ignored_threads().unwrap().len(), 1);
+        assert_eq!(UiStateDb::open_at(&dir.join("ui-state.sqlite")).unwrap().load_ignored_threads().unwrap().len(), 1);
     }
 
     #[test]
     fn starred_contacts_round_trip_and_version_wipe() {
-        let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("lookout-ui-state-test-{}", std::process::id()));
         let dir = dir.join("round-trip");
-        std::env::set_var("XDG_CACHE_HOME", &dir);
         let _ = std::fs::remove_dir_all(&dir);
 
-        let db = UiStateDb::open().expect("fresh database should open");
+        let db = UiStateDb::open_at(&dir.join("ui-state.sqlite")).expect("fresh database should open");
         assert!(db.load_starred().unwrap().is_empty());
 
         let account = AccountId("/org/gnome/OnlineAccounts/Accounts/account_1".into());
@@ -976,29 +957,26 @@ mod tests {
         assert!(loaded.get(&account).unwrap().contains("grace@example.com"));
 
         // A second open (as a fresh session would) reads the same rows.
-        let reopened = UiStateDb::open().expect("existing database should reopen");
+        let reopened = UiStateDb::open_at(&dir.join("ui-state.sqlite")).expect("existing database should reopen");
         assert_eq!(reopened.load_starred().unwrap(), loaded);
 
         // Downgrading the on-disk version wipes the table exactly once.
         reopened.conn.pragma_update(None, "user_version", 0).expect("test can write its own version");
         drop(reopened);
-        let upgraded = UiStateDb::open().unwrap();
+        let upgraded = UiStateDb::open_at(&dir.join("ui-state.sqlite")).unwrap();
         assert!(upgraded.load_starred().unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // Same `XDG_CACHE_HOME` rule as above: each reminder test takes the
-    // module lock and gets its own subdirectory.
+    // Reminder tests use the same per-test database isolation.
     #[test]
     fn reminder_state_round_trip_and_snooze() {
-        let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("lookout-ui-state-test-{}", std::process::id()));
         let dir = dir.join("reminders");
-        std::env::set_var("XDG_CACHE_HOME", &dir);
         let _ = std::fs::remove_dir_all(&dir);
 
-        let db = UiStateDb::open().expect("fresh database should open");
+        let db = UiStateDb::open_at(&dir.join("ui-state.sqlite")).expect("fresh database should open");
         assert!(db.load_reminder_state().unwrap().is_empty());
 
         // Fired → the row is visible.
@@ -1039,18 +1017,16 @@ mod tests {
 
     #[test]
     fn reminder_state_survives_reopen_and_version_wipe() {
-        let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("lookout-ui-state-test-{}", std::process::id()));
         let dir = dir.join("reminders-reopen");
-        std::env::set_var("XDG_CACHE_HOME", &dir);
         let _ = std::fs::remove_dir_all(&dir);
 
-        let db = UiStateDb::open().expect("fresh database should open");
+        let db = UiStateDb::open_at(&dir.join("ui-state.sqlite")).expect("fresh database should open");
         db.set_reminder_state("cal-1", "event-1", "2026-08-07T09:00:00Z", "fired", None).unwrap();
         db.set_starred(&AccountId("account-1".into()), "ada@example.com", true).unwrap();
 
         // A fresh session reads the same reminder rows.
-        let reopened = UiStateDb::open().expect("existing database should reopen");
+        let reopened = UiStateDb::open_at(&dir.join("ui-state.sqlite")).expect("existing database should reopen");
         let loaded = reopened.load_reminder_state().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].uid, "event-1");
@@ -1061,7 +1037,7 @@ mod tests {
         // reminder row must survive.
         reopened.conn.pragma_update(None, "user_version", 1).expect("test can write its own version");
         drop(reopened);
-        let upgraded = UiStateDb::open().unwrap();
+        let upgraded = UiStateDb::open_at(&dir.join("ui-state.sqlite")).unwrap();
         assert!(upgraded.load_starred().unwrap().is_empty());
         let loaded = upgraded.load_reminder_state().unwrap();
         assert_eq!(loaded.len(), 1);
@@ -1073,13 +1049,11 @@ mod tests {
 
     #[test]
     fn local_tasks_round_trip_reopen_and_wipe_survival() {
-        let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("lookout-ui-state-test-{}", std::process::id()));
         let dir = dir.join("local-tasks");
-        std::env::set_var("XDG_CACHE_HOME", &dir);
         let _ = std::fs::remove_dir_all(&dir);
 
-        let db = UiStateDb::open().expect("fresh database should open");
+        let db = UiStateDb::open_at(&dir.join("ui-state.sqlite")).expect("fresh database should open");
         assert!(db.load_local_tasks().unwrap().is_empty());
 
         let task = |uid: &str, summary: &str| lookout_core::CalendarTask {
@@ -1118,10 +1092,10 @@ mod tests {
 
         // Local tasks live in the UI-state database, so a version wipe (the
         // "Clear all caches"-adjacent convention) must NOT touch them.
-        let reopened = UiStateDb::open().unwrap();
+        let reopened = UiStateDb::open_at(&dir.join("ui-state.sqlite")).unwrap();
         reopened.conn.pragma_update(None, "user_version", 1).expect("test can write its own version");
         drop(reopened);
-        let upgraded = UiStateDb::open().unwrap();
+        let upgraded = UiStateDb::open_at(&dir.join("ui-state.sqlite")).unwrap();
         let loaded = upgraded.load_local_tasks().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].summary.as_deref(), Some("Second"));
@@ -1131,13 +1105,11 @@ mod tests {
 
     #[test]
     fn trusted_senders_round_trip_levels_and_wipe_survival() {
-        let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("lookout-ui-state-test-{}", std::process::id()));
         let dir = dir.join("trusted-senders");
-        std::env::set_var("XDG_CACHE_HOME", &dir);
         let _ = std::fs::remove_dir_all(&dir);
 
-        let db = UiStateDb::open().expect("fresh database should open");
+        let db = UiStateDb::open_at(&dir.join("ui-state.sqlite")).expect("fresh database should open");
         assert!(db.load_trusted_senders().unwrap().is_empty());
 
         let account = AccountId("/org/gnome/OnlineAccounts/Accounts/account_1".into());
@@ -1161,7 +1133,7 @@ mod tests {
 
         // A fresh session reads the same rows, and an unknown level encoding
         // degrades to the conservative Images level instead of failing.
-        let reopened = UiStateDb::open().expect("existing database should reopen");
+        let reopened = UiStateDb::open_at(&dir.join("ui-state.sqlite")).expect("existing database should reopen");
         assert_eq!(reopened.load_trusted_senders().unwrap(), loaded);
         reopened.conn.execute("UPDATE trusted_senders SET level = 99 WHERE entry = '@news.example'", []).unwrap();
         let loaded = reopened.load_trusted_senders().unwrap();
@@ -1171,7 +1143,7 @@ mod tests {
         // not touch it (only `starred_contacts` is wiped).
         reopened.conn.pragma_update(None, "user_version", 1).expect("test can write its own version");
         drop(reopened);
-        let upgraded = UiStateDb::open().unwrap();
+        let upgraded = UiStateDb::open_at(&dir.join("ui-state.sqlite")).unwrap();
         let loaded = upgraded.load_trusted_senders().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].1, "@news.example");
@@ -1182,12 +1154,10 @@ mod tests {
 
     #[test]
     fn blocked_senders_round_trip_and_wipe_survival() {
-        let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("lookout-ui-state-test-{}", std::process::id())).join("blocked-senders");
-        std::env::set_var("XDG_CACHE_HOME", &dir);
         let _ = std::fs::remove_dir_all(&dir);
 
-        let db = UiStateDb::open().expect("fresh database should open");
+        let db = UiStateDb::open_at(&dir.join("ui-state.sqlite")).expect("fresh database should open");
         assert!(db.load_blocked_senders().unwrap().is_empty());
 
         let account = AccountId("/org/gnome/OnlineAccounts/Accounts/account_1".into());
@@ -1209,11 +1179,11 @@ mod tests {
         assert_eq!(loaded[0].1, "@ads.example");
 
         // Blocking is a preference: the version-wipe path must not touch it.
-        let reopened = UiStateDb::open().expect("existing database should reopen");
+        let reopened = UiStateDb::open_at(&dir.join("ui-state.sqlite")).expect("existing database should reopen");
         assert_eq!(reopened.load_blocked_senders().unwrap(), loaded);
         reopened.conn.pragma_update(None, "user_version", 1).expect("test can write its own version");
         drop(reopened);
-        let upgraded = UiStateDb::open().unwrap();
+        let upgraded = UiStateDb::open_at(&dir.join("ui-state.sqlite")).unwrap();
         let loaded = upgraded.load_blocked_senders().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].1, "@ads.example");
@@ -1223,12 +1193,10 @@ mod tests {
 
     #[test]
     fn recent_folders_round_trip_replace_and_wipe_survival() {
-        let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("lookout-ui-state-test-{}", std::process::id())).join("recent-folders");
-        std::env::set_var("XDG_CACHE_HOME", &dir);
         let _ = std::fs::remove_dir_all(&dir);
 
-        let db = UiStateDb::open().expect("fresh database should open");
+        let db = UiStateDb::open_at(&dir.join("ui-state.sqlite")).expect("fresh database should open");
         assert!(db.load_recent_folders().unwrap().is_empty());
         let work = AccountId("work".into());
         let home = AccountId("home".into());
@@ -1250,7 +1218,7 @@ mod tests {
         // A preference: the version wipe leaves it alone.
         db.conn.pragma_update(None, "user_version", 1).expect("test can write its own version");
         drop(db);
-        let upgraded = UiStateDb::open().unwrap();
+        let upgraded = UiStateDb::open_at(&dir.join("ui-state.sqlite")).unwrap();
         assert_eq!(upgraded.load_recent_folders().unwrap()[&work], vec![projects]);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1258,12 +1226,10 @@ mod tests {
 
     #[test]
     fn recent_searches_round_trip_replace_and_wipe_survival() {
-        let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("lookout-ui-state-test-{}", std::process::id())).join("recent-searches");
-        std::env::set_var("XDG_CACHE_HOME", &dir);
         let _ = std::fs::remove_dir_all(&dir);
 
-        let db = UiStateDb::open().expect("fresh database should open");
+        let db = UiStateDb::open_at(&dir.join("ui-state.sqlite")).expect("fresh database should open");
         assert!(db.load_recent_searches().unwrap().is_empty());
         db.set_recent_searches(&["from:ada".to_string(), "has:attachment report".to_string()]).unwrap();
         assert_eq!(db.load_recent_searches().unwrap(), vec!["from:ada".to_string(), "has:attachment report".to_string()]);
@@ -1275,7 +1241,7 @@ mod tests {
         // A preference: the version wipe leaves it alone.
         db.conn.pragma_update(None, "user_version", 1).expect("test can write its own version");
         drop(db);
-        let upgraded = UiStateDb::open().unwrap();
+        let upgraded = UiStateDb::open_at(&dir.join("ui-state.sqlite")).unwrap();
         assert_eq!(upgraded.load_recent_searches().unwrap(), vec!["is:unread".to_string()]);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1283,13 +1249,11 @@ mod tests {
 
     #[test]
     fn folder_expansion_round_trip_replace_and_wipe_survival() {
-        let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("lookout-ui-state-test-{}", std::process::id()));
         let dir = dir.join("folder-expansion");
-        std::env::set_var("XDG_CACHE_HOME", &dir);
         let _ = std::fs::remove_dir_all(&dir);
 
-        let db = UiStateDb::open().expect("fresh database should open");
+        let db = UiStateDb::open_at(&dir.join("ui-state.sqlite")).expect("fresh database should open");
         let (empty_expanded, empty_collapsed) = db.load_folder_expansion().unwrap();
         assert!(empty_expanded.is_empty());
         assert!(empty_collapsed.is_empty());
@@ -1313,7 +1277,7 @@ mod tests {
         assert!(loaded_collapsed.is_empty());
 
         // A fresh session (restart) reads the same rows.
-        let reopened = UiStateDb::open().expect("existing database should reopen");
+        let reopened = UiStateDb::open_at(&dir.join("ui-state.sqlite")).expect("existing database should reopen");
         assert_eq!(reopened.load_folder_expansion().unwrap(), (fewer_expanded.clone(), HashSet::new()));
 
         // Re-adding both sets, then pruning one account removes exactly its
@@ -1337,7 +1301,7 @@ mod tests {
         reopened.set_folder_expansion(&fewer_expanded, &HashSet::new()).unwrap();
         reopened.conn.pragma_update(None, "user_version", 1).expect("test can write its own version");
         drop(reopened);
-        let upgraded = UiStateDb::open().unwrap();
+        let upgraded = UiStateDb::open_at(&dir.join("ui-state.sqlite")).unwrap();
         let (loaded_expanded, loaded_collapsed) = upgraded.load_folder_expansion().unwrap();
         assert_eq!(loaded_expanded, fewer_expanded);
         assert!(loaded_collapsed.is_empty());
@@ -1347,12 +1311,10 @@ mod tests {
 
     #[test]
     fn my_day_round_trip_replace_prune_and_wipe_survival() {
-        let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("lookout-ui-state-test-{}", std::process::id())).join("my-day");
-        std::env::set_var("XDG_CACHE_HOME", &dir);
         let _ = std::fs::remove_dir_all(&dir);
 
-        let db = UiStateDb::open().expect("fresh database should open");
+        let db = UiStateDb::open_at(&dir.join("ui-state.sqlite")).expect("fresh database should open");
         assert!(db.load_my_day("2026-10-16").unwrap().is_empty());
 
         db.set_my_day("2026-10-16", &[("local".into(), "t1".into()), ("todo:l1".into(), "t2".into())]).unwrap();
@@ -1372,10 +1334,10 @@ mod tests {
         assert_eq!(db.load_my_day("2026-10-20").unwrap().len(), 1);
 
         // A preference-like table: the version wipe must not touch it.
-        let reopened = UiStateDb::open().unwrap();
+        let reopened = UiStateDb::open_at(&dir.join("ui-state.sqlite")).unwrap();
         reopened.conn.pragma_update(None, "user_version", 1).expect("test can write its own version");
         drop(reopened);
-        let upgraded = UiStateDb::open().unwrap();
+        let upgraded = UiStateDb::open_at(&dir.join("ui-state.sqlite")).unwrap();
         assert_eq!(upgraded.load_my_day("2026-10-16").unwrap(), vec![("local".into(), "t1".into())]);
 
         let _ = std::fs::remove_dir_all(&dir);
