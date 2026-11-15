@@ -17,7 +17,7 @@ use crate::connection::{connect_plain, connect_tls, tls_connect_over, SessionStr
 use crate::envelope::{flags_from_fetch, summary_from_fetch, summary_from_header_fetch};
 use crate::error::{Error, Result};
 use crate::search_query::{imap_quote, SearchQuery};
-use crate::send::{build_draft_raw_message, send_smtp, ComposedMessage, OutboxMessage};
+use crate::send::{build_draft_raw_message, send_smtp, send_gmail_smtp, ComposedMessage, OutboxMessage};
 
 /// How many of the most recent messages the background body prefetch queues
 /// for download on a folder it hasn't warmed yet. Bounds the *body* warm-up
@@ -1545,6 +1545,14 @@ pub async fn run_account_session(
         }
     });
 
+    // A previous process may have stopped after SMTP accepted but before
+    // the local result was committed. Do not automatically replay that row.
+    if let Some(Ok(recovered)) = cache_op(&cache, |c| c.recover_interrupted_outbox_sends()).await {
+        if recovered > 0 {
+            tracing::warn!(account = %config.account_id, recovered, "interrupted SMTP sends retained for manual review");
+        }
+    }
+
     // The `@mentions` detection context (M-25): the account's own addresses
     // and names, compiled once. Hung off the cache handle so every body-parsing
     // path (the preview pass, the new-message fetch, on-demand bodies) can read
@@ -1726,6 +1734,8 @@ pub async fn run_account_session(
     // Abort auxiliary readers on every exit, including a closed command
     // channel while disconnected, or cancellation of the primary actor.
     let _preview_task = AccountTaskGuard(preview_task);
+    let mut gmail_smtp_job: Option<GmailSmtpJob> = None;
+    let smtp_completed = std::sync::Arc::new(tokio::sync::Notify::new());
 
     loop {
         // The sender is explicitly closed when the UI removes/replaces
@@ -1792,6 +1802,9 @@ pub async fn run_account_session(
             &mut move_ledger,
             &mut copy_ledger,
             draft_jobs.as_ref(),
+            &mut gmail_smtp_job,
+            &smtp_completed,
+            credentials.clone(),
         )
         .await
         {
@@ -1922,6 +1935,47 @@ impl Drop for AccountTaskGuard {
     fn drop(&mut self) {
         if let Some(task) = self.0.take() { task.abort(); }
     }
+}
+
+/// One in-flight Gmail submission per account. It lives outside the IMAP
+/// connection lifetime; the durable claim prevents overlapping sends.
+struct GmailSmtpJob {
+    entry: crate::cache::OutboxEntry,
+    result: tokio::sync::oneshot::Receiver<std::result::Result<(), (Error, bool)>>,
+    _task: AccountTaskGuard,
+}
+
+fn start_gmail_smtp_job(
+    config: &AccountConfig,
+    credentials: std::sync::Arc<dyn CredentialProvider>,
+    entry: crate::cache::OutboxEntry,
+    completed: std::sync::Arc<tokio::sync::Notify>,
+) -> GmailSmtpJob {
+    let (tx, result) = tokio::sync::oneshot::channel();
+    let endpoint = config.smtp.clone();
+    let account = config.account_id.clone();
+    let payload = entry.payload.clone();
+    let id = entry.id;
+    let task = tokio::spawn(async move {
+        let outcome = async {
+            let message = serde_json::from_slice::<OutboxMessage>(&payload)
+                .map_err(|e| (Error::LoginFailed(format!("Invalid outbox payload: {e}")), false))?;
+            let raw = message.raw().ok_or_else(|| (Error::LoginFailed("Invalid outbox MIME".into()), false))?;
+            tracing::info!(account = %account, id, "Gmail SMTP credential requested");
+            let credential = tokio::time::timeout(Duration::from_secs(12), credentials.smtp_credential()).await
+                .map_err(|_| (Error::LoginFailed("SMTP credential request timed out".into()), false))?
+                .map_err(|e| (Error::LoginFailed(e), false))?;
+            tracing::info!(account = %account, id, "Gmail SMTP credential received");
+            let result = send_gmail_smtp(&endpoint, credential, &message, &raw).await;
+            if matches!(&result, Err((Error::AuthRejected(_), _))) {
+                let _ = tokio::time::timeout(Duration::from_secs(10), credentials.invalidate_credential()).await;
+            }
+            result
+        }.await;
+        let _ = tx.send(outcome);
+        completed.notify_one();
+    });
+    GmailSmtpJob { entry, result, _task: AccountTaskGuard(Some(task)) }
 }
 
 enum ShutdownReason {
@@ -2078,6 +2132,9 @@ async fn connect_and_run(
     move_ledger: &mut MoveLedger,
     copy_ledger: &mut MoveLedger,
     draft_jobs: Option<&async_channel::Sender<DavmailDraftJob>>,
+    gmail_smtp_job: &mut Option<GmailSmtpJob>,
+    smtp_completed: &std::sync::Arc<tokio::sync::Notify>,
+    smtp_credentials: std::sync::Arc<dyn CredentialProvider>,
 ) -> Result<ShutdownReason> {
     // The outer loop normally parks before calling us, but the toggle can win
     // the race between that check and this call; don't log in at all then.
@@ -2286,6 +2343,8 @@ async fn connect_and_run(
         ServerChanged,
         /// Periodic refresh for servers without IDLE.
         Poll,
+        /// An independent Gmail SMTP task published its outcome.
+        SmtpCompleted,
         /// Work Offline turned on while waiting in IDLE.
         Offline,
         ChannelClosed,
@@ -2316,6 +2375,7 @@ async fn connect_and_run(
     let mut local_snooze_wake: Option<chrono::DateTime<chrono::Utc>> = cache_op(cache, |c| c.next_snooze_wake()).await.and_then(|r| r.ok()).flatten();
     let mut next_scheduled_scan = chrono::Utc::now();
     let watch_gmail_inbox = gmail_inbox_watch(&config.imap.host);
+    let isolated_smtp = watch_gmail_inbox && config.smtp.host.trim_end_matches('.').eq_ignore_ascii_case("smtp.gmail.com");
     let poll_interval = if watch_gmail_inbox && use_idle { GMAIL_INBOX_RECONCILE_INTERVAL } else { NO_IDLE_POLL_INTERVAL };
     let mut next_poll = tokio::time::Instant::now() + poll_interval;
 
@@ -2333,14 +2393,44 @@ async fn connect_and_run(
         // send goes out as soon as the (outbox-capped) IDLE slice wakes. Gated
         // on a due time and `no_work_pending`, so an empty outbox costs one
         // comparison and a queued command always wins over delivery.
-        if next_outbox_due.is_some_and(|due| due <= chrono::Utc::now()) && (deferred_interactive.is_empty() && no_work_pending(commands, interactive_commands, idle_notify)) {
+        let completed_result = gmail_smtp_job.as_mut().and_then(|job| match job.result.try_recv() {
+            Ok(outcome) => Some(outcome),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Some(Err((Error::LoginFailed("SMTP task ended without confirmation; check Sent/recipient before retrying.".into()), true))),
+        });
+        let completed_gmail = completed_result.map(|outcome| {
+            let job = gmail_smtp_job.take().expect("completed SMTP job");
+            (job.entry.clone(), outcome)
+        });
+        let may_start = next_outbox_due.is_some_and(|due| due <= chrono::Utc::now())
+            && deferred_interactive.is_empty() && no_work_pending(commands, interactive_commands, idle_notify);
+        if isolated_smtp && gmail_smtp_job.is_none() && completed_gmail.is_none() && may_start {
             let due = cache_op(cache, {
                 let now = chrono::Utc::now();
                 move |c| c.due_outbox(now)
-            })
-            .await
-            .and_then(|r| r.ok())
-            .unwrap_or_default();
+            }).await.and_then(|r| r.ok()).unwrap_or_default();
+            if let Some(entry) = due.into_iter().next() {
+                let id = entry.id;
+                if matches!(cache_op(cache, move |c| c.claim_outbox_send(id, chrono::Utc::now())).await, Some(Ok(true))) {
+                    tracing::info!(account = %account_id, id, "send pipeline: isolated Gmail SMTP dispatched");
+                    *gmail_smtp_job = Some(start_gmail_smtp_job(config, smtp_credentials.clone(), entry, smtp_completed.clone()));
+                } else {
+                    tracing::warn!(account = %account_id, id, "could not claim outgoing message");
+                }
+            }
+            next_outbox_due = cache_op(cache, |c| c.next_outbox_not_before()).await.and_then(|r| r.ok()).flatten();
+            if gmail_smtp_job.is_none() && next_outbox_due.is_some_and(|due| due <= chrono::Utc::now()) {
+                next_outbox_due = Some(chrono::Utc::now() + chrono::Duration::seconds(30));
+            }
+        }
+        if completed_gmail.is_some() || (!isolated_smtp && may_start) {
+            let (due, mut gmail_result) = match completed_gmail {
+                Some((entry, outcome)) => (vec![entry], Some(outcome)),
+                None => (cache_op(cache, {
+                    let now = chrono::Utc::now();
+                    move |c| c.due_outbox(now)
+                }).await.and_then(|r| r.ok()).unwrap_or_default(), None),
+            };
             // Post-send work is deferred until the whole due batch is done:
             // one Sent resync and one reselect for N messages instead of N of
             // each. `selection_moved` tracks a draft delete leaving the
@@ -2358,10 +2448,18 @@ async fn connect_and_run(
                     cache_op(cache, move |c| c.delete_outbox(id)).await;
                     continue;
                 };
-                tracing::info!(account = %account_id, host = %config.smtp.host, id, bytes = raw.len(), attempts, "send pipeline: SMTP starting");
-                let sent = match credentials.smtp_credential().await {
-                    Ok(cred) => send_smtp(&config.smtp, cred, &message.from, &message.recipients, &raw, message.request_delivery_receipt).await,
-                    Err(e) => Err(Error::LoginFailed(e)),
+                let (sent, uncertain) = if let Some(outcome) = gmail_result.take() {
+                    match outcome {
+                        Ok(()) => (Ok(()), false),
+                        Err((error, uncertain)) => (Err(error), uncertain),
+                    }
+                } else {
+                    tracing::info!(account = %account_id, host = %config.smtp.host, id, bytes = raw.len(), attempts, "send pipeline: SMTP starting");
+                    let result = match credentials.smtp_credential().await {
+                        Ok(cred) => send_smtp(&config.smtp, cred, &message.from, &message.recipients, &raw, message.request_delivery_receipt).await,
+                        Err(e) => Err(Error::LoginFailed(e)),
+                    };
+                    (result, false)
                 };
                 match sent {
                     Ok(()) => {
@@ -2373,6 +2471,9 @@ async fn connect_and_run(
                         // the message again on the next start.
                         cache_op(cache, move |c| c.delete_outbox(id)).await;
                         let _ = events.send(AccountEvent::OutboxSent { id }).await;
+                        if isolated_smtp {
+                            emit_outbox_contents(cache, events).await;
+                        }
 
                         // Everything below is best-effort: the message *was*
                         // sent. Archive the sent copy, then delete the draft
@@ -2384,6 +2485,14 @@ async fn connect_and_run(
                         // conventional paired local bridge gets this policy.
                         let sent_id = if davmail_saves_sent(&config.imap, &config.smtp) {
                             folders.iter().find(|m| matches!(m.role, lookout_core::MailboxRole::Sent)).map(|m| m.id.clone())
+                        } else if isolated_smtp {
+                            match tokio::time::timeout(Duration::from_secs(30), archive_sent_message(&mut session, &folders, &account_id, &raw)).await {
+                                Ok(sent) => sent,
+                                Err(_) => {
+                                    tracing::warn!(account = %account_id, "Sent archive timed out after confirmed SMTP delivery; reconnecting");
+                                    return Err(Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "Sent archive timed out after delivery")));
+                                }
+                            }
                         } else {
                             archive_sent_message(&mut session, &folders, &account_id, &raw).await
                         };
@@ -2396,7 +2505,18 @@ async fn connect_and_run(
                                     tracing::warn!("message sent but draft worker unavailable");
                                 }
                             } else {
-                                if let Err(e) = delete_draft(&mut session, &folders, &account_id, draft_id, has_uidplus).await {
+                                let result = if isolated_smtp {
+                                    match tokio::time::timeout(Duration::from_secs(30), delete_draft(&mut session, &folders, &account_id, draft_id, has_uidplus)).await {
+                                        Ok(result) => result,
+                                        Err(_) => {
+                                            tracing::warn!(account = %account_id, "Draft cleanup timed out after confirmed SMTP delivery; reconnecting");
+                                            return Err(Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "draft cleanup timed out after delivery")));
+                                        }
+                                    }
+                                } else {
+                                    delete_draft(&mut session, &folders, &account_id, draft_id, has_uidplus).await
+                                };
+                                if let Err(e) = result {
                                     tracing::warn!("message sent but deleting its draft failed: {e}");
                                 }
                                 selection_moved = true;
@@ -2404,13 +2524,14 @@ async fn connect_and_run(
                         }
                     }
                     Err(e) => {
-                        if matches!(&e, Error::AuthRejected(_)) {
+                        if !isolated_smtp && matches!(&e, Error::AuthRejected(_)) {
                             // SMTP rejected the token itself: evict it so the
                             // retry refreshes instead of replaying a stale one.
                             credentials.invalidate_credential().await;
                         }
                         let retry_at = chrono::Utc::now() + outbox_retry_delay(attempts + 1);
-                        let state = cache_op(cache, move |c| c.outbox_attempt_failed(id, retry_at, MAX_OUTBOX_ATTEMPTS)).await;
+                        let max_attempts = if uncertain { 1 } else { MAX_OUTBOX_ATTEMPTS };
+                        let state = cache_op(cache, move |c| c.outbox_attempt_failed(id, retry_at, max_attempts)).await;
                         match state {
                             // Still within the retry budget: keep the
                             // "Sending…" toast up and stay quiet, so a blip
@@ -2658,10 +2779,12 @@ async fn connect_and_run(
                                 let scan_due = scheduled_folder(&folders, &account_id)
                                     .filter(|_| scheduled_keywords_ok != Some(false))
                                     .map(|_| next_scheduled_scan);
-                                let next_due = earliest([next_outbox_due, local_snooze_wake, server_snooze_wake, scan_due]);
+                                let outbox_due = if gmail_smtp_job.is_some() { None } else { next_outbox_due };
+                                let next_due = earliest([outbox_due, local_snooze_wake, server_snooze_wake, scan_due]);
                                 let slice = prefetch_idle_slice(remaining, prefetch.as_ref().is_some_and(|pf| !pf.is_done()), prefetch_policy);
                                 let slice = cap_slice_for_outbox(slice, next_due, chrono::Utc::now()).min(remaining);
                                 tokio::select! {
+                                    _ = smtp_completed.notified(), if gmail_smtp_job.is_some() => Wake::SmtpCompleted,
                                     _ = tokio::time::sleep(slice) => {
                                         if tokio::time::Instant::now() >= next_poll { Wake::Poll }
                                         else { Wake::Idle(Ok(async_imap::extensions::idle::IdleResponse::Timeout)) }
@@ -2773,7 +2896,8 @@ async fn connect_and_run(
                                     let scan_due = scheduled_folder(&folders, &account_id)
                                         .filter(|_| scheduled_keywords_ok != Some(false))
                                         .map(|_| next_scheduled_scan);
-                                    let next_due = earliest([next_outbox_due, local_snooze_wake, server_snooze_wake, scan_due]);
+                                    let outbox_due = if gmail_smtp_job.is_some() { None } else { next_outbox_due };
+                                    let next_due = earliest([outbox_due, local_snooze_wake, server_snooze_wake, scan_due]);
                                     let slice = cap_slice_for_outbox(slice, next_due, chrono::Utc::now());
                                     let slice = if watch_gmail_inbox {
                                         slice.min(next_poll.saturating_duration_since(tokio::time::Instant::now()))
@@ -2793,6 +2917,7 @@ async fn connect_and_run(
                                     // `handle.done()` below to send IMAP's `DONE` and reclaim the
                                     // session.
                                     let wake = tokio::select! {
+                                        _ = smtp_completed.notified(), if gmail_smtp_job.is_some() => Wake::SmtpCompleted,
                                         r = wait_fut => Wake::Idle(r),
                                         c = interactive_commands.recv() => match c {
                                             Ok(cmd) => Wake::Command(cmd),
@@ -2977,7 +3102,7 @@ async fn connect_and_run(
                 }
             },
             Wake::Command(cmd) => woke_on_command = Some(cmd),
-            Wake::DeferredInteractive => {},
+            Wake::DeferredInteractive | Wake::SmtpCompleted => {},
             Wake::Offline => {
                 let _ = session.logout().await;
                 return Ok(ShutdownReason::Offline);

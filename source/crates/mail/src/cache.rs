@@ -3484,6 +3484,24 @@ impl Cache {
         Ok(ts.and_then(|t| DateTime::from_timestamp(t, 0)))
     }
 
+    /// Atomically reserve a due row for an independent SMTP task. A claimed
+    /// row is neither due nor editable/cancellable until its outcome lands.
+    pub fn claim_outbox_send(&self, id: i64, now: DateTime<Utc>) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "UPDATE outbox SET state = 'sending' WHERE id = ?1 AND state = 'pending' AND not_before <= ?2",
+            rusqlite::params![id, now.timestamp()],
+        )? == 1)
+    }
+
+    /// An interrupted SMTP attempt may already have been accepted remotely.
+    /// On a new account actor, retain it for explicit review rather than
+    /// silently replaying it. Only the owning actor calls this, after locking.
+    pub fn recover_interrupted_outbox_sends(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("UPDATE outbox SET state = 'failed' WHERE state = 'sending'", [])?)
+    }
+
     /// Records a failed send attempt: increments `attempts` and, once it
     /// reaches `max_attempts`, marks the row `failed`; otherwise leaves it
     /// `pending` with `not_before` pushed out to `retry_at`. Returns the
@@ -3522,7 +3540,7 @@ impl Cache {
     /// returns `None`.
     pub fn cancel_outbox(&self, id: i64) -> Result<Option<OutboxEntry>> {
         let conn = self.conn.lock().unwrap();
-        let entry = Self::outbox_rows_locked(&conn, "WHERE id = ?1", rusqlite::params![id])?.into_iter().next();
+        let entry = Self::outbox_rows_locked(&conn, "WHERE id = ?1 AND state != 'sending'", rusqlite::params![id])?.into_iter().next();
         if entry.is_some() {
             conn.execute("DELETE FROM outbox WHERE id = ?1", rusqlite::params![id])?;
         }
@@ -3536,7 +3554,7 @@ impl Cache {
     pub fn reschedule_outbox(&self, id: i64, not_before: DateTime<Utc>) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let updated = conn.execute(
-            "UPDATE outbox SET not_before = ?1, attempts = 0, state = ?2 WHERE id = ?3",
+            "UPDATE outbox SET not_before = ?1, attempts = 0, state = ?2 WHERE id = ?3 AND state != 'sending'",
             rusqlite::params![not_before.timestamp(), OutboxState::Pending.as_str(), id],
         )?;
         Ok(updated > 0)
@@ -3887,6 +3905,27 @@ mod tests {
     /// Schedule send's "Send now" / "Retry": a pending or failed row becomes
     /// pending at the new time with a fresh retry budget; a vanished row
     /// reports `false`.
+    #[test]
+    fn claimed_outbox_cannot_be_replayed_or_edited_and_recovers_for_review() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let now = Utc::now();
+        let id = cache.enqueue_outbox(&account_id, now, b"message").unwrap();
+        assert!(cache.claim_outbox_send(id, now).unwrap());
+        assert!(!cache.claim_outbox_send(id, now).unwrap());
+        assert!(cache.due_outbox(now).unwrap().is_empty());
+        assert!(cache.cancel_outbox(id).unwrap().is_none());
+        assert!(!cache.reschedule_outbox(id, now).unwrap());
+        assert_eq!(cache.recover_interrupted_outbox_sends().unwrap(), 1);
+        assert_eq!(cache.all_outbox().unwrap()[0].state, OutboxState::Failed);
+        assert!(cache.due_outbox(now).unwrap().is_empty());
+        assert!(cache.reschedule_outbox(id, now).unwrap());
+        assert_eq!(cache.due_outbox(now).unwrap()[0].id, id);
+        cache.delete_outbox(id).unwrap();
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn reschedule_outbox_resets_state_and_due_time() {
         let account_id = temp_account_id();

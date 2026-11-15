@@ -542,6 +542,70 @@ pub async fn send_smtp(endpoint: &EndpointConfig, credential: Credential, from: 
     Ok(())
 }
 
+/// Gmail's isolated SMTP lane uses explicit phase deadlines. The boolean
+/// in an error denotes an uncertain delivery outcome: only errors before
+/// submission can be automatically retried. Never log tokens or MIME.
+pub(crate) async fn send_gmail_smtp(endpoint: &EndpointConfig, credential: Credential, message: &OutboxMessage, raw: &[u8]) -> std::result::Result<(), (Error, bool)> {
+    use std::time::Duration;
+    crate::connection::ensure_crypto_provider_installed();
+    let safe = |message: String| (Error::LoginFailed(message), false);
+    let from: SmtpAddress = message.from.parse().map_err(|_| safe("Invalid SMTP From address".into()))?;
+    let recipients = message.recipients.iter().map(|r| {
+        split_mailbox(r).1.parse::<SmtpAddress>().map_err(|_| safe("Invalid SMTP recipient address".into()))
+    }).collect::<std::result::Result<Vec<_>, _>>()?;
+    let envelope = Envelope::new(Some(from), recipients).map_err(|e| safe(e.to_string()))?;
+    let hello = ClientId::default();
+    let tls_parameters = || TlsParameters::new(endpoint.host.clone()).map_err(|e| safe(format!("Invalid SMTP TLS hostname: {e}")));
+    let implicit_tls = (endpoint.security == Security::ImplicitTls).then(tls_parameters).transpose()?;
+    let started = std::time::Instant::now();
+    tracing::info!(host = %endpoint.host, port = endpoint.port, "Gmail SMTP connecting");
+    let mut connection = tokio::time::timeout(Duration::from_secs(25), AsyncSmtpConnection::connect_tokio1(
+        (endpoint.host.as_str(), endpoint.port), Some(Duration::from_secs(20)), &hello, implicit_tls, None,
+    )).await.map_err(|_| safe("SMTP connect/TLS/greeting timed out".into()))?
+        .map_err(|e| safe(format!("SMTP connect/TLS/greeting failed: {e}")))?;
+    tracing::info!(host = %endpoint.host, elapsed_ms = started.elapsed().as_millis(), "Gmail SMTP connected");
+    if endpoint.security == Security::StartTls && !connection.is_encrypted() {
+        if !connection.can_starttls() { return Err(safe("SMTP server does not offer STARTTLS".into())); }
+        tracing::info!("Gmail SMTP STARTTLS starting");
+        tokio::time::timeout(Duration::from_secs(15), connection.starttls(tls_parameters()?, &hello))
+            .await.map_err(|_| safe("SMTP STARTTLS timed out".into()))?
+            .map_err(|e| safe(format!("SMTP STARTTLS failed: {e}")))?;
+        tracing::info!("Gmail SMTP STARTTLS complete");
+    }
+    let (mechanisms, credentials) = match credential {
+        Credential::OAuth2AccessToken(token) => (vec![Mechanism::Xoauth2], Credentials::new(endpoint.username.clone(), token)),
+        Credential::Password(password) => (DEFAULT_MECHANISMS.to_vec(), Credentials::new(endpoint.username.clone(), password)),
+    };
+    tracing::info!("Gmail SMTP authentication starting");
+    tokio::time::timeout(Duration::from_secs(15), connection.auth(&mechanisms, &credentials))
+        .await.map_err(|_| safe("SMTP authentication timed out".into()))?
+        .map_err(|e| (Error::AuthRejected(format!("SMTP authentication failed: {e}")), false))?;
+    tracing::info!("Gmail SMTP authentication complete");
+    let dsn = if message.request_delivery_receipt {
+        match tokio::time::timeout(Duration::from_secs(10), connection.command(Ehlo::new(hello.clone()))).await {
+            Ok(Ok(response)) if response.is_positive() => ehlo_advertises_dsn(response.message()),
+            Ok(Ok(_)) => false,
+            Ok(Err(e)) => return Err(safe(format!("SMTP DSN capability check failed: {e}"))),
+            Err(_) => return Err(safe("SMTP DSN capability check timed out".into())),
+        }
+    } else { false };
+    // For larger attachments allow additional upload time, up to five
+    // minutes. IMAP remains free to process requests during this deadline.
+    let seconds = (60 + raw.len() as u64 / (128 * 1024)).min(300);
+    tracing::info!(bytes = raw.len(), timeout_secs = seconds, "Gmail SMTP submission starting");
+    match tokio::time::timeout(Duration::from_secs(seconds), submit_dsn(&mut connection, &envelope, raw, dsn)).await {
+        Ok(Ok(())) => {
+            tracing::info!("Gmail SMTP submission accepted");
+            // A final positive DATA reply is the delivery commit. QUIT is
+            // best-effort and never converts acceptance into a retry.
+            let _ = tokio::time::timeout(Duration::from_secs(2), connection.quit()).await;
+            Ok(())
+        }
+        Ok(Err(e)) => Err((Error::LoginFailed(format!("SMTP submission was not confirmed: {e}. Check Sent/recipient before retrying.")), true)),
+        Err(_) => Err((Error::LoginFailed("SMTP submission timed out; delivery is uncertain. Check Sent/recipient before retrying.".into()), true)),
+    }
+}
+
 /// Verify SMTP authentication without transmitting a message.
 pub async fn verify_smtp_login(endpoint: &EndpointConfig, password: String) -> Result<()> {
     crate::connection::ensure_crypto_provider_installed();
