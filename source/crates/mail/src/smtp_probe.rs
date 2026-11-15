@@ -135,11 +135,13 @@ pub async fn run_smtp_tls_probe() {
         let label = format!("lettre DNS {HOST}:{port}");
         run_case(&label, lettre_probe((HOST, port), port, &label)).await;
     }
-    run_case("production Lookout TLS + lettre SMTP 465", async {
-        let mut connection = crate::send::connect_gmail_implicit_tls(HOST, 465, &ClientId::default()).await?;
-        let _ = tokio::time::timeout(Duration::from_secs(2), connection.quit()).await;
-        Ok(())
-    }).await;
+    for (port, security) in [(465, crate::config::Security::ImplicitTls), (587, crate::config::Security::StartTls)] {
+        let label = format!("production Tokio SMTP {port}");
+        run_case(&label, async {
+            crate::send::probe_gmail_smtp(HOST, port, security).await?;
+            Ok(())
+        }).await;
+    }
     println!("Probe complete; inspect RESULT lines. No credentials or mail were transmitted.");
 }
 

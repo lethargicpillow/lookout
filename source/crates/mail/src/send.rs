@@ -554,43 +554,31 @@ pub(crate) async fn send_gmail_smtp(endpoint: &EndpointConfig, credential: Crede
         split_mailbox(r).1.parse::<SmtpAddress>().map_err(|_| safe("Invalid SMTP recipient address".into()))
     }).collect::<std::result::Result<Vec<_>, _>>()?;
     let envelope = Envelope::new(Some(from), recipients).map_err(|e| safe(e.to_string()))?;
-    let hello = ClientId::default();
     // GOA advertises both TLS modes for Gmail and normally selects 587.
     // Prefer TLS from the first byte for that standard endpoint: field
     // reports show repeated STARTTLS stalls after a successful greeting.
     // The alternate route is tried only before AUTH or MAIL FROM.
     let preferred = gmail_preferred_smtp_endpoint(endpoint);
     crate::smtp_probe::maybe_spawn_live_probe();
-    let mut connection = match connect_gmail_smtp(&preferred, &hello).await {
+    let mut connection = match connect_gmail_smtp(&preferred).await {
         Ok(connection) => connection,
         Err(error) if preferred.port != endpoint.port => {
             tracing::warn!(host = %endpoint.host, port = preferred.port, configured_port = endpoint.port, "Gmail implicit TLS connection failed; trying configured STARTTLS: {error}");
-            connect_gmail_smtp(endpoint, &hello).await.map_err(safe)?
+            connect_gmail_smtp(endpoint).await.map_err(safe)?
         }
         Err(error) => return Err(safe(error)),
     };
-    let (mechanisms, credentials) = match credential {
-        Credential::OAuth2AccessToken(token) => (vec![Mechanism::Xoauth2], Credentials::new(endpoint.username.clone(), token)),
-        Credential::Password(password) => (DEFAULT_MECHANISMS.to_vec(), Credentials::new(endpoint.username.clone(), password)),
-    };
     tracing::info!("Gmail SMTP authentication starting");
-    tokio::time::timeout(Duration::from_secs(15), connection.auth(&mechanisms, &credentials))
+    tokio::time::timeout(Duration::from_secs(15), connection.authenticate(&endpoint.username, credential))
         .await.map_err(|_| safe("SMTP authentication timed out".into()))?
-        .map_err(|e| (Error::AuthRejected(format!("SMTP authentication failed: {e}")), false))?;
+        .map_err(|e| (Error::AuthRejected(e), false))?;
     tracing::info!("Gmail SMTP authentication complete");
-    let dsn = if message.request_delivery_receipt {
-        match tokio::time::timeout(Duration::from_secs(10), connection.command(Ehlo::new(hello.clone()))).await {
-            Ok(Ok(response)) if response.is_positive() => ehlo_advertises_dsn(response.message()),
-            Ok(Ok(_)) => false,
-            Ok(Err(e)) => return Err(safe(format!("SMTP DSN capability check failed: {e}"))),
-            Err(_) => return Err(safe("SMTP DSN capability check timed out".into())),
-        }
-    } else { false };
+    let dsn = message.request_delivery_receipt && connection.has_extension("DSN");
     // For larger attachments allow additional upload time, up to five
     // minutes. IMAP remains free to process requests during this deadline.
     let seconds = (60 + raw.len() as u64 / (128 * 1024)).min(300);
     tracing::info!(bytes = raw.len(), timeout_secs = seconds, "Gmail SMTP submission starting");
-    match tokio::time::timeout(Duration::from_secs(seconds), submit_dsn(&mut connection, &envelope, raw, dsn)).await {
+    match tokio::time::timeout(Duration::from_secs(seconds), connection.submit(&envelope, raw, dsn)).await {
         Ok(Ok(())) => {
             tracing::info!("Gmail SMTP submission accepted");
             // A final positive DATA reply is the delivery commit. QUIT is
@@ -615,105 +603,213 @@ fn gmail_preferred_smtp_endpoint(endpoint: &EndpointConfig) -> EndpointConfig {
     preferred
 }
 
-/// Adapter for lettre's existing-stream API. The only constructor takes an
-/// already negotiated, certificate-verified TLS stream, not plain TCP.
-/// lettre labels external streams as TCP in its internal enum, so its
-/// is_encrypted() is not a reliable test for this particular connection.
-#[derive(Debug)]
-struct VerifiedSmtpStream(crate::connection::ImapStream);
+/// SMTP replies read directly from Tokio. The TLS transport is the same
+/// verified connection used by IMAP. Keep SMTP command formatting in lettre,
+/// but avoid its async stream/response machinery for Gmail.
+struct GmailSmtp {
+    stream: tokio::io::BufReader<crate::connection::ImapStream>,
+    capabilities: Vec<String>,
+}
 
-impl lettre::transport::smtp::client::AsyncTokioStream for VerifiedSmtpStream {
-    fn peer_addr(&self) -> std::io::Result<std::net::SocketAddr> {
-        self.0.get_ref().0.peer_addr()
+struct SmtpReply {
+    code: u16,
+    lines: Vec<String>,
+}
+
+async fn gmail_read_reply<S: tokio::io::AsyncRead + Unpin>(stream: &mut tokio::io::BufReader<S>) -> std::result::Result<SmtpReply, String> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    let mut lines = Vec::new();
+    let mut expected = None;
+    let mut total = 0;
+    loop {
+        let mut line = Vec::new();
+        let n = (&mut *stream).take(1001).read_until(b'\n', &mut line).await
+            .map_err(|e| format!("SMTP read failed: {e}"))?;
+        total += n;
+        if n == 0 || n > 1000 || total > 100_000 || !line.ends_with(b"\r\n") {
+            return Err("SMTP incomplete or oversized reply".into());
+        }
+        let value = std::str::from_utf8(&line[..n-2]).map_err(|_| "Invalid SMTP reply encoding".to_string())?;
+        let code = value.get(..3).and_then(|v| v.parse::<u16>().ok()).ok_or("Invalid SMTP reply code")?;
+        if !(200..600).contains(&code) || expected.is_some_and(|previous| previous != code) {
+            return Err("Inconsistent SMTP reply code".into());
+        }
+        expected = Some(code);
+        match value.as_bytes().get(3) {
+            Some(b'-') => lines.push(value[4..].to_string()),
+            Some(b' ') => {
+                lines.push(value[4..].to_string());
+                return Ok(SmtpReply { code, lines });
+            }
+            None if value.len() == 3 => return Ok(SmtpReply { code, lines }),
+            _ => return Err("Invalid SMTP reply separator".into()),
+        }
     }
 }
 
-impl tokio::io::AsyncRead for VerifiedSmtpStream {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        tokio::io::AsyncRead::poll_read(std::pin::Pin::new(&mut self.get_mut().0), cx, buf)
+fn gmail_expect(reply: SmtpReply, allowed: &[u16], stage: &str) -> std::result::Result<SmtpReply, String> {
+    if allowed.contains(&reply.code) { Ok(reply) }
+    else { Err(format!("SMTP {stage} rejected (status {})", reply.code)) }
+}
+
+async fn gmail_command<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: &mut tokio::io::BufReader<S>, command: &[u8],
+) -> std::result::Result<SmtpReply, String> {
+    use tokio::io::AsyncWriteExt;
+    stream.get_mut().write_all(command).await.map_err(|e| format!("SMTP write failed: {e}"))?;
+    stream.get_mut().flush().await.map_err(|e| format!("SMTP flush failed: {e}"))?;
+    gmail_read_reply(stream).await
+}
+
+impl GmailSmtp {
+    fn has_extension(&self, name: &str) -> bool {
+        self.capabilities.iter().skip(1).any(|line| line.split_whitespace().next().is_some_and(|v| v.eq_ignore_ascii_case(name)))
+    }
+    fn supports_auth(&self, name: &str) -> bool {
+        self.capabilities.iter().skip(1).any(|line| {
+            let mut words = line.split_whitespace();
+            let first = words.next().unwrap_or("");
+            (first.eq_ignore_ascii_case("AUTH") && words.any(|v| v.eq_ignore_ascii_case(name)))
+                || first.split_once('=').is_some_and(|(key, value)| key.eq_ignore_ascii_case("AUTH")
+                    && (value.eq_ignore_ascii_case(name) || words.any(|v| v.eq_ignore_ascii_case(name))))
+        })
+    }
+    async fn authenticate(&mut self, username: &str, credential: Credential) -> std::result::Result<(), String> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use lettre::transport::smtp::commands::Auth;
+        let reply = match credential {
+            Credential::OAuth2AccessToken(token) => {
+                if !self.supports_auth("XOAUTH2") { return Err("Gmail does not advertise XOAUTH2".into()); }
+                let command = Auth::new(Mechanism::Xoauth2, Credentials::new(username.to_owned(), token), None)
+                    .map_err(|_| "Could not construct XOAUTH2 request".to_string())?;
+                let reply = gmail_command(&mut self.stream, command.to_string().as_bytes()).await?;
+                // Gmail sends a 334 JSON error challenge when the token is
+                // rejected. An empty response terminates that SASL exchange.
+                if reply.code == 334 {
+                    gmail_command(&mut self.stream, b"\r\n").await?
+                } else { reply }
+            }
+            Credential::Password(password) => {
+                if self.supports_auth("PLAIN") {
+                    let command = Auth::new(Mechanism::Plain, Credentials::new(username.to_owned(), password), None)
+                        .map_err(|_| "Could not construct PLAIN request".to_string())?;
+                    gmail_command(&mut self.stream, command.to_string().as_bytes()).await?
+                } else if self.supports_auth("LOGIN") {
+                    gmail_expect(gmail_command(&mut self.stream, b"AUTH LOGIN\r\n").await?, &[334], "AUTH LOGIN")?;
+                    let user = format!("{}\r\n", STANDARD.encode(username));
+                    gmail_expect(gmail_command(&mut self.stream, user.as_bytes()).await?, &[334], "AUTH LOGIN username")?;
+                    let secret = format!("{}\r\n", STANDARD.encode(password));
+                    gmail_command(&mut self.stream, secret.as_bytes()).await?
+                } else { return Err("Gmail does not advertise a supported password mechanism".into()); }
+            }
+        };
+        gmail_expect(reply, &[235], "AUTH")?;
+        Ok(())
+    }
+
+    async fn submit(&mut self, envelope: &Envelope, raw: &[u8], dsn: bool) -> std::result::Result<(), String> {
+        use tokio::io::AsyncWriteExt;
+        let mut params = Vec::new();
+        let utf8 = envelope.from().is_some_and(|a| !a.to_string().is_ascii()) || envelope.to().iter().any(|a| !a.to_string().is_ascii());
+        if utf8 {
+            if !self.has_extension("SMTPUTF8") { return Err("Server does not support SMTPUTF8".into()); }
+            params.push(MailParameter::SmtpUtfEight);
+        }
+        if !raw.is_ascii() {
+            if !self.has_extension("8BITMIME") { return Err("Server does not support 8BITMIME".into()); }
+            params.push(MailParameter::Body(MailBodyParameter::EightBitMime));
+        }
+        let mail = Mail::new(envelope.from().cloned(), params).to_string();
+        gmail_expect(gmail_command(&mut self.stream, mail.as_bytes()).await?, &[250], "MAIL FROM")?;
+        let notify = if dsn { vec![RcptParameter::Other {
+            keyword: lookout_core::NOTIFY_PARAMETER.to_string(),
+            value: Some(lookout_core::NOTIFY_SUCCESS_FAILURE.to_string()),
+        }] } else { Vec::new() };
+        for address in envelope.to() {
+            let rcpt = Rcpt::new(address.clone(), notify.clone()).to_string();
+            gmail_expect(gmail_command(&mut self.stream, rcpt.as_bytes()).await?, &[250, 251, 252], "RCPT TO")?;
+        }
+        gmail_expect(gmail_command(&mut self.stream, b"DATA\r\n").await?, &[354], "DATA")?;
+        // Preserve the original MIME bytes, applying SMTP transparency only.
+        // Chunk writes rather than issuing a syscall per line or duplicating
+        // the entire attachment payload in memory.
+        let mut chunk = Vec::with_capacity(32768);
+        let mut line_start = true;
+        for &byte in raw {
+            if line_start && byte == b'.' { chunk.push(b'.'); }
+            chunk.push(byte);
+            line_start = byte == b'\n';
+            if chunk.len() >= 32768 {
+                self.stream.get_mut().write_all(&chunk).await.map_err(|e| format!("SMTP DATA write failed: {e}"))?;
+                chunk.clear();
+            }
+        }
+        if !raw.ends_with(b"\r\n") { chunk.extend_from_slice(b"\r\n"); }
+        chunk.extend_from_slice(b".\r\n");
+        self.stream.get_mut().write_all(&chunk).await.map_err(|e| format!("SMTP DATA write failed: {e}"))?;
+        self.stream.get_mut().flush().await.map_err(|e| format!("SMTP DATA flush failed: {e}"))?;
+        gmail_expect(gmail_read_reply(&mut self.stream).await?, &[250], "final DATA")?;
+        Ok(())
+    }
+
+    async fn quit(&mut self) -> std::result::Result<(), String> {
+        gmail_expect(gmail_command(&mut self.stream, b"QUIT\r\n").await?, &[221], "QUIT")?;
+        Ok(())
     }
 }
 
-impl tokio::io::AsyncWrite for VerifiedSmtpStream {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        tokio::io::AsyncWrite::poll_write(std::pin::Pin::new(&mut self.get_mut().0), cx, buf)
-    }
-
-    fn poll_flush(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
-        tokio::io::AsyncWrite::poll_flush(std::pin::Pin::new(&mut self.get_mut().0), cx)
-    }
-
-    fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
-        tokio::io::AsyncWrite::poll_shutdown(std::pin::Pin::new(&mut self.get_mut().0), cx)
-    }
-}
-
-/// SMTP-over-TLS using the same native-root rustls connector as IMAP.
-/// Both raw rustls probes succeed in the full app while lettre's own TLS
-/// establishment stalls. Keep lettre for the SMTP protocol, but let the
-/// existing Lookout connector establish and verify TLS before SMTP greeting.
-pub(crate) async fn connect_gmail_implicit_tls(host: &str, port: u16, hello: &ClientId) -> std::result::Result<AsyncSmtpConnection, String> {
+async fn gmail_connect_tls(endpoint: &EndpointConfig) -> std::result::Result<GmailSmtp, String> {
     use std::time::Duration;
+    use tokio::io::BufReader;
+    if endpoint.security == Security::Plain { return Err("Gmail SMTP requires TLS".into()); }
+    let host = &endpoint.host;
+    let port = endpoint.port;
+    tracing::info!(%host, port, security = ?endpoint.security, "Gmail SMTP connecting via Tokio");
     let tcp = tokio::time::timeout(Duration::from_secs(12), crate::connection::connect_plain(host, port))
         .await.map_err(|_| "SMTP TCP connect timed out".to_string())?
         .map_err(|e| format!("SMTP TCP connect failed: {e}"))?;
     let peer = tcp.peer_addr().map_err(|e| e.to_string())?;
-    tracing::info!(host, port, %peer, "Gmail SMTP TCP connected; starting Lookout TLS");
+    tracing::info!(%host, port, %peer, "Gmail SMTP TCP connected");
+    let tcp = if endpoint.security == Security::StartTls {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut plain = BufReader::new(tcp);
+            gmail_expect(gmail_read_reply(&mut plain).await?, &[220], "greeting")?;
+            let ehlo = gmail_expect(gmail_command(&mut plain, b"EHLO localhost\r\n").await?, &[250], "EHLO")?;
+            if !ehlo.lines.iter().skip(1).any(|line| line.eq_ignore_ascii_case("STARTTLS")) {
+                return Err("SMTP server does not advertise STARTTLS".to_string());
+            }
+            gmail_expect(gmail_command(&mut plain, b"STARTTLS\r\n").await?, &[220], "STARTTLS")?;
+            if !plain.buffer().is_empty() { return Err("Unexpected buffered plaintext after STARTTLS".into()); }
+            Ok(plain.into_inner())
+        }).await.map_err(|_| "SMTP STARTTLS negotiation timed out".to_string())??
+    } else { tcp };
     let tls = tokio::time::timeout(Duration::from_secs(15), crate::connection::tls_connect_over(tcp, host))
         .await.map_err(|_| "SMTP TLS handshake timed out".to_string())?
         .map_err(|e| format!("SMTP TLS handshake failed: {e}"))?;
-    tracing::info!(host, port, %peer, protocol = ?tls.get_ref().1.protocol_version(), "Gmail SMTP Lookout TLS established");
-    let connection = tokio::time::timeout(Duration::from_secs(15),
-        AsyncSmtpConnection::connect_with_transport(Box::new(VerifiedSmtpStream(tls)), hello))
-        .await.map_err(|_| "SMTP encrypted greeting/EHLO timed out".to_string())?
-        .map_err(|e| format!("SMTP encrypted greeting/EHLO failed: {e}"))?;
-    tracing::info!(host, port, %peer, "Gmail SMTP encrypted greeting/EHLO complete");
-    Ok(connection)
+    tracing::info!(%host, port, %peer, protocol = ?tls.get_ref().1.protocol_version(), "Gmail SMTP Lookout TLS established");
+    let mut stream = BufReader::new(tls);
+    let capabilities = tokio::time::timeout(Duration::from_secs(15), async {
+        if endpoint.security == Security::ImplicitTls {
+            gmail_expect(gmail_read_reply(&mut stream).await?, &[220], "encrypted greeting")?;
+            tracing::info!("Gmail SMTP encrypted greeting received");
+        }
+        let response = gmail_expect(gmail_command(&mut stream, b"EHLO localhost\r\n").await?, &[250], "encrypted EHLO")?;
+        tracing::info!("Gmail SMTP encrypted EHLO accepted");
+        Ok::<_, String>(response.lines)
+    }).await.map_err(|_| "SMTP encrypted greeting/EHLO timed out".to_string())??;
+    Ok(GmailSmtp { stream, capabilities })
 }
 
-/// Establish an encrypted SMTP connection before exposing credentials.
-/// Each route has bounded connect and STARTTLS phases.
-async fn connect_gmail_smtp(endpoint: &EndpointConfig, hello: &ClientId) -> std::result::Result<AsyncSmtpConnection, String> {
-    use std::time::Duration;
-    if endpoint.security == Security::Plain {
-        return Err("Gmail SMTP requires TLS".into());
-    }
-    if endpoint.security == Security::ImplicitTls {
-        tracing::info!(host = %endpoint.host, port = endpoint.port, security = ?endpoint.security, "Gmail SMTP connecting via Lookout TLS");
-        // The returned SMTP connection is already encrypted by construction.
-        // Do not call lettre STARTTLS on it or use its external-stream
-        // is_encrypted() flag, which reports false for all external streams.
-        return connect_gmail_implicit_tls(&endpoint.host, endpoint.port, hello).await;
-    }
-    let tls_parameters = || TlsParameters::new(endpoint.host.clone()).map_err(|e| format!("Invalid SMTP TLS hostname: {e}"));
-    let implicit_tls = (endpoint.security == Security::ImplicitTls).then(tls_parameters).transpose()?;
-    let started = std::time::Instant::now();
-    tracing::info!(host = %endpoint.host, port = endpoint.port, security = ?endpoint.security, "Gmail SMTP connecting");
-    let mut connection = tokio::time::timeout(Duration::from_secs(25), AsyncSmtpConnection::connect_tokio1(
-        (endpoint.host.as_str(), endpoint.port), Some(Duration::from_secs(20)), hello, implicit_tls, None,
-    )).await.map_err(|_| "SMTP connect/TLS/greeting timed out".to_string())?
-        .map_err(|e| format!("SMTP connect/TLS/greeting failed: {e}"))?;
-    tracing::info!(host = %endpoint.host, port = endpoint.port, elapsed_ms = started.elapsed().as_millis(), "Gmail SMTP connected");
-    if endpoint.security == Security::StartTls && !connection.is_encrypted() {
-        if !connection.can_starttls() { return Err("SMTP server does not offer STARTTLS".into()); }
-        tracing::info!("Gmail SMTP STARTTLS starting");
-        tokio::time::timeout(Duration::from_secs(15), connection.starttls(tls_parameters()?, hello))
-            .await.map_err(|_| "SMTP STARTTLS timed out".to_string())?
-            .map_err(|e| format!("SMTP STARTTLS failed: {e}"))?;
-        tracing::info!("Gmail SMTP STARTTLS complete");
-    }
-    if !connection.is_encrypted() {
-        return Err("Gmail SMTP connection is not encrypted".into());
-    }
-    Ok(connection)
+async fn connect_gmail_smtp(endpoint: &EndpointConfig) -> std::result::Result<GmailSmtp, String> {
+    gmail_connect_tls(endpoint).await
+}
+
+/// Credential-free production-path probe, no AUTH or submission.
+pub(crate) async fn probe_gmail_smtp(host: &str, port: u16, security: Security) -> std::result::Result<(), String> {
+    let endpoint = EndpointConfig { host: host.to_owned(), port, security, username: String::new() };
+    let mut connection = connect_gmail_smtp(&endpoint).await?;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), connection.quit()).await;
+    Ok(())
 }
 
 /// Verify SMTP authentication without transmitting a message.
@@ -1522,16 +1618,18 @@ mod tests {
             commands
         });
         let result = tokio::time::timeout(Duration::from_secs(10), async {
-            let mut connection = connect_gmail_implicit_tls("127.0.0.1", port, &ClientId::default()).await.unwrap();
-            connection.auth(&[Mechanism::Xoauth2], &Credentials::new("test@example.com".into(), "fake-token".into())).await.unwrap();
+            let endpoint = EndpointConfig { host: "127.0.0.1".into(), port, security: Security::ImplicitTls, username: "test@example.com".into() };
+            let mut connection = connect_gmail_smtp(&endpoint).await.unwrap();
+            connection.authenticate(&endpoint.username, Credential::OAuth2AccessToken("fake-token".into())).await.unwrap();
             let envelope = Envelope::new(Some("test@example.com".parse().unwrap()), vec!["recipient@example.com".parse().unwrap()]).unwrap();
-            submit_dsn(&mut connection, &envelope, b"Subject: test\r\n\r\nbody\r\n", true).await.unwrap();
+            connection.submit(&envelope, b"Subject: test\r\n\r\nbody\r\n.dot\r\n", true).await.unwrap();
             connection.quit().await.unwrap();
             server.await.unwrap()
         }).await.expect("SMTP over existing TLS completes");
         assert!(result.iter().any(|line| line.starts_with("AUTH XOAUTH2 ")));
         assert!(result.iter().any(|line| line.starts_with("RCPT TO:") && line.contains("NOTIFY=SUCCESS,FAILURE")));
         assert!(result.iter().any(|line| line == "body"));
+        assert!(result.iter().any(|line| line == "..dot"));
         assert!(result.iter().any(|line| line == "QUIT"));
     }
 
