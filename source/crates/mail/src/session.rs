@@ -177,6 +177,13 @@ fn envelope_fetch_items(davmail_compat: bool) -> &'static str {
 /// sizes and part structures to warm bodies - no summary is built, so neither
 /// the envelope nor the header block is requested.
 const STRUCTURE_ONLY_FETCH_ITEMS: &str = "(UID RFC822.SIZE BODYSTRUCTURE)";
+const PREFETCH_UID_SIZE_ITEMS: &str = "(UID RFC822.SIZE)";
+
+fn prefetch_scan_items(index_envelopes: bool, lean_scan: bool) -> &'static str {
+    if index_envelopes { ENVELOPE_FETCH_ITEMS }
+    else if lean_scan { PREFETCH_UID_SIZE_ITEMS }
+    else { STRUCTURE_ONLY_FETCH_ITEMS }
+}
 
 /// How many times the outbox retries a message the SMTP server rejects before
 /// giving up and leaving the row `failed` for the user to act on (item 1.14),
@@ -5880,7 +5887,12 @@ async fn connect_and_run(
                     // `RFC822.SIZE` rides along so the oversized-message
                     // filter below has a size to compare against; indexing
                     // adds the items `summary_from_fetch` builds a summary from.
-                    let items = if index_envelopes { ENVELOPE_FETCH_ITEMS } else { STRUCTURE_ONLY_FETCH_ITEMS };
+                    // Yandex warm folders need no MIME structures for bodies
+                    // already on disk. Enumerate the same newest-N window, then
+                    // request structures only for eligible cache misses.
+                    let lean_scan = reuse_prefetch && *prefetch_policy == PrefetchPolicy::default()
+                        && indexed == Some(true);
+                    let items = prefetch_scan_items(index_envelopes, lean_scan);
                     let fetches: Vec<_> = match session.fetch(&seq_range, items).await {
                         Ok(stream) => match stream.try_collect().await {
                             Ok(fetches) => {
@@ -5924,6 +5936,8 @@ async fn connect_and_run(
                     // Collect UIDs, newest first.
                     let mut uids: Vec<Uid> = fetches.iter().filter_map(|f| f.uid.map(Uid)).collect();
                     uids.sort_by_key(|u| std::cmp::Reverse(u.0));
+                    uids.dedup();
+                    let scanned = uids.len();
 
                     // Filter out already-cached bodies. One query for the whole
                     // envelope batch rather than a SELECT per UID - on a first
@@ -5935,9 +5949,11 @@ async fn connect_and_run(
                         move |c| c.has_bodies(&mailbox, &uids, uidvalidity)
                     })
                     .await
-                    .and_then(|r| r.ok())
-                    .unwrap_or_default();
+                    .and_then(|r| r.ok());
+                    if have.is_none() { pf.reusable_completion = false; }
+                    let have = have.unwrap_or_default();
                     uids.retain(|uid| !have.contains(uid));
+                    let cached_bodies = scanned - uids.len();
 
                     // Skip oversized messages (`RFC822.SIZE` rides free with
                     // the envelope fetch): one giant message must never hold
@@ -5954,7 +5970,26 @@ async fn connect_and_run(
                     // per-folder limit's worth) so its body fetch skips
                     // attachments entirely.
                     pf.structures.clear();
-                    for fetch in &fetches {
+                    // Bound the extra structure request to the normal prefetch
+                    // window. UID FETCH avoids sequence-number races after
+                    // expunges between enumeration and structure retrieval.
+                    let structure_fetches: Vec<Fetch> = if lean_scan {
+                        let mut rows = Vec::new();
+                        for set in uid_set_chunks(&uids) {
+                            let result: Result<Vec<Fetch>> = async {
+                                Ok(session.uid_fetch(&set, "(UID BODYSTRUCTURE)").await?.try_collect().await?)
+                            }.await;
+                            match result {
+                                Ok(batch) => rows.extend(batch),
+                                Err(e) => return Err(note_prefetch_failure(prefetch_failures, &mailbox_id, e)),
+                            }
+                        }
+                        rows
+                    } else {
+                        Vec::new()
+                    };
+                    let structure_rows = if lean_scan { &structure_fetches } else { &fetches };
+                    for fetch in structure_rows {
                         let (Some(uid), Some(structure)) = (fetch.uid.map(Uid), fetch.bodystructure()) else {
                             continue;
                         };
@@ -5963,10 +5998,16 @@ async fn connect_and_run(
                         }
                     }
 
+                    if lean_scan {
+                        tracing::debug!(mailbox = %mailbox_id, scanned, cached_bodies,
+                            structure_requested = uids.len(), structure_received = structure_fetches.len(),
+                            scan_ms = envelope_fetch_elapsed_ms, elapsed_ms = started.elapsed().as_millis(),
+                            "prefetch: warm folder UID scan");
+                    }
                     tracing::debug!(
                         mailbox = %pf.mailboxes[pf.current],
                         total = uids.len(),
-                        elapsed_ms = envelope_fetch_elapsed_ms,
+                        elapsed_ms = started.elapsed().as_millis(),
                         "prefetch: queued UIDs for body download"
                     );
                     pf.pending_uids = uids;
@@ -11127,6 +11168,14 @@ mod tests {
         assert!(pf.current_folder_name.is_empty());
         assert_eq!(pf.forget_tree(&id("A"), '/'), None, "an already-finished folder has nothing to announce");
         assert_eq!(pf.mailboxes[pf.current], id("Work2"));
+    }
+
+    #[test]
+    fn yandex_warm_prefetch_scans_without_mime_structures() {
+        assert_eq!(prefetch_scan_items(false, true), "(UID RFC822.SIZE)");
+        assert_eq!(prefetch_scan_items(false, false), STRUCTURE_ONLY_FETCH_ITEMS);
+        assert_eq!(prefetch_scan_items(true, true), ENVELOPE_FETCH_ITEMS);
+        assert_eq!(prefetch_scan_items(true, false), ENVELOPE_FETCH_ITEMS);
     }
 
     #[test]
