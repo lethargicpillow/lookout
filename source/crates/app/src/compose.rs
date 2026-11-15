@@ -3327,8 +3327,11 @@ pub fn build_compose_view(
     let from_line = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
     address_labels.add_widget(&from_dropdown);
     from_line.append(&from_dropdown);
-    from_line.append(&from_value);
-    from_line.append(&identity_hint_icon);
+    let from_surface = gtk::Box::builder().orientation(gtk::Orientation::Horizontal)
+        .spacing(6).hexpand(true).css_classes(["compose-from-surface"]).build();
+    from_surface.append(&from_value);
+    from_surface.append(&identity_hint_icon);
+    from_line.append(&from_surface);
     from_line.set_hexpand(true);
     from_dropdown.set_hexpand(false);
     from_dropdown.add_css_class("compose-from-select");
@@ -3575,18 +3578,18 @@ pub fn build_compose_view(
                     from_dropdown.set_sensitive(true);
                     return;
                 };
-                if autosave.pending.get() && !autosave.wait_for_save().await {
-                    autosave.status_label.set_label("Draft not confirmed — message not queued");
-                    sending.set(false);
-                    send_button_for_dialog.set_sensitive(true);
-                    from_dropdown.set_sensitive(true);
-                    return;
-                }
-                let switching_draft = autosave.draft_queued.get() && autosave.draft_owner.borrow().as_ref() != Some(&account);
+                tracing::info!(account = %account, scheduled = schedule.is_some(), "compose send: preparing");
+                // Same-account Send follows any queued SaveDraft on the
+                // account channel. It must not wait for a server APPEND
+                // acknowledgement: the outbox already owns the full MIME
+                // and only removes the draft after SMTP succeeds.
+                let switching_draft = autosave.draft_owner.borrow().as_ref().is_some_and(|id| id != &account)
+                    || autosave.pending_owner.borrow().as_ref().is_some_and(|id| id != &account);
                 if schedule.is_some() || switching_draft {
                     if autosave.pending.get() { let _ = autosave.wait_for_save().await; }
                     let queued = !autosave.pending.get() && autosave.flush(true).await;
                     if !queued || !autosave.wait_for_save().await {
+                        tracing::warn!(account = %account, "compose send: required draft transfer/save not confirmed");
                         autosave.status_label.set_label("Draft not confirmed — message not queued");
                         sending.set(false);
                         send_button_for_dialog.set_sensitive(true);
@@ -3727,7 +3730,7 @@ pub fn build_compose_view(
                     from_dropdown.set_sensitive(true);
                     return;
                 }
-                tracing::debug!("compose send: command accepted; closing editor");
+                tracing::info!(account = %account, "compose send: command accepted; closing editor");
                 closed.set(true);
                 on_done();
                 tracing::debug!("compose send: editor closed");

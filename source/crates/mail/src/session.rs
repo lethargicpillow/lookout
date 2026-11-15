@@ -67,6 +67,11 @@ const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Poll servers without the optional IMAP IDLE extension.
 const NO_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(30);
+const GMAIL_INBOX_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+
+fn gmail_inbox_watch(host: &str) -> bool {
+    host.trim_end_matches('.').eq_ignore_ascii_case("imap.gmail.com")
+}
 
 /// How many folder-count STATUS calls the drain runs between `FoldersUpdated`
 /// emits. The drain itself yields to the command queue before *every* round
@@ -1344,7 +1349,7 @@ async fn queue_outbox_message(
     .await;
     match queued {
         Some(Ok(id)) => {
-            tracing::debug!(id, "send pipeline: outbox persisted");
+            tracing::info!(account = %account_id, id, "send pipeline: outbox persisted");
             let _ = events
                 .send(AccountEvent::OutboxQueued {
                     id,
@@ -2310,7 +2315,9 @@ async fn connect_and_run(
     let mut server_snooze_wake: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut local_snooze_wake: Option<chrono::DateTime<chrono::Utc>> = cache_op(cache, |c| c.next_snooze_wake()).await.and_then(|r| r.ok()).flatten();
     let mut next_scheduled_scan = chrono::Utc::now();
-    let mut next_poll = tokio::time::Instant::now() + NO_IDLE_POLL_INTERVAL;
+    let watch_gmail_inbox = gmail_inbox_watch(&config.imap.host);
+    let poll_interval = if watch_gmail_inbox && use_idle { GMAIL_INBOX_RECONCILE_INTERVAL } else { NO_IDLE_POLL_INTERVAL };
+    let mut next_poll = tokio::time::Instant::now() + poll_interval;
 
     loop {
         // Work Offline (M-40): checked before the outbox drain so a toggle
@@ -2351,14 +2358,14 @@ async fn connect_and_run(
                     cache_op(cache, move |c| c.delete_outbox(id)).await;
                     continue;
                 };
-                tracing::debug!(id, bytes = raw.len(), attempts, "send pipeline: SMTP starting");
+                tracing::info!(account = %account_id, host = %config.smtp.host, id, bytes = raw.len(), attempts, "send pipeline: SMTP starting");
                 let sent = match credentials.smtp_credential().await {
                     Ok(cred) => send_smtp(&config.smtp, cred, &message.from, &message.recipients, &raw, message.request_delivery_receipt).await,
                     Err(e) => Err(Error::LoginFailed(e)),
                 };
                 match sent {
                     Ok(()) => {
-                        tracing::debug!(id, "send pipeline: SMTP accepted");
+                        tracing::info!(account = %account_id, id, "send pipeline: SMTP accepted");
                         // The transport accepted the message, so the row has
                         // done its job: delete it *before* the archive and
                         // draft round trips. A crash, quit or lost network in
@@ -2640,7 +2647,9 @@ async fn connect_and_run(
                         Ok(cmd) => Wake::Command(cmd),
                         Err(async_channel::TryRecvError::Closed) => return Ok(ShutdownReason::Requested),
                         Err(async_channel::TryRecvError::Empty) => {
-                            if !use_idle {
+                            if watch_gmail_inbox && tokio::time::Instant::now() >= next_poll {
+                                Wake::Poll
+                            } else if !use_idle {
                                 // No IDLE/DONE on this connection. Keep the socket open,
                                 // wake immediately for interactive work, and poll on a
                                 // monotonic deadline that commands cannot reset.
@@ -2766,6 +2775,9 @@ async fn connect_and_run(
                                         .map(|_| next_scheduled_scan);
                                     let next_due = earliest([next_outbox_due, local_snooze_wake, server_snooze_wake, scan_due]);
                                     let slice = cap_slice_for_outbox(slice, next_due, chrono::Utc::now());
+                                    let slice = if watch_gmail_inbox {
+                                        slice.min(next_poll.saturating_duration_since(tokio::time::Instant::now()))
+                                    } else { slice };
                                     let (wait_fut, stop_source) = handle.wait_with_timeout(slice);
 
                                     // Race the IDLE wait against the next command so an on-demand
@@ -2836,8 +2848,22 @@ async fn connect_and_run(
                                     }
 
                                     drop(stop_source);
-                                    session = handle.done().await?;
-                                    wake
+                                    session = match handle.done().await {
+                                        Ok(session) => session,
+                                        Err(error) => {
+                                            // The select already consumed this command.
+                                            // Preserve it on the account-lifetime queue so
+                                            // a broken IDLE teardown cannot swallow Send.
+                                            if let Wake::Command(command) = wake {
+                                                deferred_interactive.push_front(command);
+                                            }
+                                            return Err(Error::Imap(error));
+                                        }
+                                    };
+                                    if watch_gmail_inbox && matches!(&wake, Wake::Idle(Ok(async_imap::extensions::idle::IdleResponse::Timeout)))
+                                        && tokio::time::Instant::now() >= next_poll {
+                                        Wake::Poll
+                                    } else { wake }
                                 }
                             }
                             }
@@ -2896,13 +2922,19 @@ async fn connect_and_run(
                 sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache, &mut folders, interactive_commands, deferred_interactive, None, condstore, qresync, local_focus, davmail_compat).await?;
                 dirty_mailboxes.remove(&current_mailbox_id);
                 session_selected = current_mailbox_id.clone();
-                next_poll = tokio::time::Instant::now() + NO_IDLE_POLL_INTERVAL;
+                next_poll = tokio::time::Instant::now() + poll_interval;
                 if !imap_idle_allowed(&config.imap.host) {
                     tracing::info!(account = %account_id, host = %config.imap.host,
                         elapsed_ms = poll_started.elapsed().as_millis(), "IMAP compatibility poll complete");
                 }
             }
             Wake::Idle(Err(e)) => return Err(Error::Imap(e)),
+            Wake::IdlePush(mailbox_id) if watch_gmail_inbox && mailbox_id == inbox_id && current_mailbox_id != inbox_id => {
+                tracing::info!(account = %account_id, "Gmail Inbox push: refreshing in background");
+                sync_mailbox(&mut session, &account_id, "INBOX", &inbox_id, events, cache, &mut folders, interactive_commands, deferred_interactive, None, condstore, qresync, local_focus, davmail_compat).await?;
+                dirty_mailboxes.remove(&inbox_id);
+                session_selected = inbox_id.clone();
+            }
             Wake::IdlePush(mailbox_id) => match idle_push_outcome(&mailbox_id, &current_mailbox_id) {
                 PushOutcome::ResyncNow => {
                     tracing::debug!(mailbox = %mailbox_id, "idle-push: resyncing currently-open mailbox");
@@ -3039,7 +3071,7 @@ async fn connect_and_run(
                         // `send_replace` never blocks and simply overwrites
                         // the previous value; only the latest folder switch
                         // matters.
-                        mailbox_tx.send_replace(current_mailbox_id.clone());
+                        if !watch_gmail_inbox { mailbox_tx.send_replace(current_mailbox_id.clone()); }
                         // If the cache already has envelope summaries for this
                         // mailbox, emit them and skip the full IMAP sync to
                         // avoid blocking the session for seconds on a network
@@ -3437,6 +3469,7 @@ async fn connect_and_run(
                     // same path backs undo send, schedule send and the offline
                     // outbox (items 1.13/1.14). The raw message is built once,
                     // here.
+                    tracing::info!(account = %account_id, "send pipeline: SendMessage received");
                     if let Some(due) = queue_outbox_message(cache, events, &account_id, &msg, not_before, client_token).await {
                         next_outbox_due = Some(next_outbox_due.map_or(due, |next| next.min(due)));
                     }
@@ -4383,7 +4416,7 @@ async fn connect_and_run(
                             }
                             if current_mailbox_id != current_before {
                                 current_mailbox_name = crate::mailbox_name::mailbox_path(&account_id, &current_mailbox_id).unwrap_or("INBOX").to_string();
-                                mailbox_tx.send_replace(current_mailbox_id.clone());
+                                if !watch_gmail_inbox { mailbox_tx.send_replace(current_mailbox_id.clone()); }
                             }
                             if let Some(finished) = prefetch.as_mut().and_then(|pf| pf.forget_tree(&root, delimiter)) {
                                 let _ = events.send(AccountEvent::PrefetchFinished { mailbox: finished }).await;
@@ -5897,7 +5930,7 @@ async fn run_idle_supervisor(
                 return;
             }
             Err(e) => {
-                tracing::debug!(account = %config.account_id, error = %e, consecutive_failures, "dedicated IDLE connection error, will retry");
+                tracing::warn!(account = %config.account_id, error = %e, consecutive_failures, "dedicated IDLE connection error, will retry");
             }
         }
         consecutive_failures += 1;
@@ -5937,6 +5970,10 @@ async fn run_idle_connection(
     };
     if !caps.has_idle {
         return Ok(IdleConnectionOutcome::NoIdleCapability);
+    }
+
+    if gmail_inbox_watch(&config.imap.host) {
+        tracing::info!(account = %config.account_id, "Gmail dedicated IDLE watching Inbox");
     }
 
     let prefix = format!("{}:", config.account_id.0);
@@ -10812,6 +10849,15 @@ mod tests {
         assert_eq!(next_idle_probe_delay(5), Duration::from_secs(30 * 60));
         assert_eq!(next_idle_probe_delay(6), Duration::from_secs(30 * 60));
         assert_eq!(next_idle_probe_delay(1000), Duration::from_secs(30 * 60));
+    }
+
+    #[test]
+    fn gmail_inbox_watch_is_provider_specific() {
+        assert!(gmail_inbox_watch("imap.gmail.com"));
+        assert!(gmail_inbox_watch("IMAP.GMAIL.COM."));
+        assert!(!gmail_inbox_watch("imap.yandex.com"));
+        assert!(!gmail_inbox_watch("127.0.0.1"));
+        assert!(!gmail_inbox_watch("imap.gmail.com.example.org"));
     }
 
     #[test]
