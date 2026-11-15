@@ -411,8 +411,10 @@ impl AppConfig {
             .unwrap_or(if default_name.trim().is_empty() { email } else { default_name }).to_owned()
     }
 
-    pub fn sender_name(&self, id: &AccountId, default_name: &str) -> String {
-        self.mail_account_names.get(id).map(|n| n.sender_name.clone()).unwrap_or_else(|| default_name.to_owned())
+    /// An unconfigured primary sender has no display name. Local account
+    /// labels are never implicit outgoing names, including for legacy accounts.
+    pub fn sender_name(&self, id: &AccountId) -> String {
+        self.mail_account_names.get(id).map(|n| n.sender_name.clone()).unwrap_or_default()
     }
 
     pub fn set_mail_account_names(&mut self, id: &AccountId, account_name: String, sender_name: String) {
@@ -433,16 +435,16 @@ impl AppConfig {
 
     /// Every identity the composer can send as for one account: the
     /// persisted identities plus - always first - the account's own default
-    /// identity (its GOA name/address). Persisted identities whose email
+    /// identity (its address and explicitly configured sender name). Persisted identities whose email
     /// duplicates the account's own are dropped so the default never
     /// appears twice.
-    pub fn identities_for_account(&self, account_id: &AccountId, default_name: &str, default_email: &str) -> Vec<Identity> {
+    pub fn identities_for_account(&self, account_id: &AccountId, _default_name: &str, default_email: &str) -> Vec<Identity> {
         let mut identities: Vec<Identity> = self
             .identities_for(account_id)
             .into_iter()
             .filter(|i| !i.email.eq_ignore_ascii_case(default_email))
             .collect();
-        identities.insert(0, Identity::new(account_id.clone(), self.sender_name(account_id, default_name), default_email));
+        identities.insert(0, Identity::new(account_id.clone(), self.sender_name(account_id), default_email));
         identities
     }
 
@@ -477,7 +479,7 @@ impl AppConfig {
             if previous.display_name != account.display_name {
                 self.mail_account_names.insert(AccountId(account.id.clone()), MailAccountNames {
                     account_name: account.display_name.clone(),
-                    sender_name: previous.display_name.clone(),
+                    sender_name: String::new(),
                 });
             }
         }
@@ -1003,7 +1005,7 @@ mod tests {
     fn account_names_are_independent_and_persisted() {
         let id = AccountId("other:test".into());
         let mut config = AppConfig::default();
-        assert_eq!(config.sender_name(&id, "Legacy"), "Legacy");
+        assert!(config.sender_name(&id).is_empty());
         config.set_mail_account_names(&id, "Work".into(), "Ada Lovelace".into());
         assert_eq!(config.account_name(&id, "Legacy", "ada@example.com"), "Work");
         assert_eq!(config.identities_for_account(&id, "Legacy", "ada@example.com")[0].name, "Ada Lovelace");
@@ -1038,7 +1040,7 @@ mod tests {
         assert_eq!(identities.len(), 2);
         // The synthesized default always comes first.
         assert_eq!(identities[0].email, "me@example.com");
-        assert_eq!(identities[0].name, "My Name");
+        assert!(identities[0].name.is_empty());
         assert_eq!(identities[1].email, "work@example.com");
 
         // Other accounts' identities are never mixed in.
@@ -1136,6 +1138,12 @@ mod tests {
         config.upsert_other_account(edited.clone());
         assert_eq!(config.other_accounts.len(), 1);
         assert_eq!(config.other_account(&account.id), Some(edited));
+        assert!(config.sender_name(&AccountId(account.id.clone())).is_empty());
+        config.set_mail_account_names(&AccountId(account.id.clone()), "Renamed".into(), "Ada Lovelace".into());
+        let mut renamed = config.other_account(&account.id).unwrap();
+        renamed.display_name = "Local label".into();
+        config.upsert_other_account(renamed);
+        assert_eq!(config.sender_name(&AccountId(account.id.clone())), "Ada Lovelace");
         assert_eq!(config.other_account("other:nope"), None);
 
         // Removing a manual account must not leave an orphan GAL row.

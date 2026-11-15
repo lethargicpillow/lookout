@@ -41,7 +41,7 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, app_config: Rc<RefCell<AppConfig
 
     let (account_name, sender_name) = {
         let config = app_config.borrow();
-        (config.account_name(&account_id, default_name, email), config.sender_name(&account_id, default_name))
+        (config.account_name(&account_id, default_name, email), config.sender_name(&account_id))
     };
     let names = adw::PreferencesGroup::builder().title("Primary account").build();
     let account_entry = adw::EntryRow::builder().title("Account name").text(&account_name).build();
@@ -54,7 +54,7 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, app_config: Rc<RefCell<AppConfig
         .subtitle(glib::markup_escape_text(email)).build();
     crate::privacy::mark_row(&email_row);
     names.add(&email_row);
-    let note = gtk::Label::builder().label("Account name is used only in Lookout. Sender display name appears in outgoing messages. Leave it empty to send without a display name.")
+    let note = gtk::Label::builder().label("Account name is used only in Lookout. Sender display name appears in outgoing messages. Leave it empty to send without a client-supplied display name. Your mail server may supply its own name (for example, Exchange).")
         .wrap(true).xalign(0.0).css_classes(["dim-label"]).build();
     let save_names = gtk::Button::with_label("Save names");
     save_names.add_css_class("suggested-action");
