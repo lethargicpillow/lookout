@@ -70,6 +70,36 @@ const NO_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 // Yandex frequently closes otherwise healthy connections. Avoid rescanning
 // recently completed background folders on every transport reconnect.
 const YANDEX_PREFETCH_REUSE: Duration = Duration::from_secs(10 * 60);
+const PREFETCH_BODY_RETRY_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+
+// Account-local, background-only cooldowns. A UID is meaningful only within
+// its mailbox and UIDVALIDITY; a recreated folder must not inherit a denial.
+#[derive(Default)]
+struct PrefetchBodyRetries {
+    until: HashMap<(MailboxId, u32, Uid), std::time::Instant>,
+}
+
+impl PrefetchBodyRetries {
+    fn defer(&mut self, mailbox: &MailboxId, validity: UidValidity, uid: Uid, now: std::time::Instant) {
+        self.until.insert((mailbox.clone(), validity.0, uid), now + PREFETCH_BODY_RETRY_COOLDOWN);
+    }
+
+    fn filter(&mut self, mailbox: &MailboxId, validity: UidValidity, uids: &mut Vec<Uid>, now: std::time::Instant) -> usize {
+        self.until.retain(|(id, v, _), until| *until > now && (id != mailbox || *v == validity.0));
+        let before = uids.len();
+        uids.retain(|uid| !self.until.contains_key(&(mailbox.clone(), validity.0, *uid)));
+        before - uids.len()
+    }
+
+    fn forget_tree(&mut self, root: &MailboxId, delimiter: char) {
+        self.until.retain(|(id, _, _), _| !crate::mailbox_name::is_same_or_descendant(id, root, delimiter));
+    }
+}
+
+fn is_body_unavailable(error: &Error) -> bool {
+    matches!(error, Error::Imap(async_imap::error::Error::No(reason))
+        if reason.to_ascii_uppercase().contains("[UNAVAILABLE]"))
+}
 const GMAIL_INBOX_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 
 fn gmail_inbox_watch(host: &str) -> bool {
@@ -1727,6 +1757,7 @@ pub async fn run_account_session(
     // forever (see `PREFETCH_FAILURE_LIMIT`).
     let mut prefetch_failures: HashMap<MailboxId, u32> = HashMap::new();
     let mut recent_prefetch: HashMap<MailboxId, std::time::Instant> = HashMap::new();
+    let mut prefetch_body_retries = PrefetchBodyRetries::default();
     // The local Focused Inbox opt-in and contacts (M-03 / item 2.12). Lives
     // outside `connect_and_run` so a `ConfigureLocalFocus` command sent while
     // disconnected survives the reconnect, and the next connection's first
@@ -1842,6 +1873,7 @@ pub async fn run_account_session(
             &mut ready_since,
             &mut prefetch_failures,
             &mut recent_prefetch,
+            &mut prefetch_body_retries,
             &mut local_focus,
             &mut prefetch_policy,
             &mut offline_rx,
@@ -2173,6 +2205,7 @@ async fn connect_and_run(
     ready_since: &mut Option<std::time::Instant>,
     prefetch_failures: &mut HashMap<MailboxId, u32>,
     recent_prefetch: &mut HashMap<MailboxId, std::time::Instant>,
+    prefetch_body_retries: &mut PrefetchBodyRetries,
     local_focus: &mut LocalFocusSettings,
     prefetch_policy: &mut PrefetchPolicy,
     offline_rx: &mut tokio::sync::watch::Receiver<bool>,
@@ -4622,6 +4655,7 @@ async fn connect_and_run(
                                 if !watch_gmail_inbox { mailbox_tx.send_replace(current_mailbox_id.clone()); }
                             }
                             recent_prefetch.retain(|id, _| !crate::mailbox_name::is_same_or_descendant(id, &root, delimiter));
+                            prefetch_body_retries.forget_tree(&root, delimiter);
                             if let Some(finished) = prefetch.as_mut().and_then(|pf| pf.forget_tree(&root, delimiter)) {
                                 let _ = events.send(AccountEvent::PrefetchFinished { mailbox: finished }).await;
                             }
@@ -5971,6 +6005,17 @@ async fn connect_and_run(
                         tracing::debug!(mailbox = %pf.mailboxes[pf.current], oversized = skipped - uids.len(), "prefetch: skipped oversized bodies");
                     }
 
+                    // Defer only background attempts after a tagged UNAVAILABLE
+                    // on the full MIME fetch. Keep the folder eligible for later
+                    // passes: deferred bodies are not successful cache entries.
+                    if reuse_prefetch {
+                        let deferred = prefetch_body_retries.filter(&mailbox_id, pf.uidvalidity, &mut uids, std::time::Instant::now());
+                        if deferred > 0 {
+                            pf.reusable_completion = false;
+                            tracing::debug!(mailbox = %mailbox_id, deferred, "prefetch: deferred unavailable bodies");
+                        }
+                    }
+
                     // Remember each still-wanted uid's part structure (only the
                     // per-folder limit's worth) so its body fetch skips
                     // attachments entirely.
@@ -6072,7 +6117,8 @@ async fn connect_and_run(
                     tracing::debug!(mailbox = %pf.mailboxes[pf.current], uids = ?batch,
                         "prefetch: requesting body batch");
                     let started = std::time::Instant::now();
-                    let fetched = match fetch_bodies_batch(cache, &mut session, &pf.mailboxes[pf.current], pf.uidvalidity, &batch, &pf.structures).await {
+                    let mut unavailable = Vec::new();
+                    let fetched = match fetch_bodies_batch_with_unavailable(cache, &mut session, &pf.mailboxes[pf.current], pf.uidvalidity, &batch, &pf.structures, &mut unavailable).await {
                         Ok(bodies) => bodies.len(),
                         Err(e) => {
                             if reuse_prefetch {
@@ -6084,6 +6130,16 @@ async fn connect_and_run(
                             0
                         }
                     };
+                    if reuse_prefetch && !unavailable.is_empty() {
+                        let mailbox = &pf.mailboxes[pf.current];
+                        let now = std::time::Instant::now();
+                        for uid in unavailable {
+                            prefetch_body_retries.defer(mailbox, pf.uidvalidity, uid, now);
+                            tracing::debug!(mailbox = %mailbox, uid = uid.0, retry_secs = PREFETCH_BODY_RETRY_COOLDOWN.as_secs(),
+                                "prefetch: unavailable body retry deferred");
+                        }
+                        pf.reusable_completion = false;
+                    }
                     // Only reuse a completed folder when its requested bodies
                     // are actually persisted (including bodies already cached).
                     if reuse_prefetch && pf.reusable_completion && *prefetch_policy == PrefetchPolicy::default() {
@@ -9604,6 +9660,19 @@ async fn fetch_bodies_batch(
     batch: &[Uid],
     structures: &HashMap<Uid, Vec<BodyPart>>,
 ) -> Result<Vec<(Uid, EmailBody)>> {
+    let mut unavailable = Vec::new();
+    fetch_bodies_batch_with_unavailable(cache, session, mailbox, uidvalidity, batch, structures, &mut unavailable).await
+}
+
+async fn fetch_bodies_batch_with_unavailable(
+    cache: &CacheHandle,
+    session: &mut Session<SessionStream>,
+    mailbox: &MailboxId,
+    uidvalidity: UidValidity,
+    batch: &[Uid],
+    structures: &HashMap<Uid, Vec<BodyPart>>,
+    unavailable: &mut Vec<Uid>,
+) -> Result<Vec<(Uid, EmailBody)>> {
     if batch.is_empty() {
         return Ok(Vec::new());
     }
@@ -9687,7 +9756,10 @@ async fn fetch_bodies_batch(
                 }
             }
             Ok(None) => {}
-            Err(e) => tracing::warn!(?uid, "prefetch: whole-message fallback failed: {e}"),
+            Err(e) => {
+                if is_body_unavailable(&e) { unavailable.push(*uid); }
+                tracing::warn!(?uid, "prefetch: whole-message fallback failed: {e}");
+            }
         }
     }
 
@@ -11226,6 +11298,32 @@ mod tests {
         assert_eq!(prefetch_scan_items(false, false), STRUCTURE_ONLY_FETCH_ITEMS);
         assert_eq!(prefetch_scan_items(true, true), ENVELOPE_FETCH_ITEMS);
         assert_eq!(prefetch_scan_items(true, false), ENVELOPE_FETCH_ITEMS);
+    }
+
+    #[test]
+    fn prefetch_body_cooldown_is_scoped_and_expires() {
+        let sent = MailboxId("sent".into());
+        let inbox = MailboxId("inbox".into());
+        let now = std::time::Instant::now();
+        let mut retries = PrefetchBodyRetries::default();
+        retries.defer(&sent, UidValidity(12), Uid(265), now);
+        let mut uids = vec![Uid(265), Uid(266)];
+        assert_eq!(retries.filter(&sent, UidValidity(12), &mut uids, now), 1);
+        assert_eq!(uids, vec![Uid(266)]);
+        let mut other = vec![Uid(265)];
+        assert_eq!(retries.filter(&inbox, UidValidity(12), &mut other, now), 0);
+        let mut expired = vec![Uid(265)];
+        assert_eq!(retries.filter(&sent, UidValidity(12), &mut expired, now + PREFETCH_BODY_RETRY_COOLDOWN), 0);
+        retries.defer(&sent, UidValidity(12), Uid(265), now);
+        assert_eq!(retries.filter(&sent, UidValidity(13), &mut expired, now), 0);
+        assert!(retries.until.is_empty());
+    }
+
+    #[test]
+    fn only_tagged_unavailable_defers_background_body() {
+        assert!(is_body_unavailable(&Error::Imap(async_imap::error::Error::No("[UNAVAILABLE] UID FETCH Completed".into()))));
+        assert!(!is_body_unavailable(&Error::Imap(async_imap::error::Error::No("[NONEXISTENT] mailbox missing".into()))));
+        assert!(!is_body_unavailable(&Error::Imap(async_imap::error::Error::Bad("[UNAVAILABLE] malformed command".into()))));
     }
 
     #[test]
