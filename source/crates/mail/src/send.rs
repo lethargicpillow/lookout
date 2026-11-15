@@ -921,8 +921,13 @@ async fn send_smtp_with_delivery_receipt(endpoint: &EndpointConfig, credential: 
 /// answer it (its `Extension` enum doesn't model DSN).
 fn ehlo_advertises_dsn<'a>(lines: impl Iterator<Item = &'a str>) -> bool {
     lines
-        .into_iter()
-        .any(|line| line.split(|c: char| !c.is_ascii_alphanumeric()).any(|token| token.eq_ignore_ascii_case("dsn")))
+        // The first EHLO line is the server greeting, not an extension.
+        .skip(1)
+        .any(|line| {
+            line.split_ascii_whitespace()
+                .next()
+                .is_some_and(|keyword| keyword.eq_ignore_ascii_case("DSN"))
+        })
 }
 
 /// The DSN-aware `MAIL FROM`/`RCPT TO`/`DATA` sequence. Returns a plain
@@ -1459,8 +1464,12 @@ mod tests {
     fn ehlo_capability_scan_finds_the_dsn_keyword() {
         assert!(ehlo_advertises_dsn(["mx.example.test Hello", "SIZE 35882577", "DSN", "STARTTLS"].into_iter()));
         assert!(ehlo_advertises_dsn(["mx.example.test Hello", "dsn"].into_iter()));
-        // Not a substring hit: `DSN` must be its own token.
+        // Only the extension keyword counts, not substrings, parameters or the greeting.
         assert!(!ehlo_advertises_dsn(["mx.example.test Hello", "X-DSN-HELPER"].into_iter()));
+        assert!(!ehlo_advertises_dsn(["mx.example.test Hello", "X-HELPER DSN"].into_iter()));
+        assert!(!ehlo_advertises_dsn(["mx.example.test DSN available", "SIZE 100"].into_iter()));
+        assert!(!ehlo_advertises_dsn(["DSN"].into_iter()));
+        assert!(ehlo_advertises_dsn(["mx.example.test Hello", "DSN "].into_iter()));
         assert!(!ehlo_advertises_dsn(["mx.example.test Hello", "SIZE 100"].into_iter()));
         assert!(!ehlo_advertises_dsn(std::iter::empty()));
     }
