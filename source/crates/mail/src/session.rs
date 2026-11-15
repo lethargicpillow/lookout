@@ -5981,13 +5981,24 @@ async fn connect_and_run(
                     let structure_fetches: Vec<Fetch> = if lean_scan {
                         let mut rows = Vec::new();
                         for set in uid_set_chunks(&uids) {
-                            tracing::debug!(mailbox = %mailbox_id, requested = uids.len(),
+                            tracing::debug!(mailbox = %mailbox_id, requested = uids.len(), uid_set = %set,
                                 "prefetch: requesting missing body structures");
-                            let result: Result<Vec<Fetch>> = async {
-                                Ok(session.uid_fetch(&set, "(UID BODYSTRUCTURE)").await?.try_collect().await?)
+                            // A tagged NO is a completed command, not a broken
+                            // transport. Keep any structures returned before it
+                            // and let the existing size-bounded full MIME path
+                            // handle UIDs for which the server omitted a structure.
+                            let result: Result<(Vec<Fetch>, Option<String>)> = async {
+                                collect_metadata_fetches(session.uid_fetch(&set, "(UID BODYSTRUCTURE)").await?).await
                             }.await;
                             match result {
-                                Ok(batch) => rows.extend(batch),
+                                Ok((batch, None)) => rows.extend(batch),
+                                Ok((batch, Some(reason))) if reason.to_ascii_uppercase().contains("[UNAVAILABLE]") => {
+                                    tracing::warn!(mailbox = %mailbox_id, uid_set = %set, received = batch.len(), %reason,
+                                        "prefetch: body structures unavailable; keeping UIDs for whole-message fallback");
+                                    rows.extend(batch);
+                                }
+                                Ok((_, Some(reason))) => return Err(note_prefetch_failure(prefetch_failures, &mailbox_id,
+                                    "UID FETCH BODYSTRUCTURE", async_imap::error::Error::No(reason).into())),
                                 Err(e) => return Err(note_prefetch_failure(prefetch_failures, &mailbox_id, "UID FETCH BODYSTRUCTURE", e)),
                             }
                         }
@@ -6014,6 +6025,9 @@ async fn connect_and_run(
                     tracing::debug!(
                         mailbox = %pf.mailboxes[pf.current],
                         total = uids.len(),
+                        scanned,
+                        cached_bodies,
+                        uidvalidity = pf.uidvalidity.0,
                         elapsed_ms = started.elapsed().as_millis(),
                         "prefetch: queued UIDs for body download"
                     );
@@ -6055,6 +6069,8 @@ async fn connect_and_run(
                     }
                     let batch: Vec<Uid> = pf.pending_uids.drain(..pf.pending_uids.len().min(prefetch_policy.batch_size)).collect();
                     let batch_len = batch.len();
+                    tracing::debug!(mailbox = %pf.mailboxes[pf.current], uids = ?batch,
+                        "prefetch: requesting body batch");
                     let started = std::time::Instant::now();
                     let fetched = match fetch_bodies_batch(cache, &mut session, &pf.mailboxes[pf.current], pf.uidvalidity, &batch, &pf.structures).await {
                         Ok(bodies) => bodies.len(),
