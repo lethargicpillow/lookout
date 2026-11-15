@@ -2266,6 +2266,9 @@ async fn connect_and_run(
     }).await {
         tracing::warn!(%account_id, "could not defer startup metadata retries: {e}");
     }
+    // Only committed full snapshots (not STATUS, LIST or prefetch metadata)
+    // establish a flag-sync watermark. Never carry one across a reconnect.
+    let mut sync_watermarks = SyncWatermarks::new(gmail_inbox_watch(&config.imap.host));
     // Fresh session: no mailbox is SELECTed yet, so the sync must select INBOX.
     sync_mailbox(
         &mut session,
@@ -2282,6 +2285,7 @@ async fn connect_and_run(
         qresync,
         local_focus,
         davmail_compat,
+        &mut sync_watermarks,
     )
     .await?;
 
@@ -2634,6 +2638,7 @@ async fn connect_and_run(
                         qresync,
                         local_focus,
                         davmail_compat,
+                        &mut sync_watermarks,
                     )
                     .await?;
                     dirty_mailboxes.remove(&sent_id);
@@ -2661,6 +2666,7 @@ async fn connect_and_run(
                             qresync,
                             local_focus,
                             davmail_compat,
+                            &mut sync_watermarks,
                         )
                         .await?;
                         dirty_mailboxes.remove(&current_mailbox_id);
@@ -2762,6 +2768,7 @@ async fn connect_and_run(
                                     qresync,
                                     local_focus,
                                     davmail_compat,
+                                    &mut sync_watermarks,
                                 )
                                 .await?;
                                 session_selected = current_mailbox_id.clone();
@@ -3066,6 +3073,7 @@ async fn connect_and_run(
                     qresync,
                     local_focus,
                     davmail_compat,
+                    &mut sync_watermarks,
                 )
                 .await?;
                 dirty_mailboxes.remove(&current_mailbox_id);
@@ -3080,10 +3088,10 @@ async fn connect_and_run(
                 // fresh SELECT catches UIDVALIDITY changes and updates the
                 // server's view before the flags/membership refresh.
                 if current_mailbox_id != inbox_id {
-                    sync_mailbox(&mut session, &account_id, "INBOX", &inbox_id, events, cache, &mut folders, interactive_commands, deferred_interactive, None, condstore, qresync, local_focus, davmail_compat).await?;
+                    sync_mailbox(&mut session, &account_id, "INBOX", &inbox_id, events, cache, &mut folders, interactive_commands, deferred_interactive, None, condstore, qresync, local_focus, davmail_compat, &mut sync_watermarks).await?;
                     dirty_mailboxes.remove(&inbox_id);
                 }
-                sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache, &mut folders, interactive_commands, deferred_interactive, None, condstore, qresync, local_focus, davmail_compat).await?;
+                sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache, &mut folders, interactive_commands, deferred_interactive, None, condstore, qresync, local_focus, davmail_compat, &mut sync_watermarks).await?;
                 dirty_mailboxes.remove(&current_mailbox_id);
                 session_selected = current_mailbox_id.clone();
                 next_poll = tokio::time::Instant::now() + poll_interval;
@@ -3095,7 +3103,7 @@ async fn connect_and_run(
             Wake::Idle(Err(e)) => return Err(Error::Imap(e)),
             Wake::IdlePush(mailbox_id) if watch_gmail_inbox && mailbox_id == inbox_id && current_mailbox_id != inbox_id => {
                 tracing::info!(account = %account_id, "Gmail Inbox push: refreshing in background");
-                sync_mailbox(&mut session, &account_id, "INBOX", &inbox_id, events, cache, &mut folders, interactive_commands, deferred_interactive, None, condstore, qresync, local_focus, davmail_compat).await?;
+                sync_mailbox(&mut session, &account_id, "INBOX", &inbox_id, events, cache, &mut folders, interactive_commands, deferred_interactive, None, condstore, qresync, local_focus, davmail_compat, &mut sync_watermarks).await?;
                 dirty_mailboxes.remove(&inbox_id);
                 session_selected = inbox_id.clone();
             }
@@ -3131,6 +3139,7 @@ async fn connect_and_run(
                         qresync,
                         local_focus,
                         davmail_compat,
+                        &mut sync_watermarks,
                     )
                     .await?;
                     dirty_mailboxes.remove(&current_mailbox_id);
@@ -3209,6 +3218,7 @@ async fn connect_and_run(
                         qresync,
                         local_focus,
                         davmail_compat,
+                        &mut sync_watermarks,
                     )
                     .await?;
                     session_selected = current_mailbox_id.clone();
@@ -3293,6 +3303,7 @@ async fn connect_and_run(
                             qresync,
                             local_focus,
                             davmail_compat,
+                            &mut sync_watermarks,
                         )
                         .await?;
                         session_selected = current_mailbox_id.clone();
@@ -3362,7 +3373,7 @@ async fn connect_and_run(
                             sync_mailbox(&mut session, &account_id, &path, &mailbox,
                                 events, cache, &mut folders, interactive_commands,
                                 deferred_interactive,
-                                None, condstore, qresync, local_focus, davmail_compat).await?;
+                                None, condstore, qresync, local_focus, davmail_compat, &mut sync_watermarks).await?;
                             session_selected = mailbox.clone();
                             dirty_mailboxes.remove(&mailbox);
                         }
@@ -3740,6 +3751,7 @@ async fn connect_and_run(
                                 qresync,
                                 local_focus,
                                 davmail_compat,
+                                &mut sync_watermarks,
                             )
                             .await?;
                             dirty_mailboxes.remove(&current_mailbox_id);
@@ -3915,6 +3927,7 @@ async fn connect_and_run(
                                 qresync,
                                 local_focus,
                                 davmail_compat,
+                                &mut sync_watermarks,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -3991,6 +4004,7 @@ async fn connect_and_run(
                                 qresync,
                                 local_focus,
                                 davmail_compat,
+                                &mut sync_watermarks,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -4072,6 +4086,7 @@ async fn connect_and_run(
                                 qresync,
                                 local_focus,
                                 davmail_compat,
+                                &mut sync_watermarks,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -4187,6 +4202,7 @@ async fn connect_and_run(
                                 qresync,
                                 local_focus,
                                 davmail_compat,
+                                &mut sync_watermarks,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -4255,6 +4271,7 @@ async fn connect_and_run(
                                 qresync,
                                 local_focus,
                                 davmail_compat,
+                                &mut sync_watermarks,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -4319,6 +4336,7 @@ async fn connect_and_run(
                                 qresync,
                                 local_focus,
                                 davmail_compat,
+                                &mut sync_watermarks,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -4354,7 +4372,7 @@ async fn connect_and_run(
                             dirty_mailboxes.insert(mailbox.clone());
                             sync_mailbox(&mut session, &account_id, &path, &mailbox, events,
                                 cache, &mut folders, interactive_commands, deferred_interactive, None, condstore,
-                                qresync, local_focus, davmail_compat).await?;
+                                qresync, local_focus, davmail_compat, &mut sync_watermarks).await?;
                             dirty_mailboxes.remove(&mailbox);
                         }
                         Err(e) => {
@@ -4420,6 +4438,7 @@ async fn connect_and_run(
                                 qresync,
                                 local_focus,
                                 davmail_compat,
+                                &mut sync_watermarks,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -4476,6 +4495,7 @@ async fn connect_and_run(
                                 qresync,
                                 local_focus,
                                 davmail_compat,
+                                &mut sync_watermarks,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -4626,6 +4646,7 @@ async fn connect_and_run(
                         qresync,
                         local_focus,
                         davmail_compat,
+                        &mut sync_watermarks,
                     )
                     .await?;
                     session_selected = current_mailbox_id.clone();
@@ -4776,6 +4797,7 @@ async fn connect_and_run(
                         qresync,
                         local_focus,
                         davmail_compat,
+                        &mut sync_watermarks,
                     )
                     .await?;
                     session_selected = current_mailbox_id.clone();
@@ -4858,6 +4880,7 @@ async fn connect_and_run(
                         qresync,
                         local_focus,
                         davmail_compat,
+                        &mut sync_watermarks,
                     )
                     .await?;
                     session_selected = current_mailbox_id.clone();
@@ -4918,6 +4941,7 @@ async fn connect_and_run(
                                 qresync,
                                 local_focus,
                                 davmail_compat,
+                                &mut sync_watermarks,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -4985,6 +5009,7 @@ async fn connect_and_run(
                                     qresync,
                                     local_focus,
                                     davmail_compat,
+                                    &mut sync_watermarks,
                                 )
                                 .await?;
                                 session_selected = current_mailbox_id.clone();
@@ -5074,6 +5099,7 @@ async fn connect_and_run(
                                     qresync,
                                     local_focus,
                                     davmail_compat,
+                                    &mut sync_watermarks,
                                 )
                                 .await?;
                                 session_selected = current_mailbox_id.clone();
@@ -5188,6 +5214,7 @@ async fn connect_and_run(
                                         qresync,
                                         local_focus,
                                         davmail_compat,
+                                        &mut sync_watermarks,
                                     )
                                     .await?;
                                     session_selected = current_mailbox_id.clone();
@@ -5230,6 +5257,7 @@ async fn connect_and_run(
                                 qresync,
                                 local_focus,
                                 davmail_compat,
+                                &mut sync_watermarks,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -5297,6 +5325,7 @@ async fn connect_and_run(
                                         qresync,
                                         local_focus,
                                         davmail_compat,
+                                        &mut sync_watermarks,
                                     )
                                     .await?;
                                     session_selected = current_mailbox_id.clone();
@@ -5339,6 +5368,7 @@ async fn connect_and_run(
                                 qresync,
                                 local_focus,
                                 davmail_compat,
+                                &mut sync_watermarks,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -5391,6 +5421,7 @@ async fn connect_and_run(
                                     qresync,
                                     local_focus,
                                     davmail_compat,
+                                    &mut sync_watermarks,
                                 )
                                 .await?;
                                 session_selected = current_mailbox_id.clone();
@@ -5706,6 +5737,7 @@ async fn connect_and_run(
                             qresync,
                             local_focus,
                             davmail_compat,
+                            &mut sync_watermarks,
                         )
                         .await?;
                         session_selected = current_mailbox_id.clone();
@@ -8334,6 +8366,40 @@ async fn service_sync_body_requests(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct SyncWatermark {
+    validity: UidValidity,
+    modseq: u64,
+    count: usize,
+}
+
+struct SyncWatermarks {
+    // Gmail's periodic reconciliation does a fresh SELECT for UIDVALIDITY.
+    // Other providers keep their existing fresh-SELECT/full-scan policy.
+    fresh_delta: bool,
+    by_mailbox: HashMap<MailboxId, SyncWatermark>,
+}
+
+impl SyncWatermarks {
+    fn new(fresh_delta: bool) -> Self {
+        Self { fresh_delta, by_mailbox: HashMap::new() }
+    }
+
+    fn baseline(&self, mailbox: &MailboxId, validity: UidValidity, cached: usize,
+        already_selected: bool, fresh_modseq: Option<u64>, qresync: bool) -> Option<u64> {
+        let mark = self.by_mailbox.get(mailbox)?;
+        if mark.validity != validity || mark.count != cached || mark.modseq == 0 {
+            return None;
+        }
+        if already_selected || (self.fresh_delta && !qresync
+            && fresh_modseq.is_some_and(|current| current >= mark.modseq)) {
+            Some(mark.modseq)
+        } else {
+            None
+        }
+    }
+}
+
 // The extra `session_selected`/`qresync` arguments are what let the IDLE-wake
 // path skip its re-SELECT and use the QRESYNC SELECT, so the count is worth it
 // for the session-critical helper.
@@ -8353,6 +8419,7 @@ async fn sync_mailbox(
     qresync: bool,
     local_focus: &LocalFocusSettings,
     davmail_compat: bool,
+    sync_watermarks: &mut SyncWatermarks,
 ) -> Result<()> {
     let _ = events.send(AccountEvent::MailboxSyncStarted { mailbox: mailbox_id.clone() }).await;
     // Any change already reported to this connection is covered by the fetch
@@ -8399,9 +8466,9 @@ async fn sync_mailbox(
     // cached under the mailbox's current `uidvalidity` doesn't need either
     // refetched, just its flags refreshed.
     //
-    // On the IDLE-wake path (this sync skipped its SELECT) with CONDSTORE
-    // enabled and a baseline modseq known, the flag refresh can itself be a
-    // delta: `FETCH 1:* (UID FLAGS MODSEQ) (CHANGEDSINCE <baseline>)` (RFC
+    // With CONDSTORE and a committed snapshot watermark, the flag refresh
+    // can be a delta on an IDLE wake or a Gmail fresh SELECT reconciliation:
+    // `FETCH 1:* (UID FLAGS MODSEQ) (CHANGEDSINCE <baseline>)` (RFC
     // 7162 §3.2.5.1) returns only messages whose flags changed since the
     // baseline - a steady-state wake costs O(changed) instead of O(mailbox).
     // New arrivals are reported too (their modseq exceeds the baseline), so
@@ -8416,19 +8483,18 @@ async fn sync_mailbox(
     // of numbers, far cheaper than the full flag fetch it replaces, and it
     // doubles as the folder's exists count. The full path needs no extra
     // pass - the full flag fetch *is* the membership set.
-    let cached: HashMap<Uid, EmailSummary> = cache_op(cache, {
+    let cached_result = cache_op(cache, {
         let mailbox_id = mailbox_id.clone();
         move |c| c.load_messages_by_uid(&mailbox_id, uidvalidity)
-    })
-    .await
-    .and_then(|r| r.ok())
-    .unwrap_or_default();
-    let baseline = folders.iter().find(|f| f.id == *mailbox_id).and_then(|f| f.highest_modseq);
-    // A previously incomplete metadata snapshot must not use QRESYNC's
-    // cached-membership shortcut: unresolved live UIDs would disappear.
-    let complete_membership = folders.iter().find(|f| f.id == *mailbox_id)
-        .is_some_and(|f| f.total as usize == cached.len());
-    let delta = already_selected && condstore && baseline.is_some() && complete_membership;
+    }).await.and_then(|r| r.ok());
+    let cache_loaded = cached_result.is_some();
+    let cached: HashMap<Uid, EmailSummary> = cached_result.unwrap_or_default();
+    let fresh_modseq = mailbox_meta.as_ref().and_then(|meta| meta.highest_modseq);
+    let baseline = if condstore && cache_loaded {
+        sync_watermarks.baseline(mailbox_id, uidvalidity, cached.len(),
+            already_selected, fresh_modseq, qresync)
+    } else { None };
+    let delta = baseline.is_some();
     tracing::debug!(account = %account_id, mailbox = %folder_path, cached = cached.len(), delta, "requesting mailbox flags");
     let flags = async {
         let rows: Vec<Fetch> = if delta {
@@ -8807,7 +8873,22 @@ async fn sync_mailbox(
         reused = messages.len().saturating_sub(new_uids.len()),
         "synced mailbox"
     );
-    emit_messages(mailbox_id, uidvalidity, &messages, events, cache).await;
+    let cache_saved = emit_messages(mailbox_id, uidvalidity, &messages, events, cache).await;
+    // A fresh SELECT's modseq predates the FETCH and is a conservative
+    // watermark. On a selected delta, advance only over returned MODSEQs.
+    // Never certify an incomplete or failed cache write.
+    let next_modseq = fresh_modseq.or_else(|| baseline.map(|bound| {
+        flag_fetches.iter().filter_map(|f| f.modseq).fold(bound, u64::max)
+    }));
+    let complete = unresolved_envelopes == 0 && messages.len() == present_uids.len()
+        && (delta || mailbox_meta.as_ref().is_none_or(|meta| meta.exists as usize == messages.len()));
+    if let Some(modseq) = next_modseq.filter(|v| *v != 0 && cache_saved && complete) {
+        sync_watermarks.by_mailbox.insert(mailbox_id.clone(), SyncWatermark {
+            validity: uidvalidity, modseq, count: messages.len(),
+        });
+    } else {
+        sync_watermarks.by_mailbox.remove(mailbox_id);
+    }
 
     // The unread count comes straight from the flags this sync fetched, and
     // the total from the fetch size (see the folder update after the
@@ -9071,7 +9152,7 @@ async fn emit_cached_messages_after_removal(cache: &CacheHandle, mailbox_id: &Ma
 /// Caches `messages` and publishes them to the UI, minus anything currently
 /// snoozed. Snoozed messages are still fetched and cached normally - only
 /// what's emitted is filtered, so a snooze is purely a display concern.
-async fn emit_messages(mailbox_id: &MailboxId, uidvalidity: UidValidity, messages: &[EmailSummary], events: &async_channel::Sender<AccountEvent>, cache: &CacheHandle) {
+async fn emit_messages(mailbox_id: &MailboxId, uidvalidity: UidValidity, messages: &[EmailSummary], events: &async_channel::Sender<AccountEvent>, cache: &CacheHandle) -> bool {
     let mut messages = messages.to_vec();
     // The write, the address-book feed, and the snooze read in one blocking
     // hop: `replace_messages` is the session's heaviest cache write (a
@@ -9093,6 +9174,7 @@ async fn emit_messages(mailbox_id: &MailboxId, uidvalidity: UidValidity, message
         }
     })
     .await;
+    let saved = cached.as_ref().is_some_and(|(replace, _, _, _)| replace.is_ok());
     if let Some((replace, addresses, snoozed, overlaid)) = cached {
         // Messages whose folder can't store keywords carry their follow-up
         // flag in the cache's local table (item 1.16).
@@ -9122,6 +9204,7 @@ async fn emit_messages(mailbox_id: &MailboxId, uidvalidity: UidValidity, message
     // A sync can bring flags set by another client, so the Tasks view's
     // flagged-mail list is re-read too.
     emit_flagged_messages(cache, events).await;
+    saved
 }
 
 /// DavMail cannot reliably serve partial MIME fetches. Backfill snippets
@@ -10844,6 +10927,23 @@ mod tests {
         assert_eq!(m.name, "Sent");
         assert_eq!(m.delimiter, '/');
         assert_eq!(m.role, MailboxRole::Sent);
+    }
+
+    #[test]
+    fn gmail_reconcile_delta_requires_committed_matching_snapshot() {
+        let id = MailboxId::new(&AccountId("acc".into()), "INBOX");
+        let mut marks = SyncWatermarks::new(true);
+        assert_eq!(marks.baseline(&id, UidValidity(7), 3, false, Some(100), false), None);
+        marks.by_mailbox.insert(id.clone(), SyncWatermark { validity: UidValidity(7), modseq: 90, count: 3 });
+        assert_eq!(marks.baseline(&id, UidValidity(7), 3, false, Some(100), false), Some(90));
+        assert_eq!(marks.baseline(&id, UidValidity(7), 3, false, Some(89), false), None);
+        assert_eq!(marks.baseline(&id, UidValidity(8), 3, false, Some(100), false), None);
+        assert_eq!(marks.baseline(&id, UidValidity(7), 2, false, Some(100), false), None);
+        assert_eq!(marks.baseline(&id, UidValidity(7), 3, false, None, false), None);
+        assert_eq!(marks.baseline(&id, UidValidity(7), 3, false, Some(100), true), None);
+        marks.fresh_delta = false;
+        assert_eq!(marks.baseline(&id, UidValidity(7), 3, false, Some(100), false), None);
+        assert_eq!(marks.baseline(&id, UidValidity(7), 3, true, None, false), Some(90));
     }
 
     #[test]
