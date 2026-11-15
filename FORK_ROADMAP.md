@@ -11,9 +11,18 @@ for this fork. Keep the original roadmap and its item IDs for comparison.
   workspace tests passed on the development Kubuntu machine (2026-11-15).
 - [x] Adapt the existing cargo-deb packaging for locked builds and identifiable
   fork revisions, retaining the application ID and package name.
-- [ ] Build and validate a DEB locally on Kubuntu; verify install, launch from
-  the KDE menu, GSettings, tray, and upgrade from the previous package without
-  losing configuration, keyring credentials, local tasks, or cache.
+- [x] Build and validate a DEB locally on Kubuntu: `98a29dc`, package content,
+  desktop entry, schema and native libraries verified; APT simulates an
+  upgrade from `0.9.310-1` without installing or removing other packages.
+- [ ] Finish installed-app acceptance: KDE menu launch, GSettings, tray,
+  and preservation of configuration, keyring credentials, local tasks and cache.
+- [ ] Before the first fork release, refresh the About dialog and related
+  metadata: identify the fork and its version/revision, replace the outdated
+  GNOME Online Accounts-only description, point issue reporting to the fork,
+  and review the website link, AppStream, package descriptions and README for
+  consistency. Retain original author Gavin Graham, contributor attribution,
+  copyright and GPL-3.0-or-later notices. Keep the application ID and package
+  name unchanged; agree on branding and version wording before editing.
 - [ ] Validate CI on develop: build, tests, GreenMail, lint/format, and DEB
   artifact. Docker is not installed on the development machine.
 - [ ] Fix any real CI/package failures before tagging a fork release.
