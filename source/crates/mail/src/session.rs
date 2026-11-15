@@ -2618,7 +2618,7 @@ async fn connect_and_run(
                         events,
                         &mut dirty_mailboxes,
                     )
-                    .await;
+                    .await?;
                     sync_mailbox(
                         &mut session,
                         &account_id,
@@ -2745,7 +2745,7 @@ async fn connect_and_run(
                                 events,
                                 &mut dirty_mailboxes,
                             )
-                            .await;
+                            .await?;
                             if current_mailbox_id == inbox_id || current_mailbox_id == scheduled_id {
                                 sync_mailbox(
                                     &mut session,
@@ -3899,7 +3899,7 @@ async fn connect_and_run(
                                 events,
                                 &mut dirty_mailboxes,
                             )
-                            .await;
+                            .await?;
                             sync_mailbox(
                                 &mut session,
                                 &account_id,
@@ -3975,7 +3975,7 @@ async fn connect_and_run(
                                 events,
                                 &mut dirty_mailboxes,
                             )
-                            .await;
+                            .await?;
                             sync_mailbox(
                                 &mut session,
                                 &account_id,
@@ -4056,7 +4056,7 @@ async fn connect_and_run(
                                 events,
                                 &mut dirty_mailboxes,
                             )
-                            .await;
+                            .await?;
                             sync_mailbox(
                                 &mut session,
                                 &account_id,
@@ -4171,7 +4171,7 @@ async fn connect_and_run(
                                 events,
                                 &mut dirty_mailboxes,
                             )
-                            .await;
+                            .await?;
                             sync_mailbox(
                                 &mut session,
                                 &account_id,
@@ -4239,7 +4239,7 @@ async fn connect_and_run(
                                 events,
                                 &mut dirty_mailboxes,
                             )
-                            .await;
+                            .await?;
                             sync_mailbox(
                                 &mut session,
                                 &account_id,
@@ -4303,7 +4303,7 @@ async fn connect_and_run(
                                 events,
                                 &mut dirty_mailboxes,
                             )
-                            .await;
+                            .await?;
                             sync_mailbox(
                                 &mut session,
                                 &account_id,
@@ -4404,7 +4404,7 @@ async fn connect_and_run(
                                 events,
                                 &mut dirty_mailboxes,
                             )
-                            .await;
+                            .await?;
                             sync_mailbox(
                                 &mut session,
                                 &account_id,
@@ -4460,7 +4460,7 @@ async fn connect_and_run(
                                 events,
                                 &mut dirty_mailboxes,
                             )
-                            .await;
+                            .await?;
                             sync_mailbox(
                                 &mut session,
                                 &account_id,
@@ -4733,7 +4733,7 @@ async fn connect_and_run(
                                                     events,
                                                     &mut dirty_mailboxes,
                                                 )
-                                                .await;
+                                                .await?;
                                                 on_server = true;
                                             }
                                             Err(e) => {
@@ -4827,7 +4827,7 @@ async fn connect_and_run(
                                     events,
                                     &mut dirty_mailboxes,
                                 )
-                                .await;
+                                .await?;
                             }
                             Err(e) => {
                                 tracing::warn!("undo snooze failed: {e}");
@@ -4902,7 +4902,7 @@ async fn connect_and_run(
                                 events,
                                 &mut dirty_mailboxes,
                             )
-                            .await;
+                            .await?;
                             sync_mailbox(
                                 &mut session,
                                 &account_id,
@@ -5676,7 +5676,7 @@ async fn connect_and_run(
                 // The folder may have vanished from a re-list between being
                 // queued and being drained; skip it rather than miscounting.
                 let Some(index) = folders.iter().position(|m| m.id == mailbox_id) else { continue };
-                let changed = refresh_folder_counts(&mut session, &mut folders[index], &account_id, condstore).await;
+                let changed = refresh_folder_counts(&mut session, &mut folders[index], &account_id, condstore).await?;
                 dirty |= changed;
                 if changed {
                     if mailbox_id == current_mailbox_id {
@@ -7858,10 +7858,12 @@ fn status_count_query(condstore: bool) -> &'static str {
 
 /// One folder's best-effort STATUS count refresh (RFC 3501 §6.3.10): fills
 /// `total`/`unread` (and, for free, `uidnext`/`uidvalidity`) from the server
-/// and reports whether anything changed. Never fatal: a folder whose STATUS
-/// fails (deleted since LIST, or a server that rejects the command) keeps
+/// and reports whether anything changed. A tagged NO/BAD (folder deleted
+/// since LIST, or server rejects the command) is nonfatal and keeps
 /// its LIST-only defaults, so unread counts degrade gracefully on servers
-/// without a useful STATUS. Note the crate's `Mailbox` type reports the
+/// without a useful STATUS. Transport/protocol failures must instead end
+/// the connection; continuing can produce default/empty SELECT metadata.
+/// Note the crate's `Mailbox` type reports the
 /// STATUS `unseen` as a *count*, unlike SELECT's "sequence number of the
 /// first unseen message", so it maps straight onto `Mailbox::unread`.
 ///
@@ -7869,9 +7871,9 @@ fn status_count_query(condstore: bool) -> &'static str {
 /// `HIGHESTMODSEQ` (RFC 7162 §3.2.1: a CONDSTORE server MUST support it as
 /// a STATUS data item) - the STATUS drain is the one pass that touches every
 /// folder, so it's how folders that never get SELECTed still learn a modseq.
-async fn refresh_folder_counts(session: &mut Session<SessionStream>, folder: &mut Mailbox, account_id: &AccountId, condstore: bool) -> bool {
+async fn refresh_folder_counts(session: &mut Session<SessionStream>, folder: &mut Mailbox, account_id: &AccountId, condstore: bool) -> Result<bool> {
     let Some(path) = folder.id.0.strip_prefix(&format!("{}:", account_id.0)) else {
-        return false;
+        return Ok(false);
     };
     // HIGHESTMODSEQ is only legal to *ask* for when the capability is
     // advertised; on a non-CONDSTORE server the data item is a protocol
@@ -7894,13 +7896,33 @@ async fn refresh_folder_counts(session: &mut Session<SessionStream>, folder: &mu
                 changed |= folder.highest_modseq != meta.highest_modseq;
                 folder.highest_modseq = meta.highest_modseq;
             }
-            changed
+            Ok(changed)
+        }
+        Err(e) if status_rejection_is_nonfatal(&e) => {
+            tracing::debug!(mailbox = %folder.id, "STATUS rejected for {}, leaving existing counts: {e}", folder.id);
+            Ok(false)
         }
         Err(e) => {
-            tracing::debug!(mailbox = %folder.id, "STATUS failed for {}, leaving LIST-only defaults: {e}", folder.id);
-            false
+            tracing::warn!(mailbox = %folder.id, "STATUS connection failure; reconnecting: {e}");
+            Err(e.into())
         }
     }
+}
+
+fn status_rejection_is_nonfatal(error: &async_imap::error::Error) -> bool {
+    matches!(error, async_imap::error::Error::No(_) | async_imap::error::Error::Bad(_))
+}
+
+// UIDVALIDITY is mandatory for a successful SELECT (RFC 3501 6.3.1).
+// A default Mailbox returned on EOF must not become a cache generation.
+fn checked_sync_uidvalidity(validity: UidValidity) -> Result<UidValidity> {
+    if validity.0 == 0 {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "IMAP SELECT missing UIDVALIDITY; refusing mailbox sync",
+        )));
+    }
+    Ok(validity)
 }
 
 /// The order the main loop refreshes folder counts in: the folder the user is
@@ -8098,14 +8120,14 @@ async fn refresh_folders_targeted(
     cache: &CacheHandle,
     events: &async_channel::Sender<AccountEvent>,
     dirty_mailboxes: &mut HashSet<MailboxId>,
-) -> bool {
+) -> Result<bool> {
     let mut open_changed = false;
     let mut any_changed = false;
     for id in ids {
         let Some(index) = folders.iter().position(|m| m.id == *id) else {
             continue;
         };
-        if !refresh_folder_counts(session, &mut folders[index], account_id, condstore).await {
+        if !refresh_folder_counts(session, &mut folders[index], account_id, condstore).await? {
             continue;
         }
         any_changed = true;
@@ -8118,7 +8140,7 @@ async fn refresh_folders_targeted(
     if any_changed {
         publish_folders(folders, account_id, cache, events).await;
     }
-    open_changed
+    Ok(open_changed)
 }
 
 /// The IMAP `SEARCH` fallback for one mailbox: it translates the query's
@@ -8367,6 +8389,7 @@ async fn sync_mailbox(
         .map(|meta| UidValidity(meta.uid_validity.unwrap_or(0)))
         .or_else(|| folders.iter().find(|f| f.id == *mailbox_id).map(|f| f.uidvalidity))
         .unwrap_or(UidValidity(0));
+    let uidvalidity = checked_sync_uidvalidity(uidvalidity)?;
     // The display list shows every message in the folder, so every sync
     // still learns the full current UID set: any window - UID or sequence -
     // silently drops the older mail that large folders like Gmail's All Mail
@@ -10821,6 +10844,23 @@ mod tests {
         assert_eq!(m.name, "Sent");
         assert_eq!(m.delimiter, '/');
         assert_eq!(m.role, MailboxRole::Sent);
+    }
+
+    #[test]
+    fn imap_status_only_tagged_rejections_are_nonfatal() {
+        use async_imap::error::Error as ImapError;
+        assert!(status_rejection_is_nonfatal(&ImapError::No("unknown mailbox".into())));
+        assert!(status_rejection_is_nonfatal(&ImapError::Bad("unsupported STATUS".into())));
+        let eof: ImapError = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "TLS EOF").into();
+        assert!(!status_rejection_is_nonfatal(&eof));
+        let broken: ImapError = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe").into();
+        assert!(!status_rejection_is_nonfatal(&broken));
+    }
+
+    #[test]
+    fn imap_sync_rejects_unknown_uidvalidity_before_cache_access() {
+        assert!(checked_sync_uidvalidity(UidValidity(0)).is_err());
+        assert_eq!(checked_sync_uidvalidity(UidValidity(123)).unwrap(), UidValidity(123));
     }
 
     #[test]
