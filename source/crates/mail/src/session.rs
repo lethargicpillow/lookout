@@ -179,6 +179,13 @@ fn envelope_fetch_items(davmail_compat: bool) -> &'static str {
 const STRUCTURE_ONLY_FETCH_ITEMS: &str = "(UID RFC822.SIZE BODYSTRUCTURE)";
 const PREFETCH_UID_SIZE_ITEMS: &str = "(UID RFC822.SIZE)";
 
+// A failed folder attempt retries with the original sequence FETCH. Only a
+// fully completed folder clears its failure count; a successful UID scan
+// alone must not erase a later BODYSTRUCTURE rejection.
+fn use_lean_prefetch_scan(reuse: bool, default_policy: bool, indexed: Option<bool>, failures: u32) -> bool {
+    reuse && default_policy && indexed == Some(true) && failures == 0
+}
+
 fn prefetch_scan_items(index_envelopes: bool, lean_scan: bool) -> &'static str {
     if index_envelopes { ENVELOPE_FETCH_ITEMS }
     else if lean_scan { PREFETCH_UID_SIZE_ITEMS }
@@ -355,14 +362,15 @@ fn prefetch_select_failure(failures: &mut HashMap<MailboxId, u32>, mailbox_id: &
     error.into()
 }
 
-fn note_prefetch_failure(failures: &mut HashMap<MailboxId, u32>, mailbox_id: &MailboxId, error: Error) -> Error {
+fn note_prefetch_failure(failures: &mut HashMap<MailboxId, u32>, mailbox_id: &MailboxId, stage: &str, error: Error) -> Error {
     let count = failures.entry(mailbox_id.clone()).or_insert(0);
     *count += 1;
     tracing::warn!(
         mailbox = %mailbox_id,
         failures = *count,
         limit = PREFETCH_FAILURE_LIMIT,
-        "prefetch: envelope fetch failed for {mailbox_id}; the account will keep working and skip this folder in the background once it reaches the limit: {error}"
+        stage,
+        "prefetch: folder request failed; reconnecting, with background skip at the failure limit: {error}"
     );
     error
 }
@@ -5890,21 +5898,18 @@ async fn connect_and_run(
                     // Yandex warm folders need no MIME structures for bodies
                     // already on disk. Enumerate the same newest-N window, then
                     // request structures only for eligible cache misses.
-                    let lean_scan = reuse_prefetch && *prefetch_policy == PrefetchPolicy::default()
-                        && indexed == Some(true);
+                    let prior_failures = prefetch_failures.get(&mailbox_id).copied().unwrap_or(0);
+                    let lean_scan = use_lean_prefetch_scan(reuse_prefetch,
+                        *prefetch_policy == PrefetchPolicy::default(), indexed, prior_failures);
+                    tracing::debug!(mailbox = %mailbox_id, lean_scan, prior_failures,
+                        index_envelopes, exists = mailbox_meta.exists, "prefetch: starting folder scan");
                     let items = prefetch_scan_items(index_envelopes, lean_scan);
                     let fetches: Vec<_> = match session.fetch(&seq_range, items).await {
                         Ok(stream) => match stream.try_collect().await {
-                            Ok(fetches) => {
-                                // A clean pass clears any prior failures, so a
-                                // one-off blip never accumulates toward the
-                                // skip limit.
-                                prefetch_failures.remove(&mailbox_id);
-                                fetches
-                            }
-                            Err(e) => return Err(note_prefetch_failure(prefetch_failures, &mailbox_id, e.into())),
+                            Ok(fetches) => fetches,
+                            Err(e) => return Err(note_prefetch_failure(prefetch_failures, &mailbox_id, "sequence FETCH", e.into())),
                         },
-                        Err(e) => return Err(note_prefetch_failure(prefetch_failures, &mailbox_id, e.into())),
+                        Err(e) => return Err(note_prefetch_failure(prefetch_failures, &mailbox_id, "sequence FETCH", e.into())),
                     };
                     let envelope_fetch_elapsed_ms = started.elapsed().as_millis();
 
@@ -5976,12 +5981,14 @@ async fn connect_and_run(
                     let structure_fetches: Vec<Fetch> = if lean_scan {
                         let mut rows = Vec::new();
                         for set in uid_set_chunks(&uids) {
+                            tracing::debug!(mailbox = %mailbox_id, requested = uids.len(),
+                                "prefetch: requesting missing body structures");
                             let result: Result<Vec<Fetch>> = async {
                                 Ok(session.uid_fetch(&set, "(UID BODYSTRUCTURE)").await?.try_collect().await?)
                             }.await;
                             match result {
                                 Ok(batch) => rows.extend(batch),
-                                Err(e) => return Err(note_prefetch_failure(prefetch_failures, &mailbox_id, e)),
+                                Err(e) => return Err(note_prefetch_failure(prefetch_failures, &mailbox_id, "UID FETCH BODYSTRUCTURE", e)),
                             }
                         }
                         rows
@@ -6052,6 +6059,10 @@ async fn connect_and_run(
                     let fetched = match fetch_bodies_batch(cache, &mut session, &pf.mailboxes[pf.current], pf.uidvalidity, &batch, &pf.structures).await {
                         Ok(bodies) => bodies.len(),
                         Err(e) => {
+                            if reuse_prefetch {
+                                return Err(note_prefetch_failure(prefetch_failures,
+                                    &pf.mailboxes[pf.current], "UID FETCH bodies", e));
+                            }
                             tracing::warn!(?e, "prefetch: batch fetch failed");
                             pf.reusable_completion = false;
                             0
@@ -6090,6 +6101,9 @@ async fn connect_and_run(
                 // If all UIDs for this mailbox are done, advance to the next.
                 if pf.pending_uids.is_empty() {
                     let finished_mailbox = pf.mailboxes[pf.current].clone();
+                    if pf.reusable_completion {
+                        prefetch_failures.remove(&finished_mailbox);
+                    }
                     if reuse_prefetch && pf.reusable_completion && *prefetch_policy == PrefetchPolicy::default() {
                         recent_prefetch.insert(finished_mailbox.clone(), std::time::Instant::now());
                     }
@@ -11168,6 +11182,26 @@ mod tests {
         assert!(pf.current_folder_name.is_empty());
         assert_eq!(pf.forget_tree(&id("A"), '/'), None, "an already-finished folder has nothing to announce");
         assert_eq!(pf.mailboxes[pf.current], id("Work2"));
+    }
+
+    #[test]
+    fn yandex_prefetch_retry_uses_legacy_scan_and_preserves_failure_limit() {
+        let id = MailboxId("sent".into());
+        let mut failures = HashMap::new();
+        assert!(use_lean_prefetch_scan(true, true, Some(true), 0));
+        let error = || Error::Imap(async_imap::error::Error::No("[UNAVAILABLE] UID FETCH Completed".into()));
+        let _ = note_prefetch_failure(&mut failures, &id, "UID FETCH BODYSTRUCTURE", error());
+        assert_eq!(failures[&id], 1);
+        assert!(!use_lean_prefetch_scan(true, true, Some(true), failures[&id]));
+        let _ = note_prefetch_failure(&mut failures, &id, "sequence FETCH", error());
+        assert_eq!(failures[&id], PREFETCH_FAILURE_LIMIT);
+        let account = AccountId("acc".into());
+        let folder = mailbox(&account, "Sent", MailboxRole::Sent, 0);
+        let mut skipped = HashMap::new();
+        skipped.insert(folder.id.clone(), failures[&id]);
+        let mut pass = None;
+        queue_new_prefetch_mailboxes(&mut pass, &[folder], &MailboxId::new(&account, "INBOX"), &skipped);
+        assert!(pass.is_none());
     }
 
     #[test]
