@@ -67,6 +67,9 @@ const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Poll servers without the optional IMAP IDLE extension.
 const NO_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(30);
+// Yandex frequently closes otherwise healthy connections. Avoid rescanning
+// recently completed background folders on every transport reconnect.
+const YANDEX_PREFETCH_REUSE: Duration = Duration::from_secs(10 * 60);
 const GMAIL_INBOX_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 
 fn gmail_inbox_watch(host: &str) -> bool {
@@ -207,6 +210,8 @@ struct PrefetchState {
     /// pass so the body fetches can be text-parts-only (see
     /// `fetch_body_partial`) instead of whole-message downloads.
     structures: HashMap<Uid, Vec<BodyPart>>,
+    /// False if the current folder had an unsuccessful cache/index operation.
+    reusable_completion: bool,
     /// When this pass started, so aggressive prefetch can restart the whole
     /// pass once `refresh_interval` elapses.
     started: std::time::Instant,
@@ -222,6 +227,7 @@ impl PrefetchState {
             envelopes_fetched: false,
             current_folder_name: String::new(),
             structures: HashMap::new(),
+            reusable_completion: true,
             started: std::time::Instant::now(),
         }
     }
@@ -243,6 +249,7 @@ impl PrefetchState {
         self.uidvalidity = UidValidity(0);
         self.envelopes_fetched = false;
         self.structures.clear();
+        self.reusable_completion = true;
     }
 
     fn validate_body_selection(&mut self, actual: Option<u32>) -> bool {
@@ -274,9 +281,30 @@ impl PrefetchState {
             self.envelopes_fetched = false;
             self.current_folder_name.clear();
             self.structures.clear();
+            self.reusable_completion = true;
         }
         announced
     }
+}
+
+/// Keep completed folders in the pass's prefix, so relists do not enqueue
+/// them again. Only timestamps survive reconnects: no UID or MIME structure
+/// is reused across a new connection.
+fn resume_recent_prefetch(
+    mailboxes: Vec<MailboxId>,
+    completed: &mut HashMap<MailboxId, std::time::Instant>,
+    now: std::time::Instant,
+) -> PrefetchState {
+    let eligible: HashSet<_> = mailboxes.iter().cloned().collect();
+    completed.retain(|id, at| eligible.contains(id)
+        && now.saturating_duration_since(*at) < YANDEX_PREFETCH_REUSE);
+    let (mut done, pending): (Vec<_>, Vec<_>) = mailboxes.into_iter()
+        .partition(|id| completed.contains_key(id));
+    let current = done.len();
+    done.extend(pending);
+    let mut pass = PrefetchState::new(done);
+    pass.current = current;
+    pass
 }
 
 /// Adds every folder in `folders` the prefetch pass doesn't already know
@@ -1683,6 +1711,7 @@ pub async fn run_account_session(
     // folder whose message can never be parsed instead of looping on it
     // forever (see `PREFETCH_FAILURE_LIMIT`).
     let mut prefetch_failures: HashMap<MailboxId, u32> = HashMap::new();
+    let mut recent_prefetch: HashMap<MailboxId, std::time::Instant> = HashMap::new();
     // The local Focused Inbox opt-in and contacts (M-03 / item 2.12). Lives
     // outside `connect_and_run` so a `ConfigureLocalFocus` command sent while
     // disconnected survives the reconnect, and the next connection's first
@@ -1747,6 +1776,7 @@ pub async fn run_account_session(
         // paused syncing. Park here, still answering the cache-only outbox
         // commands, until the signal goes back online.
         if *offline_rx.borrow() {
+            recent_prefetch.clear();
             let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Offline)).await;
             if let Some(task) = idle_task.0.take() {
                 task.abort();
@@ -1796,6 +1826,7 @@ pub async fn run_account_session(
             &mut deferred_interactive,
             &mut ready_since,
             &mut prefetch_failures,
+            &mut recent_prefetch,
             &mut local_focus,
             &mut prefetch_policy,
             &mut offline_rx,
@@ -2126,6 +2157,7 @@ async fn connect_and_run(
     deferred_interactive: &mut VecDeque<AccountCommand>,
     ready_since: &mut Option<std::time::Instant>,
     prefetch_failures: &mut HashMap<MailboxId, u32>,
+    recent_prefetch: &mut HashMap<MailboxId, std::time::Instant>,
     local_focus: &mut LocalFocusSettings,
     prefetch_policy: &mut PrefetchPolicy,
     offline_rx: &mut tokio::sync::watch::Receiver<bool>,
@@ -2309,8 +2341,15 @@ async fn connect_and_run(
         .filter(|m| m.id != inbox_id && prefetch_failures.get(&m.id).copied().unwrap_or(0) < PREFETCH_FAILURE_LIMIT)
         .map(|m| m.id.clone())
         .collect();
+    let reuse_prefetch = !imap_idle_allowed(&config.imap.host) && cache.as_ref().is_some();
     let mut prefetch = if davmail_compat || prefetch_mailboxes.is_empty() {
         None
+    } else if reuse_prefetch && *prefetch_policy == PrefetchPolicy::default() {
+        let pass = resume_recent_prefetch(prefetch_mailboxes, recent_prefetch, std::time::Instant::now());
+        tracing::info!(account = %account_id, host = %config.imap.host,
+            reused = pass.current, pending = pass.mailboxes.len() - pass.current,
+            "background prefetch reconnect plan");
+        Some(pass)
     } else {
         tracing::info!(account = %account_id, mailboxes = prefetch_mailboxes.len(), "starting background body prefetch");
         Some(PrefetchState::new(prefetch_mailboxes))
@@ -3798,6 +3837,10 @@ async fn connect_and_run(
                 // connection attempts, see `run_account_session`.
                 AccountCommand::Reconnect => {}
                 AccountCommand::SetPrefetchPolicy(policy) => {
+                    if *prefetch_policy != policy {
+                        recent_prefetch.clear();
+                        if let Some(pf) = prefetch.as_mut() { pf.reusable_completion = false; }
+                    }
                     *prefetch_policy = policy;
                 }
                 AccountCommand::MoveMessage { mailbox, uid, role } => {
@@ -4543,6 +4586,7 @@ async fn connect_and_run(
                                 current_mailbox_name = crate::mailbox_name::mailbox_path(&account_id, &current_mailbox_id).unwrap_or("INBOX").to_string();
                                 if !watch_gmail_inbox { mailbox_tx.send_replace(current_mailbox_id.clone()); }
                             }
+                            recent_prefetch.retain(|id, _| !crate::mailbox_name::is_same_or_descendant(id, &root, delimiter));
                             if let Some(finished) = prefetch.as_mut().and_then(|pf| pf.forget_tree(&root, delimiter)) {
                                 let _ = events.send(AccountEvent::PrefetchFinished { mailbox: finished }).await;
                             }
@@ -5792,13 +5836,12 @@ async fn connect_and_run(
                     // global search finds its recent mail. An opened folder's
                     // own syncs already keep its full snapshot indexed.
                     let mailbox_id = pf.mailboxes[pf.current].clone();
-                    let index_envelopes = !cache_op(cache, {
+                    let indexed = cache_op(cache, {
                         let mailbox_id = mailbox_id.clone();
                         move |c| c.has_messages(&mailbox_id)
-                    })
-                    .await
-                    .and_then(|r| r.ok())
-                    .unwrap_or(true);
+                    }).await.and_then(|r| r.ok());
+                    if indexed.is_none() { pf.reusable_completion = false; }
+                    let index_envelopes = !indexed.unwrap_or(true);
                     let fetch_from = mailbox_meta.exists.saturating_sub(prefetch_policy.folder_limit.saturating_sub(1)).max(1);
                     let seq_range = format!("{fetch_from}:*");
                     let started = std::time::Instant::now();
@@ -5837,8 +5880,12 @@ async fn connect_and_run(
                         })
                         .await
                         {
-                            Some(Err(e)) => tracing::warn!("prefetch: failed to index envelopes for {mailbox_id}: {e}"),
-                            _ => tracing::debug!(mailbox = %mailbox_id, count, "prefetch: indexed envelopes for search"),
+                            Some(Err(e)) => {
+                                pf.reusable_completion = false;
+                                tracing::warn!("prefetch: failed to index envelopes for {mailbox_id}: {e}");
+                            }
+                            Some(Ok(())) => tracing::debug!(mailbox = %mailbox_id, count, "prefetch: indexed envelopes for search"),
+                            None => { pf.reusable_completion = false; }
                         }
                     }
 
@@ -5933,9 +5980,21 @@ async fn connect_and_run(
                         Ok(bodies) => bodies.len(),
                         Err(e) => {
                             tracing::warn!(?e, "prefetch: batch fetch failed");
+                            pf.reusable_completion = false;
                             0
                         }
                     };
+                    // Only reuse a completed folder when its requested bodies
+                    // are actually persisted (including bodies already cached).
+                    if reuse_prefetch && pf.reusable_completion && *prefetch_policy == PrefetchPolicy::default() {
+                        let mailbox = pf.mailboxes[pf.current].clone();
+                        let validity = pf.uidvalidity;
+                        let verified = cache_op(cache, move |c| c.has_bodies(&mailbox, &batch, validity))
+                            .await.and_then(|r| r.ok());
+                        if !verified.is_some_and(|have| have.len() == batch_len) {
+                            pf.reusable_completion = false;
+                        }
+                    }
                     // Logged unconditionally, not just when `fetched > 0`: a
                     // batch that's mostly (or entirely) already cached still
                     // pays the round trip - `elapsed_ms` here is exactly the
@@ -5958,6 +6017,9 @@ async fn connect_and_run(
                 // If all UIDs for this mailbox are done, advance to the next.
                 if pf.pending_uids.is_empty() {
                     let finished_mailbox = pf.mailboxes[pf.current].clone();
+                    if reuse_prefetch && pf.reusable_completion && *prefetch_policy == PrefetchPolicy::default() {
+                        recent_prefetch.insert(finished_mailbox.clone(), std::time::Instant::now());
+                    }
                     pf.advance();
                     let _ = events.send(AccountEvent::PrefetchFinished { mailbox: finished_mailbox }).await;
                     if pf.is_done() {
@@ -10925,6 +10987,30 @@ mod tests {
         assert!(pf.current_folder_name.is_empty());
         assert_eq!(pf.forget_tree(&id("A"), '/'), None, "an already-finished folder has nothing to announce");
         assert_eq!(pf.mailboxes[pf.current], id("Work2"));
+    }
+
+    #[test]
+    fn yandex_prefetch_reconnect_reuses_only_recent_completed_folders() {
+        let a = MailboxId("a".into());
+        let b = MailboxId("b".into());
+        let c = MailboxId("c".into());
+        let removed = MailboxId("removed".into());
+        let start = std::time::Instant::now();
+        let now = start + YANDEX_PREFETCH_REUSE;
+        let mut completed = HashMap::from([
+            (a.clone(), now),
+            (b.clone(), start),
+            (removed.clone(), now),
+        ]);
+        let pass = resume_recent_prefetch(vec![b.clone(), c.clone(), a.clone()], &mut completed, now);
+        assert_eq!(pass.current, 1);
+        assert_eq!(pass.mailboxes, vec![a.clone(), b.clone(), c.clone()]);
+        assert!(!pass.envelopes_fetched);
+        assert!(pass.pending_uids.is_empty());
+        assert_eq!(completed.len(), 1);
+        let expired = resume_recent_prefetch(vec![a, b, c], &mut completed, now + YANDEX_PREFETCH_REUSE);
+        assert_eq!(expired.current, 0);
+        assert!(completed.is_empty());
     }
 
     #[test]
