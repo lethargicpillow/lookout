@@ -921,17 +921,15 @@ fn pkce_challenge(verifier: &str) -> String {
 mod tests {
     use super::*;
 
-    /// The refresh token and client id live under the user's data and config
-    /// dirs, never the shared temp dir (no env is set here: GLib caches these
-    /// dirs on first call).
+    /// Credentials follow GLib's data/config roots, including explicit XDG
+    /// overrides used by isolated test runs. Check the exact paths, not whether
+    /// their roots happen to reside beneath the system temporary directory.
     #[test]
     fn credential_paths_resolve_through_glib() {
         let tokens = oauth_dir();
         assert_eq!(tokens, glib::user_data_dir().join("lookout/oauth"));
-        assert!(!tokens.starts_with(std::env::temp_dir()));
         let client_id = client_id_file_path();
         assert_eq!(client_id, glib::user_config_dir().join("lookout/google-tasks-oauth.json"));
-        assert!(!client_id.starts_with(std::env::temp_dir()));
     }
 
     #[test]

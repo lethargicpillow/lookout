@@ -795,13 +795,12 @@ fn pkce_challenge(verifier: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Refresh tokens live under the user's data dir, never the shared temp
-    /// dir (no env is set here: GLib caches these dirs on first call).
+    /// Refresh tokens follow GLib's data root, including an explicit XDG
+    /// override. The exact path guards against an unrelated temp-dir fallback.
     #[test]
     fn oauth_dir_is_under_the_user_data_dir() {
         let dir = oauth_dir();
         assert_eq!(dir, glib::user_data_dir().join("lookout/oauth"));
-        assert!(!dir.starts_with(std::env::temp_dir()));
     }
 
     /// The cache stores wall-clock expiry, and a rejected token is evicted so
