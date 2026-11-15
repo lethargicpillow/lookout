@@ -615,12 +615,83 @@ fn gmail_preferred_smtp_endpoint(endpoint: &EndpointConfig) -> EndpointConfig {
     preferred
 }
 
+/// Adapter for lettre's existing-stream API. The only constructor takes an
+/// already negotiated, certificate-verified TLS stream, not plain TCP.
+/// lettre labels external streams as TCP in its internal enum, so its
+/// is_encrypted() is not a reliable test for this particular connection.
+#[derive(Debug)]
+struct VerifiedSmtpStream(crate::connection::ImapStream);
+
+impl lettre::transport::smtp::client::AsyncTokioStream for VerifiedSmtpStream {
+    fn peer_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.0.get_ref().0.peer_addr()
+    }
+}
+
+impl tokio::io::AsyncRead for VerifiedSmtpStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        tokio::io::AsyncRead::poll_read(std::pin::Pin::new(&mut self.get_mut().0), cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for VerifiedSmtpStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        tokio::io::AsyncWrite::poll_write(std::pin::Pin::new(&mut self.get_mut().0), cx, buf)
+    }
+
+    fn poll_flush(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        tokio::io::AsyncWrite::poll_flush(std::pin::Pin::new(&mut self.get_mut().0), cx)
+    }
+
+    fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        tokio::io::AsyncWrite::poll_shutdown(std::pin::Pin::new(&mut self.get_mut().0), cx)
+    }
+}
+
+/// SMTP-over-TLS using the same native-root rustls connector as IMAP.
+/// Both raw rustls probes succeed in the full app while lettre's own TLS
+/// establishment stalls. Keep lettre for the SMTP protocol, but let the
+/// existing Lookout connector establish and verify TLS before SMTP greeting.
+pub(crate) async fn connect_gmail_implicit_tls(host: &str, port: u16, hello: &ClientId) -> std::result::Result<AsyncSmtpConnection, String> {
+    use std::time::Duration;
+    let tcp = tokio::time::timeout(Duration::from_secs(12), crate::connection::connect_plain(host, port))
+        .await.map_err(|_| "SMTP TCP connect timed out".to_string())?
+        .map_err(|e| format!("SMTP TCP connect failed: {e}"))?;
+    let peer = tcp.peer_addr().map_err(|e| e.to_string())?;
+    tracing::info!(host, port, %peer, "Gmail SMTP TCP connected; starting Lookout TLS");
+    let tls = tokio::time::timeout(Duration::from_secs(15), crate::connection::tls_connect_over(tcp, host))
+        .await.map_err(|_| "SMTP TLS handshake timed out".to_string())?
+        .map_err(|e| format!("SMTP TLS handshake failed: {e}"))?;
+    tracing::info!(host, port, %peer, protocol = ?tls.get_ref().1.protocol_version(), "Gmail SMTP Lookout TLS established");
+    let connection = tokio::time::timeout(Duration::from_secs(15),
+        AsyncSmtpConnection::connect_with_transport(Box::new(VerifiedSmtpStream(tls)), hello))
+        .await.map_err(|_| "SMTP encrypted greeting/EHLO timed out".to_string())?
+        .map_err(|e| format!("SMTP encrypted greeting/EHLO failed: {e}"))?;
+    tracing::info!(host, port, %peer, "Gmail SMTP encrypted greeting/EHLO complete");
+    Ok(connection)
+}
+
 /// Establish an encrypted SMTP connection before exposing credentials.
 /// Each route has bounded connect and STARTTLS phases.
 async fn connect_gmail_smtp(endpoint: &EndpointConfig, hello: &ClientId) -> std::result::Result<AsyncSmtpConnection, String> {
     use std::time::Duration;
     if endpoint.security == Security::Plain {
         return Err("Gmail SMTP requires TLS".into());
+    }
+    if endpoint.security == Security::ImplicitTls {
+        tracing::info!(host = %endpoint.host, port = endpoint.port, security = ?endpoint.security, "Gmail SMTP connecting via Lookout TLS");
+        // The returned SMTP connection is already encrypted by construction.
+        // Do not call lettre STARTTLS on it or use its external-stream
+        // is_encrypted() flag, which reports false for all external streams.
+        return connect_gmail_implicit_tls(&endpoint.host, endpoint.port, hello).await;
     }
     let tls_parameters = || TlsParameters::new(endpoint.host.clone()).map_err(|e| format!("Invalid SMTP TLS hostname: {e}"));
     let implicit_tls = (endpoint.security == Security::ImplicitTls).then(tls_parameters).transpose()?;
@@ -1394,6 +1465,74 @@ mod tests {
         other.port = 465;
         other.security = Security::ImplicitTls;
         assert_eq!(gmail_preferred_smtp_endpoint(&other).security, Security::ImplicitTls);
+    }
+
+    #[tokio::test]
+    async fn gmail_existing_tls_transport_authenticates_and_submits() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio_rustls::rustls::pki_types::pem::PemObject;
+        use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use std::time::Duration;
+
+        crate::connection::ensure_crypto_provider_installed();
+        let ca = CertificateDer::from_pem_slice(include_bytes!("testdata/test-ca.pem")).unwrap();
+        let _ = crate::connection::TEST_ROOT_CERTIFICATE.set(ca);
+        let cert = CertificateDer::from_pem_slice(include_bytes!("testdata/test-server.pem")).unwrap();
+        let key = PrivateKeyDer::from_pem_slice(include_bytes!("testdata/test-server.key")).unwrap();
+        let config = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth().with_single_cert(vec![cert], key).unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            // No SMTP command can be read before this handshake completes.
+            let tls = acceptor.accept(tcp).await.unwrap();
+            let mut stream = BufReader::new(tls);
+            stream.get_mut().write_all(b"220 fake ESMTP\r\n").await.unwrap();
+            stream.get_mut().flush().await.unwrap();
+            let mut commands = Vec::new();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if stream.read_line(&mut line).await.unwrap() == 0 { break; }
+                let command = line.trim_end().to_string();
+                let reply: &[u8] = if command.starts_with("EHLO ") {
+                    b"250-fake\r\n250-AUTH XOAUTH2\r\n250-DSN\r\n250 8BITMIME\r\n"
+                } else if command.starts_with("AUTH XOAUTH2 ") {
+                    b"235 authenticated\r\n"
+                } else if command.starts_with("MAIL FROM:") || command.starts_with("RCPT TO:") {
+                    b"250 ok\r\n"
+                } else if command == "DATA" {
+                    b"354 continue\r\n"
+                } else if command == "." {
+                    b"250 accepted\r\n"
+                } else if command == "QUIT" {
+                    b"221 bye\r\n"
+                } else {
+                    commands.push(command);
+                    continue;
+                };
+                stream.get_mut().write_all(reply).await.unwrap();
+                stream.get_mut().flush().await.unwrap();
+                let done = command == "QUIT";
+                commands.push(command);
+                if done { break; }
+            }
+            commands
+        });
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut connection = connect_gmail_implicit_tls("127.0.0.1", port, &ClientId::default()).await.unwrap();
+            connection.auth(&[Mechanism::Xoauth2], &Credentials::new("test@example.com".into(), "fake-token".into())).await.unwrap();
+            let envelope = Envelope::new(Some("test@example.com".parse().unwrap()), vec!["recipient@example.com".parse().unwrap()]).unwrap();
+            submit_dsn(&mut connection, &envelope, b"Subject: test\r\n\r\nbody\r\n", true).await.unwrap();
+            connection.quit().await.unwrap();
+            server.await.unwrap()
+        }).await.expect("SMTP over existing TLS completes");
+        assert!(result.iter().any(|line| line.starts_with("AUTH XOAUTH2 ")));
+        assert!(result.iter().any(|line| line.starts_with("RCPT TO:") && line.contains("NOTIFY=SUCCESS,FAILURE")));
+        assert!(result.iter().any(|line| line == "body"));
+        assert!(result.iter().any(|line| line == "QUIT"));
     }
 
     #[tokio::test]
