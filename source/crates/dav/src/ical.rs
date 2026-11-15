@@ -1422,8 +1422,15 @@ mod tests {
         assert_eq!(event.attendees[0].address.name.as_deref(), Some("Room 4"));
 
         let written = build_vcalendar(event);
-        assert!(written.contains("CUTYPE=RESOURCE"), "a room is written as a resource: {written}");
-        assert!(written.contains("ROLE=REQ-PARTICIPANT"), "a resource stays a required participant: {written}");
+        // RFC 5545 content lines may fold inside a parameter value. Unfold
+        // before checking the wire parameters; parse the original below.
+        let unfolded = written.replace("\r\n ", "").replace("\r\n\t", "");
+        let attendee = unfolded.lines().find(|line| line.starts_with("ATTENDEE;"))
+            .expect("a room attendee must be serialized");
+        let (parameters, address) = attendee.split_once(':').expect("ATTENDEE has a value");
+        assert!(parameters.split(';').any(|p| p == "CUTYPE=RESOURCE"), "a room is written as a resource: {written}");
+        assert!(parameters.split(';').any(|p| p == "ROLE=REQ-PARTICIPANT"), "a resource stays a required participant: {written}");
+        assert_eq!(address, "mailto:room4@example.com");
         let round = &parse_vevents(&cal_id(), &written)[0];
         assert_eq!(round.attendees[0].role, AttendeeRole::Resource, "the room survives the round trip");
     }
