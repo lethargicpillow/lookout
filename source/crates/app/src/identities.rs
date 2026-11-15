@@ -51,7 +51,7 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, app_config: Rc<RefCell<AppConfig
     names.add(&account_entry);
     names.add(&sender_entry);
     let email_row = adw::ActionRow::builder().title("Email address")
-        .subtitle(glib::markup_escape_text(email)).build();
+        .subtitle(gtk::glib::markup_escape_text(email)).build();
     crate::privacy::mark_row(&email_row);
     names.add(&email_row);
     let note = gtk::Label::builder().label("Account name is used only in Lookout. Sender display name appears in outgoing messages. Leave it empty to send without a client-supplied display name. Your mail server may supply its own name (for example, Exchange).")
