@@ -166,6 +166,8 @@ async fn main() -> anyhow::Result<()> {
                     AccountEvent::MessagesUpdated { .. } => {}
                     AccountEvent::PreviewsFetched { .. } => {}
                     AccountEvent::MailboxSyncStarted { .. } => {}
+                    // Progress snapshots are not authoritative sync results.
+                    AccountEvent::MailboxSyncProgress { .. } => {}
                     AccountEvent::PrefetchStarted { .. } | AccountEvent::PrefetchFinished { .. } => {}
                     AccountEvent::NewMessages { .. } => {}
                     AccountEvent::NewMailArrived { .. } => {}
