@@ -560,6 +560,7 @@ pub(crate) async fn send_gmail_smtp(endpoint: &EndpointConfig, credential: Crede
     // reports show repeated STARTTLS stalls after a successful greeting.
     // The alternate route is tried only before AUTH or MAIL FROM.
     let preferred = gmail_preferred_smtp_endpoint(endpoint);
+    crate::smtp_probe::maybe_spawn_live_probe();
     let mut connection = match connect_gmail_smtp(&preferred, &hello).await {
         Ok(connection) => connection,
         Err(error) if preferred.port != endpoint.port => {

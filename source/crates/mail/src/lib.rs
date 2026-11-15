@@ -16,8 +16,9 @@ pub mod body;
 mod cache;
 mod config;
 mod connection;
-#[cfg(test)]
 mod smtp_probe;
+#[doc(hidden)]
+pub use smtp_probe::run_smtp_tls_probe;
 mod envelope;
 mod error;
 pub mod mailbox_name;

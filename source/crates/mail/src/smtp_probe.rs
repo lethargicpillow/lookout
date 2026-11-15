@@ -97,20 +97,34 @@ async fn run_case(label: &str, future: impl std::future::Future<Output = ProbeRe
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "opt-in network diagnostic; no authentication or message submission"]
-async fn smtp_tls_probe() {
+/// Credential-free diagnostics, usable on the actual application's runtime.
+#[doc(hidden)]
+pub async fn run_smtp_tls_probe() {
     crate::connection::ensure_crypto_provider_installed();
+    println!("SMTP PROBE: pid={} runtime={:?}", std::process::id(), tokio::runtime::Handle::current().runtime_flavor());
     // Keep the trust policy identical to production, even in a test build.
-    assert!(std::env::var_os("LOOKOUT_INSECURE_TLS_FOR_TESTS").is_none(),
-        "unset LOOKOUT_INSECURE_TLS_FOR_TESTS before this diagnostic");
-    let addresses: Vec<_> = lookup_host((HOST, 465)).await.expect("resolve SMTP host").collect();
+    if std::env::var_os("LOOKOUT_INSECURE_TLS_FOR_TESTS").is_some() {
+        println!("SMTP PROBE: unset LOOKOUT_INSECURE_TLS_FOR_TESTS first");
+        return;
+    }
+    let addresses: Vec<_> = match tokio::time::timeout(Duration::from_secs(8), lookup_host((HOST, 465))).await {
+        Ok(Ok(addrs)) => addrs.collect(),
+        Ok(Err(error)) => { println!("SMTP PROBE: DNS error: {error}"); return; }
+        Err(_) => { println!("SMTP PROBE: DNS timeout"); return; }
+    };
     println!("DNS {HOST}: {addresses:?}");
-    let ip = std::env::var("LOOKOUT_SMTP_PROBE_IP").ok()
-        .map(|value| value.parse::<IpAddr>().expect("valid LOOKOUT_SMTP_PROBE_IP"))
+    let explicit_ip = match std::env::var("LOOKOUT_SMTP_PROBE_IP") {
+        Ok(value) => match value.parse::<IpAddr>() {
+            Ok(ip) => Some(ip),
+            Err(_) => { println!("SMTP PROBE: invalid LOOKOUT_SMTP_PROBE_IP"); return; }
+        },
+        Err(_) => None,
+    };
+    let Some(ip) = explicit_ip
         .or_else(|| addresses.iter().find(|addr| addr.is_ipv4()).map(|addr| addr.ip()))
-        .or_else(|| addresses.first().map(|addr| addr.ip()))
-        .expect("at least one SMTP address");
+        .or_else(|| addresses.first().map(|addr| addr.ip())) else {
+            println!("SMTP PROBE: no SMTP address"); return;
+        };
     println!("Fixed probe IP: {ip}");
     for port in [465, 587] {
         let addr = SocketAddr::new(ip, port);
@@ -122,4 +136,28 @@ async fn smtp_tls_probe() {
         run_case(&label, lettre_probe((HOST, port), port, &label)).await;
     }
     println!("Probe complete; inspect RESULT lines. No credentials or mail were transmitted.");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "opt-in network diagnostic; no authentication or message submission"]
+async fn smtp_tls_probe() {
+    run_smtp_tls_probe().await;
+}
+
+/// Run exactly once per process, alongside the real SMTP connection.
+/// Explicit opt-in only; the probe never receives credentials or MIME.
+pub(crate) fn maybe_spawn_live_probe() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if std::env::var("LOOKOUT_SMTP_LIVE_PROBE").as_deref() != Ok("1") {
+        return;
+    }
+    if STARTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    tokio::spawn(async {
+        tracing::info!("SMTP live diagnostic started");
+        run_smtp_tls_probe().await;
+        tracing::info!("SMTP live diagnostic finished");
+    });
 }

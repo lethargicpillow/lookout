@@ -136,6 +136,14 @@ const LAUNCHER_ACTIONS: [(&str, &str); 4] = [
 
 fn main() -> glib::ExitCode {
     let args: Vec<_> = std::env::args_os().collect();
+    // Run the same credential-free probe in the full application binary,
+    // without initializing GTK, GOA or account state.
+    if args.get(1).is_some_and(|a| a == "--smtp-tls-probe") {
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()
+            .expect("failed to build SMTP probe runtime");
+        rt.block_on(lookout_mail::run_smtp_tls_probe());
+        return glib::ExitCode::SUCCESS;
+    }
     // Private decompression worker: no GTK, account state or credentials.
     if args.get(1).is_some_and(|a| a == "--unpack-oab-internal") {
         let size = args.get(2).and_then(|s| s.to_str()).and_then(|s| s.parse::<u64>().ok());
