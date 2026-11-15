@@ -555,23 +555,19 @@ pub(crate) async fn send_gmail_smtp(endpoint: &EndpointConfig, credential: Crede
     }).collect::<std::result::Result<Vec<_>, _>>()?;
     let envelope = Envelope::new(Some(from), recipients).map_err(|e| safe(e.to_string()))?;
     let hello = ClientId::default();
-    let tls_parameters = || TlsParameters::new(endpoint.host.clone()).map_err(|e| safe(format!("Invalid SMTP TLS hostname: {e}")));
-    let implicit_tls = (endpoint.security == Security::ImplicitTls).then(tls_parameters).transpose()?;
-    let started = std::time::Instant::now();
-    tracing::info!(host = %endpoint.host, port = endpoint.port, "Gmail SMTP connecting");
-    let mut connection = tokio::time::timeout(Duration::from_secs(25), AsyncSmtpConnection::connect_tokio1(
-        (endpoint.host.as_str(), endpoint.port), Some(Duration::from_secs(20)), &hello, implicit_tls, None,
-    )).await.map_err(|_| safe("SMTP connect/TLS/greeting timed out".into()))?
-        .map_err(|e| safe(format!("SMTP connect/TLS/greeting failed: {e}")))?;
-    tracing::info!(host = %endpoint.host, elapsed_ms = started.elapsed().as_millis(), "Gmail SMTP connected");
-    if endpoint.security == Security::StartTls && !connection.is_encrypted() {
-        if !connection.can_starttls() { return Err(safe("SMTP server does not offer STARTTLS".into())); }
-        tracing::info!("Gmail SMTP STARTTLS starting");
-        tokio::time::timeout(Duration::from_secs(15), connection.starttls(tls_parameters()?, &hello))
-            .await.map_err(|_| safe("SMTP STARTTLS timed out".into()))?
-            .map_err(|e| safe(format!("SMTP STARTTLS failed: {e}")))?;
-        tracing::info!("Gmail SMTP STARTTLS complete");
-    }
+    // GOA advertises both TLS modes for Gmail and normally selects 587.
+    // Prefer TLS from the first byte for that standard endpoint: field
+    // reports show repeated STARTTLS stalls after a successful greeting.
+    // The alternate route is tried only before AUTH or MAIL FROM.
+    let preferred = gmail_preferred_smtp_endpoint(endpoint);
+    let mut connection = match connect_gmail_smtp(&preferred, &hello).await {
+        Ok(connection) => connection,
+        Err(error) if preferred.port != endpoint.port => {
+            tracing::warn!(host = %endpoint.host, port = preferred.port, configured_port = endpoint.port, "Gmail implicit TLS connection failed; trying configured STARTTLS: {error}");
+            connect_gmail_smtp(endpoint, &hello).await.map_err(safe)?
+        }
+        Err(error) => return Err(safe(error)),
+    };
     let (mechanisms, credentials) = match credential {
         Credential::OAuth2AccessToken(token) => (vec![Mechanism::Xoauth2], Credentials::new(endpoint.username.clone(), token)),
         Credential::Password(password) => (DEFAULT_MECHANISMS.to_vec(), Credentials::new(endpoint.username.clone(), password)),
@@ -604,6 +600,48 @@ pub(crate) async fn send_gmail_smtp(endpoint: &EndpointConfig, credential: Crede
         Ok(Err(e)) => Err((Error::LoginFailed(format!("SMTP submission was not confirmed: {e}. Check Sent/recipient before retrying.")), true)),
         Err(_) => Err((Error::LoginFailed("SMTP submission timed out; delivery is uncertain. Check Sent/recipient before retrying.".into()), true)),
     }
+}
+
+/// Prefer the other standard, equally encrypted Gmail SMTP endpoint.
+/// Do not override explicitly configured nonstandard ports or other hosts.
+fn gmail_preferred_smtp_endpoint(endpoint: &EndpointConfig) -> EndpointConfig {
+    let mut preferred = endpoint.clone();
+    if endpoint.host.trim_end_matches('.').eq_ignore_ascii_case("smtp.gmail.com")
+        && endpoint.port == 587 && endpoint.security == Security::StartTls {
+        preferred.port = 465;
+        preferred.security = Security::ImplicitTls;
+    }
+    preferred
+}
+
+/// Establish an encrypted SMTP connection before exposing credentials.
+/// Each route has bounded connect and STARTTLS phases.
+async fn connect_gmail_smtp(endpoint: &EndpointConfig, hello: &ClientId) -> std::result::Result<AsyncSmtpConnection, String> {
+    use std::time::Duration;
+    if endpoint.security == Security::Plain {
+        return Err("Gmail SMTP requires TLS".into());
+    }
+    let tls_parameters = || TlsParameters::new(endpoint.host.clone()).map_err(|e| format!("Invalid SMTP TLS hostname: {e}"));
+    let implicit_tls = (endpoint.security == Security::ImplicitTls).then(tls_parameters).transpose()?;
+    let started = std::time::Instant::now();
+    tracing::info!(host = %endpoint.host, port = endpoint.port, security = ?endpoint.security, "Gmail SMTP connecting");
+    let mut connection = tokio::time::timeout(Duration::from_secs(25), AsyncSmtpConnection::connect_tokio1(
+        (endpoint.host.as_str(), endpoint.port), Some(Duration::from_secs(20)), hello, implicit_tls, None,
+    )).await.map_err(|_| "SMTP connect/TLS/greeting timed out".to_string())?
+        .map_err(|e| format!("SMTP connect/TLS/greeting failed: {e}"))?;
+    tracing::info!(host = %endpoint.host, port = endpoint.port, elapsed_ms = started.elapsed().as_millis(), "Gmail SMTP connected");
+    if endpoint.security == Security::StartTls && !connection.is_encrypted() {
+        if !connection.can_starttls() { return Err("SMTP server does not offer STARTTLS".into()); }
+        tracing::info!("Gmail SMTP STARTTLS starting");
+        tokio::time::timeout(Duration::from_secs(15), connection.starttls(tls_parameters()?, hello))
+            .await.map_err(|_| "SMTP STARTTLS timed out".to_string())?
+            .map_err(|e| format!("SMTP STARTTLS failed: {e}"))?;
+        tracing::info!("Gmail SMTP STARTTLS complete");
+    }
+    if !connection.is_encrypted() {
+        return Err("Gmail SMTP connection is not encrypted".into());
+    }
+    Ok(connection)
 }
 
 /// Verify SMTP authentication without transmitting a message.
@@ -1333,6 +1371,28 @@ mod tests {
             .expect("the fake server accepts the message");
         let _ = connection.quit().await;
         server.await.expect("the fake server finishes")
+    }
+
+    #[test]
+    fn gmail_smtp_prefers_implicit_tls_only_for_standard_starttls_endpoint() {
+        let configured = EndpointConfig {
+            host: "smtp.gmail.com".into(), port: 587, security: Security::StartTls,
+            username: "me@example.com".into(),
+        };
+        let preferred = gmail_preferred_smtp_endpoint(&configured);
+        assert_eq!(preferred.port, 465);
+        assert_eq!(preferred.security, Security::ImplicitTls);
+        assert_eq!(preferred.username, configured.username);
+        assert_eq!(configured.port, 587);
+        let mut other = configured.clone();
+        other.host = "smtp.yandex.com".into();
+        assert_eq!(gmail_preferred_smtp_endpoint(&other).port, 587);
+        other.host = configured.host.clone();
+        other.port = 2525;
+        assert_eq!(gmail_preferred_smtp_endpoint(&other).port, 2525);
+        other.port = 465;
+        other.security = Security::ImplicitTls;
+        assert_eq!(gmail_preferred_smtp_endpoint(&other).security, Security::ImplicitTls);
     }
 
     #[tokio::test]
