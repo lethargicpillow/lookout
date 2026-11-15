@@ -2118,13 +2118,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let account_label = {
                     let st = state_clone2.borrow();
                     if matches!(st.mail_view, MailView::UnifiedInbox) {
-                        mailbox_account_id(&summary.mailbox).and_then(|id| st.accounts.get(&id)).map(|h| {
-                            if h.display_name.is_empty() {
-                                h.email.clone()
-                            } else {
-                                h.display_name.clone()
-                            }
-                        })
+                        mailbox_account_id(&summary.mailbox).and_then(|id| st.accounts.get(&id).map(|h| {
+                            st.app_config.borrow().account_name(&id, &h.display_name, &h.email)
+                        }))
                     } else {
                         None
                     }
@@ -10570,7 +10566,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 .goa_accounts
                 .iter()
                 .map(|(account_id, a)| crate::config_view::GoaAccountInfo {
-                    display_name: a.display_name.clone(),
+                    display_name: st.app_config.borrow().account_name(account_id, &a.display_name, &a.email),
                     email: a.email.clone(),
                     account_id: account_id.0.clone(),
                     enabled: st.account_enabled(account_id),
@@ -10581,7 +10577,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 .accounts
                 .iter()
                 .map(|(account_id, h)| crate::config_view::MailAccountInfo {
-                    display_name: h.display_name.clone(),
+                    display_name: st.app_config.borrow().account_name(account_id, &h.display_name, &h.email),
                     email: h.email.clone(),
                     account_id: account_id.0.clone(),
                     is_other: account_id.0.starts_with(crate::app_config::OTHER_ACCOUNT_ID_PREFIX),
@@ -10706,11 +10702,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let refresh_hook = refresh_hook.clone();
                 Rc::new(move |anchor, account_id| {
                     let account_id = AccountId(account_id.to_string());
-                    let app_config = state.borrow().app_config.clone();
+                    let (app_config, default_name, email) = {
+                        let st = state.borrow();
+                        let Some(handle) = st.accounts.get(&account_id) else { return; };
+                        (st.app_config.clone(), handle.display_name.clone(), handle.email.clone())
+                    };
                     let on_changed = {
                         let state = state.clone();
                         let refresh_hook = refresh_hook.borrow().clone();
                         Rc::new(move || {
+                            let folder_refresh = state.borrow().folder_tree_refresh.clone();
+                            if let Some(refresh) = folder_refresh { refresh(); }
                             // Any open composer's From dropdown re-reads its
                             // identities live, so a change made in Config
                             // while composing lands in the open list too.
@@ -10721,7 +10723,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                             refresh_hook();
                         })
                     };
-                    crate::identities::show_manage_dialog(anchor, app_config, account_id, on_changed);
+                    crate::identities::show_manage_dialog(anchor, app_config, account_id, &default_name, &email, on_changed);
                 })
             };
             // Config → Accounts → Signatures row actions: edit reopens the

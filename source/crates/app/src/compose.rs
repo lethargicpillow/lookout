@@ -1175,6 +1175,7 @@ struct DraftSnapshot {
     /// The selected sending identity's address - a From change must re-save
     /// the draft like any other edit.
     from: String,
+    sender_name: String,
     to: String,
     cc: String,
     bcc: String,
@@ -1241,9 +1242,9 @@ impl PendingAttachment {
 /// selection, falling back to the first entry (the account's own default
 /// identity), and ultimately to a blank placeholder - the send will be
 /// rejected by the SMTP envelope check long before anything goes out.
-fn sender_option_label(identity: &Identity) -> String {
-    if identity.name.trim().is_empty() { identity.email.clone() }
-    else { format!("{} ; {}", identity.name.trim(), identity.email) }
+pub(crate) fn sender_option_label(name: &str, email: &str) -> String {
+    if name.trim().is_empty() { email.to_owned() }
+    else { format!("{} ; {}", name.trim(), email) }
 }
 
 fn selected_identity(identities: &Rc<RefCell<Vec<Identity>>>, from_dropdown: &gtk::DropDown) -> Identity {
@@ -1394,6 +1395,7 @@ impl AutosaveCtx {
         Some(DraftSnapshot {
             account: selected_identity(&self.identities, &self.from_dropdown).account_id,
             from: selected_identity(&self.identities, &self.from_dropdown).email,
+            sender_name: selected_identity(&self.identities, &self.from_dropdown).name,
             to: self.to_row.text_value(),
             cc: self.cc_row.text_value(),
             bcc: self.bcc_row.text_value(),
@@ -2232,6 +2234,7 @@ type ComposeBuild = (gtk::Box, gtk::Box, async_channel::Sender<String>, async_ch
 pub fn build_compose_view(
     title: &str,
     identities_source: Rc<dyn Fn() -> Vec<Identity>>,
+    sender_label: Rc<dyn Fn(&Identity) -> String>,
     signatures_source: Rc<dyn Fn() -> Vec<Signature>>,
     manage_signatures: Option<Rc<dyn Fn(&gtk::Widget)>>,
     // The global "My Templates" list (item 2.10 / C-17) and the callback that
@@ -2379,6 +2382,7 @@ pub fn build_compose_view(
         let identities = identities.clone();
         let from_value = from_value.clone();
         let account_changed = account_changed.clone();
+        let sender_label = sender_label.clone();
         Rc::new(move || {
             let list = identities.borrow();
             let Some(identity) = list.get(from_dropdown.selected() as usize) else {
@@ -2386,7 +2390,7 @@ pub fn build_compose_view(
                 identity_hint_icon.set_visible(false);
                 return;
             };
-            let label = sender_option_label(identity);
+            let label = sender_label(identity);
             from_value.set_label(&label);
             from_value.set_tooltip_text(Some(&label));
             let primary = list.iter().find(|entry| entry.account_id == identity.account_id);
@@ -2405,6 +2409,7 @@ pub fn build_compose_view(
         let show_from = show_from.clone();
         let initial_account = initial_account.clone();
         let sender_busy = sender_busy.clone();
+        let sender_label = sender_label.clone();
         Rc::new(move || {
             if sender_busy.get() { return; }
             let previous = selected_identity(&identities, &from_dropdown);
@@ -2412,7 +2417,7 @@ pub fn build_compose_view(
             let selected = list.iter().position(|i| i.account_id == previous.account_id && i.email.eq_ignore_ascii_case(&previous.email))
                 .or_else(|| list.iter().position(|i| i.account_id == initial_account)).unwrap_or(0);
             let account_count = list.iter().map(|i| &i.account_id).collect::<std::collections::HashSet<_>>().len();
-            let labels: Vec<String> = list.iter().map(sender_option_label).collect();
+            let labels: Vec<String> = list.iter().map(|identity| sender_label(identity)).collect();
             let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
             let model = gtk::StringList::new(&label_refs);
             *identities.borrow_mut() = list;
@@ -4388,6 +4393,7 @@ mod tests {
     fn snapshot(to: &str, subject: &str, body_text: &str) -> DraftSnapshot {
         DraftSnapshot {
             account: AccountId("test".into()),
+            sender_name: String::new(),
             from: "me@example.com".to_string(),
             to: to.to_string(),
             cc: String::new(),
@@ -4408,7 +4414,7 @@ mod tests {
     #[test]
     fn sender_label_and_account_change_are_distinct() {
         let identity = Identity::new(AccountId("a".into()), "My name", "me@example.com");
-        assert_eq!(sender_option_label(&identity), "My name ; me@example.com");
+        assert_eq!(sender_option_label(&identity.name, &identity.email), "My name ; me@example.com");
         let first = snapshot("recipient@example.com", "subject", "body");
         let mut second = first.clone();
         second.account = AccountId("b".into());
@@ -4511,6 +4517,7 @@ mod tests {
         // text even though its HTML is non-empty.
         let snap = DraftSnapshot {
             account: AccountId("test".into()),
+            sender_name: String::new(),
             from: String::new(),
             to: String::new(),
             cc: String::new(),

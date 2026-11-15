@@ -122,11 +122,7 @@ pub(crate) fn rebuild_folder_tree(state: &Rc<RefCell<UiState>>, folder_selection
             .accounts
             .iter()
             .map(|(id, handle)| {
-                let label = if handle.display_name.is_empty() {
-                    handle.email.clone()
-                } else {
-                    handle.display_name.clone()
-                };
+                let label = st.app_config.borrow().account_name(id, &handle.display_name, &handle.email);
                 (id.clone(), label, handle.folders.clone())
             })
             .collect();

@@ -678,12 +678,29 @@ pub(crate) fn show_composer_in_reading_pane_full(
                 let mut accounts: Vec<_> = st.accounts.iter().filter(|(_, handle)| !handle.cmd_tx.is_closed()).collect();
                 accounts.sort_by(|(a, ah), (b, bh)| {
                     (*a != &initial).cmp(&(*b != &initial))
-                        .then_with(|| ah.display_name.to_lowercase().cmp(&bh.display_name.to_lowercase()))
+                        .then_with(|| {
+                            let config = st.app_config.borrow();
+                            config.account_name(a, &ah.display_name, &ah.email).to_lowercase()
+                                .cmp(&config.account_name(b, &bh.display_name, &bh.email).to_lowercase())
+                        })
                         .then_with(|| ah.email.cmp(&bh.email))
                         .then_with(|| a.0.cmp(&b.0))
                 });
                 let config = st.app_config.borrow();
                 accounts.into_iter().flat_map(|(id, handle)| config.identities_for_account(id, &handle.display_name, &handle.email)).collect()
+            })
+        },
+        // Primary From labels use the local account name; aliases retain
+        // their own display name. Neither changes the outgoing identity.
+        {
+            let state = state.clone();
+            Rc::new(move |identity| {
+                let st = state.borrow();
+                let name = st.accounts.get(&identity.account_id)
+                    .filter(|handle| handle.email.eq_ignore_ascii_case(&identity.email))
+                    .map(|handle| st.app_config.borrow().account_name(&identity.account_id, &handle.display_name, &handle.email))
+                    .unwrap_or_else(|| identity.name.clone());
+                crate::compose::sender_option_label(&name, &identity.email)
             })
         },
         // The composer's signature menu re-reads the global signature list

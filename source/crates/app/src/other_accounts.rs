@@ -499,7 +499,7 @@ pub fn show_add_account_dialog(
     };
 
     // -- form fields --
-    let name_entry = gtk::Entry::builder().placeholder_text("Display name (optional)").hexpand(true).build();
+    let name_entry = gtk::Entry::builder().placeholder_text("Account name (optional)").hexpand(true).build();
     let email_entry = gtk::Entry::builder().placeholder_text("name@example.com").hexpand(true).build();
 
     let oab_entry = gtk::Entry::builder().placeholder_text("https://exchange.example/OAB/GUID/oab.xml").hexpand(true).build();
@@ -579,7 +579,7 @@ pub fn show_add_account_dialog(
     form.attach(&field_label("Password"), 0, row, 1, 1);
     form.attach(&imap_password_entry, 1, row, 1, 1);
     row += 1;
-    form.attach(&field_label("Name"), 0, row, 1, 1);
+    form.attach(&field_label("Account name"), 0, row, 1, 1);
     form.attach(&name_entry, 1, row, 1, 1);
     row += 1;
     if !is_edit {

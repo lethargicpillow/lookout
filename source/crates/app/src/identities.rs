@@ -30,14 +30,67 @@ fn parse_addresses(field: &str) -> Vec<EmailAddress> {
 /// Presents the modal manage-identities window, anchored to `anchor`'s
 /// window when one exists (tests have no window). `on_changed` fires after
 /// every persisted change so live views of the identity list can refresh.
-pub fn show_manage_dialog(anchor: &gtk::Widget, app_config: Rc<RefCell<AppConfig>>, account_id: AccountId, on_changed: Rc<dyn Fn()>) {
+pub fn show_manage_dialog(anchor: &gtk::Widget, app_config: Rc<RefCell<AppConfig>>, account_id: AccountId, default_name: &str, email: &str, on_changed: Rc<dyn Fn()>) {
     let dialog = {
-        let mut builder = gtk::Window::builder().modal(true).title("Manage identities").default_width(540).default_height(480);
+        let mut builder = gtk::Window::builder().modal(true).title("Account names and sending identities").default_width(540).default_height(560);
         if let Some(win) = anchor.root().and_downcast::<gtk::Window>() {
             builder = builder.transient_for(&win);
         }
         builder.build()
     };
+
+    let (account_name, sender_name) = {
+        let config = app_config.borrow();
+        (config.account_name(&account_id, default_name, email), config.sender_name(&account_id, default_name))
+    };
+    let names = adw::PreferencesGroup::builder().title("Primary account").build();
+    let account_entry = adw::EntryRow::builder().title("Account name").text(&account_name).build();
+    let sender_entry = adw::EntryRow::builder().title("Sender display name").text(&sender_name).build();
+    crate::privacy::mark_content(&account_entry);
+    crate::privacy::mark_content(&sender_entry);
+    names.add(&account_entry);
+    names.add(&sender_entry);
+    let email_row = adw::ActionRow::builder().title("Email address")
+        .subtitle(glib::markup_escape_text(email)).build();
+    crate::privacy::mark_row(&email_row);
+    names.add(&email_row);
+    let note = gtk::Label::builder().label("Account name is used only in Lookout. Sender display name appears in outgoing messages. Leave it empty to send without a display name.")
+        .wrap(true).xalign(0.0).css_classes(["dim-label"]).build();
+    let save_names = gtk::Button::with_label("Save names");
+    save_names.add_css_class("suggested-action");
+    save_names.set_halign(gtk::Align::End);
+    save_names.set_sensitive(false);
+    let names_changed = {
+        let account_entry = account_entry.clone();
+        let sender_entry = sender_entry.clone();
+        let save_names = save_names.clone();
+        let saved = Rc::new(RefCell::new((account_name, sender_name)));
+        let app_config = app_config.clone();
+        let account_id = account_id.clone();
+        let on_changed = on_changed.clone();
+        let save_saved = saved.clone();
+        let account_for_save = account_entry.clone();
+        let sender_for_save = sender_entry.clone();
+        save_names.connect_clicked(move |button| {
+            let account = account_for_save.text().trim().to_string();
+            let sender = sender_for_save.text().trim().to_string();
+            if account.is_empty() || sender.contains(['\r', '\n']) { return; }
+            app_config.borrow_mut().set_mail_account_names(&account_id, account.clone(), sender.clone());
+            crate::app_config::save(&app_config.borrow());
+            *save_saved.borrow_mut() = (account, sender);
+            button.set_sensitive(false);
+            on_changed();
+        });
+        Rc::new(move || {
+            let account = account_entry.text().trim().to_string();
+            let sender = sender_entry.text().trim().to_string();
+            save_names.set_sensitive(!account.is_empty() && !sender.contains(['\r', '\n']) && (account, sender) != *saved.borrow());
+        })
+    };
+    for entry in [&account_entry, &sender_entry] {
+        let changed = names_changed.clone();
+        entry.connect_changed(move |_| changed());
+    }
 
     let list = gtk::ListBox::builder().css_classes(["boxed-list"]).build();
     let scroller = gtk::ScrolledWindow::builder().child(&list).vexpand(true).build();
@@ -223,6 +276,12 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, app_config: Rc<RefCell<AppConfig
         .margin_start(12)
         .margin_end(12)
         .build();
+    root.set_spacing(8);
+    root.append(&names);
+    root.append(&note);
+    root.append(&save_names);
+    let aliases = gtk::Label::builder().label("Additional sending identities").xalign(0.0).css_classes(["heading"]).build();
+    root.append(&aliases);
     root.append(&scroller);
     root.append(&add_box);
     let close_button = gtk::Button::builder().label("Done").css_classes(["suggested-action"]).margin_top(12).build();

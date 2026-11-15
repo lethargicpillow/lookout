@@ -284,11 +284,21 @@ pub struct LdapDirectory {
     pub enabled: bool,
 }
 
+/// Local names for a mail account, independent of its authentication and
+/// server configuration. An empty sender name means an address-only From.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailAccountNames {
+    pub account_name: String,
+    pub sender_name: String,
+}
+
 /// The whole file's contents. All fields are additive: an older build's file
 /// (or a `{}` hand-edited file) deserializes into defaults for the rest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct AppConfig {
     pub identities: Vec<Identity>,
+    #[serde(default)]
+    pub mail_account_names: std::collections::HashMap<AccountId, MailAccountNames>,
     /// The user-authored signatures (see `signatures.rs` for the editor UI).
     /// Global - not pinned to an account - so the list lives on the Accounts
     /// settings screen and a future send-time step can pick one per message.
@@ -395,6 +405,24 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
+    pub fn account_name(&self, id: &AccountId, default_name: &str, email: &str) -> String {
+        self.mail_account_names.get(id).map(|n| n.account_name.as_str())
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or(if default_name.trim().is_empty() { email } else { default_name }).to_owned()
+    }
+
+    pub fn sender_name(&self, id: &AccountId, default_name: &str) -> String {
+        self.mail_account_names.get(id).map(|n| n.sender_name.clone()).unwrap_or_else(|| default_name.to_owned())
+    }
+
+    pub fn set_mail_account_names(&mut self, id: &AccountId, account_name: String, sender_name: String) {
+        // Keep the manual connection editor's existing name field in sync.
+        if let Some(account) = self.other_accounts.iter_mut().find(|a| a.id == id.0) {
+            account.display_name = account_name.clone();
+        }
+        self.mail_account_names.insert(id.clone(), MailAccountNames { account_name, sender_name });
+    }
+
     /// The persisted sending identities pinned to `account_id`, in file
     /// order. The account's own address is *not* in this list - it's always
     /// available implicitly (see `identities_for_account`), and a user-added
@@ -414,7 +442,7 @@ impl AppConfig {
             .into_iter()
             .filter(|i| !i.email.eq_ignore_ascii_case(default_email))
             .collect();
-        identities.insert(0, Identity::new(account_id.clone(), default_name, default_email));
+        identities.insert(0, Identity::new(account_id.clone(), self.sender_name(account_id, default_name), default_email));
         identities
     }
 
@@ -427,6 +455,7 @@ impl AppConfig {
     pub fn remove_other_account(&mut self, account_id: &AccountId) {
         self.other_accounts.retain(|a| a.id != account_id.0);
         self.oab_urls.remove(&account_id.0);
+        self.mail_account_names.remove(account_id);
         self.directory_accounts.retain(|id| id != account_id);
         self.ldap_directories.retain(|directory| &directory.account_id != account_id);
     }
@@ -440,6 +469,18 @@ impl AppConfig {
     /// Inserts `account`, replacing any existing entry with the same id
     /// (the edit path) or appending it (the add path).
     pub fn upsert_other_account(&mut self, account: OtherAccount) {
+        // A rename via the existing manual connection editor also updates
+        // the local name, but must not change an explicitly chosen From.
+        if let Some(names) = self.mail_account_names.get_mut(&AccountId(account.id.clone())) {
+            names.account_name = account.display_name.clone();
+        } else if let Some(previous) = self.other_accounts.iter().find(|a| a.id == account.id) {
+            if previous.display_name != account.display_name {
+                self.mail_account_names.insert(AccountId(account.id.clone()), MailAccountNames {
+                    account_name: account.display_name.clone(),
+                    sender_name: previous.display_name.clone(),
+                });
+            }
+        }
         if let Some(existing) = self.other_accounts.iter_mut().find(|a| a.id == account.id) {
             *existing = account;
         } else {
@@ -858,6 +899,7 @@ mod tests {
         identity.bcc = vec![lookout_core::EmailAddress::new("archive@example.com")];
         let config = AppConfig {
             identities: vec![identity],
+            mail_account_names: std::collections::HashMap::new(),
             signatures: Vec::new(),
             signature_defaults: std::collections::HashMap::new(),
             folder_role_overrides: vec![FolderRoleOverride {
@@ -955,6 +997,27 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), "not json");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn account_names_are_independent_and_persisted() {
+        let id = AccountId("other:test".into());
+        let mut config = AppConfig::default();
+        assert_eq!(config.sender_name(&id, "Legacy"), "Legacy");
+        config.set_mail_account_names(&id, "Work".into(), "Ada Lovelace".into());
+        assert_eq!(config.account_name(&id, "Legacy", "ada@example.com"), "Work");
+        assert_eq!(config.identities_for_account(&id, "Legacy", "ada@example.com")[0].name, "Ada Lovelace");
+        config.set_mail_account_names(&id, "Renamed".into(), "Ada Lovelace".into());
+        assert_eq!(config.identities_for_account(&id, "Renamed", "ada@example.com")[0].name, "Ada Lovelace");
+        let json = serde_json::to_value(&config).unwrap();
+        let loaded: AppConfig = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(loaded, config);
+        let mut legacy = json;
+        legacy.as_object_mut().unwrap().remove("mail_account_names");
+        let loaded: AppConfig = serde_json::from_value(legacy).unwrap();
+        assert!(loaded.mail_account_names.is_empty());
+        config.set_mail_account_names(&id, "Work".into(), String::new());
+        assert!(config.identities_for_account(&id, "Legacy", "ada@example.com")[0].name.is_empty());
     }
 
     #[test]

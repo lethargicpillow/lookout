@@ -1637,7 +1637,7 @@ pub fn refresh(
                 glib::markup_escape_text(&info.identity_labels.join(" · ")).to_string()
             };
             let identity_row = adw::ActionRow::builder()
-                .title("Sending identities")
+                .title("Account names and sending identities")
                 .subtitle(&identities_subtitle)
                 .activatable(true)
                 .build();
