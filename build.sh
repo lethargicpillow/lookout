@@ -104,7 +104,7 @@ if [ "$DEB" = true ]; then
     mkdir -p "$DEB_DIR"
     STAGING="$(mktemp -d "$DEB_DIR/.lookout-build.XXXXXX")"
     trap 'rm -rf -- "$STAGING"' EXIT
-    cargo deb --no-build -p lookout-app --deb-revision "$REVISION" --output "$STAGING/lookout.deb"
+    cargo deb --locked --no-build -p lookout-app --deb-revision "$REVISION" --output "$STAGING/lookout.deb"
     VERSION="$(dpkg-deb -f "$STAGING/lookout.deb" Version)"
     ARCH="$(dpkg-deb -f "$STAGING/lookout.deb" Architecture)"
     DEB_PATH="$DEB_DIR/lookout_${VERSION}_${ARCH}.deb"

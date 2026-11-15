@@ -2,8 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [build]
+    branches: [develop, build]
   pull_request:
+  workflow_dispatch:
 
 defaults:
   run:
@@ -42,7 +43,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: source
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
   test:
     runs-on: ubuntu-24.04
@@ -64,9 +65,18 @@ jobs:
         with:
           workspaces: source
       - name: Unit tests (whole workspace)
-        run: cargo test --workspace
+        run: |
+          TEST_ROOT="$(mktemp -d)"
+          trap 'rm -rf -- "$TEST_ROOT"' EXIT
+          mkdir -p "$TEST_ROOT"/{cache,config,data,state}
+          export XDG_CACHE_HOME="$TEST_ROOT/cache"
+          export XDG_CONFIG_HOME="$TEST_ROOT/config"
+          export XDG_DATA_HOME="$TEST_ROOT/data"
+          export XDG_STATE_HOME="$TEST_ROOT/state"
+          export GSETTINGS_BACKEND=memory
+          cargo test --locked --workspace
       - name: Fake-GOA D-Bus test (isolated session bus)
-        run: dbus-run-session -- cargo test -p lookout-goa --test fake_goa
+        run: dbus-run-session -- cargo test --locked -p lookout-goa --test fake_goa
 
   greenmail:
     runs-on: ubuntu-24.04
@@ -80,8 +90,15 @@ jobs:
         with:
           workspaces: source
       - name: GreenMail integration test
-        run: cargo test -p lookout-mail --features test-utils --test imap_integration -- --ignored
-        continue-on-error: true
+        run: |
+          TEST_ROOT="$(mktemp -d)"
+          trap 'rm -rf -- "$TEST_ROOT"' EXIT
+          mkdir -p "$TEST_ROOT"/{cache,config,data,state}
+          export XDG_CACHE_HOME="$TEST_ROOT/cache"
+          export XDG_CONFIG_HOME="$TEST_ROOT/config"
+          export XDG_DATA_HOME="$TEST_ROOT/data"
+          export XDG_STATE_HOME="$TEST_ROOT/state"
+          cargo test --locked -p lookout-mail --features test-utils --test imap_integration -- --ignored --test-threads=1 --nocapture
 
   build:
     runs-on: ubuntu-24.04
@@ -101,4 +118,43 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: source
-      - run: cargo build --workspace
+      - run: cargo build --locked --workspace
+
+  deb:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build and packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libwebkitgtk-6.0-dev \
+            libglib2.0-dev \
+            libssl-dev \
+            pkg-config \
+            dpkg-dev \
+            desktop-file-utils
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: source
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked --version 3.7.0
+      - name: Build DEB
+        working-directory: .
+        run: ./build.sh --deb
+      - name: Validate DEB and test dependency resolution
+        working-directory: .
+        run: |
+          shopt -s nullglob
+          packages=(source/target/debian/lookout_*.deb)
+          test "${#packages[@]}" -eq 1
+          ./scripts/check-deb.sh "${packages[0]}"
+          apt-get -s install --no-install-recommends "./${packages[0]}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lookout-deb-amd64-${{ github.sha }}
+          path: source/target/debian/lookout_*.deb
+          if-no-files-found: error
